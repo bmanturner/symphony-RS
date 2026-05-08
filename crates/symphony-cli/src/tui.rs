@@ -31,7 +31,7 @@
 //! iterations — running a real raw-mode terminal in `cargo test` is
 //! flaky and not worth the maintenance.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
 use symphony_agent::tandem::CostModel;
 use symphony_core::agent::{AgentEvent, SessionId, TokenUsage};
 use symphony_core::events::OrchestratorEvent;
@@ -185,13 +185,55 @@ impl CostState {
     }
 }
 
+/// Maximum recent events the log keeps in memory.
+///
+/// Sized to a few screens of scroll-back: at 24 rows per terminal that's
+/// roughly eight viewport-fulls of history, which is enough to catch a
+/// burst of activity without unbounded growth on a long-lived TUI. Old
+/// events are dropped FIFO; consumers who need archival history should
+/// subscribe to the SSE feed directly.
+pub const RECENT_EVENTS_CAP: usize = 200;
+
+/// One captured orchestrator event, materialised for the recent-events
+/// log panel.
+///
+/// We snapshot the *display data* rather than re-walking the original
+/// [`OrchestratorEvent`] at render time so the panel renders in O(rows
+/// drawn) regardless of how chatty the SSE stream is. The `kind` field
+/// is the serde tag of the originating variant (used for both the
+/// colour-coding and a one-token label); `summary` is a one-line
+/// human-readable description; `identifier` is captured so the `f`
+/// substring filter can match without joining against tracker state at
+/// render time.
+#[derive(Debug, Clone)]
+pub struct RecentEvent {
+    /// Wall-clock instant the event was applied to the TUI state. Used
+    /// by the future `r` toggle to switch absolute ↔ relative time
+    /// rendering across panels.
+    pub at: Instant,
+    /// Stable single-token label drawn from the variant's serde tag
+    /// (`"state_changed"`, `"dispatched"`, `"agent"`, …) plus a synthetic
+    /// `"lagged"` for transport-level drops. Drives [`event_kind_colour`]
+    /// so the log is colour-coded without inspecting the payload twice.
+    pub kind: &'static str,
+    /// One-line human description. Adapter-specific: a `Message` carries
+    /// the (truncated) text, a `Dispatched` names the backend, etc. Plain
+    /// ASCII so terminals without UTF-8 still render cleanly.
+    pub summary: String,
+    /// Best-effort tracker identifier (e.g. `ENG-123`) when the event
+    /// pertains to one specific issue. `None` for `Reconciled` (which
+    /// carries only [`IssueId`]s and no human-readable identifier
+    /// snapshots) and for `Lagged` (a transport-layer drop, not
+    /// per-issue). The `f` filter only matches events with `Some`.
+    pub identifier: Option<String>,
+}
+
 /// All state the TUI needs to render a frame.
 ///
-/// Future panels (cost summary, recent-events log, tandem activity)
-/// push their own fields onto this struct. Keeping a single owning
-/// struct (rather than a tangle of `Arc<Mutex<…>>` per panel) means
-/// the render pipeline is `(&AppState, Instant) → Frame`, which is
-/// trivial to snapshot-test.
+/// Future panels (tandem activity) push their own fields onto this
+/// struct. Keeping a single owning struct (rather than a tangle of
+/// `Arc<Mutex<…>>` per panel) means the render pipeline is
+/// `(&AppState, Instant) → Frame`, which is trivial to snapshot-test.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     /// Current SSE connection status, drives the header banner.
@@ -202,13 +244,29 @@ pub struct AppState {
     /// the visual order is deterministic regardless of insertion
     /// order — important for ratatui snapshot tests.
     pub active_issues: HashMap<IssueId, ActiveIssue>,
-    /// One-line summary of the most recently observed event, shown in
-    /// the placeholder body until the recent-events panel lands. Once
-    /// that panel exists this field becomes redundant and is removed
-    /// in the same commit.
-    pub last_event_summary: Option<String>,
     /// Token + dollar accumulator surfaced in the cost-summary panel.
     pub cost: CostState,
+    /// FIFO ring buffer of the most recent events, capped at
+    /// [`RECENT_EVENTS_CAP`]. Newest events are pushed to the back; the
+    /// recent-events panel renders the tail (newest-first) so a
+    /// reconnecting TUI shows the most relevant context first.
+    pub recent_events: VecDeque<RecentEvent>,
+    /// Best-known human identifier per [`IssueId`], populated from any
+    /// event that carries one. Lets us label `Agent` events (which
+    /// carry only the raw [`IssueId`]) with the same `ENG-123` string
+    /// the operator sees in the active-issues table — and lets the `f`
+    /// filter match those events too. Never purged: a release that
+    /// removes the row from `active_issues` does not remove its
+    /// identifier from history.
+    pub identifier_cache: HashMap<IssueId, String>,
+    /// Current substring filter applied to the recent-events panel.
+    /// Empty string disables the filter entirely.
+    pub event_filter: String,
+    /// `true` while the user is typing into the filter input via the
+    /// `f` hotkey. While set, character keys append to
+    /// [`AppState::event_filter`] instead of routing as commands; `Esc`
+    /// cancels (clears + exits) and `Enter` commits (keeps + exits).
+    pub filter_input_mode: bool,
     /// Set true when the user pressed `q` (or `Ctrl+C`); the run loop
     /// terminates on the next iteration. Tests inspect this directly.
     pub should_quit: bool,
@@ -235,23 +293,32 @@ impl AppState {
                 };
             }
             WatchEvent::Lagged { missed } => {
-                self.last_event_summary = Some(format!("lagged: missed {missed} events"));
+                // A `Lagged` is a transport-layer drop, not an
+                // orchestrator event — push it onto the recent-events
+                // log so the operator sees it (in red) without lying
+                // about the orchestrator's state.
+                self.push_recent("lagged", format!("missed {missed} events"), None);
             }
             WatchEvent::Event(orch) => {
                 self.apply_orchestrator_event(orch);
-                // Render the event's serde tag rather than its full
-                // payload — the body panel is a one-liner today, and the
-                // dedicated recent-events panel (next iteration) is
-                // where the full payload belongs.
-                self.last_event_summary = Some(format!(
-                    "event: {}",
-                    serde_json::to_value(orch)
-                        .ok()
-                        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
-                        .unwrap_or_else(|| "(unknown)".into())
-                ));
             }
         }
+    }
+
+    /// Append one entry to the recent-events ring buffer, evicting the
+    /// oldest if [`RECENT_EVENTS_CAP`] would be exceeded. Pure helper
+    /// (no I/O, no clock dependency beyond [`Instant::now`]) so the
+    /// call sites in [`AppState::apply_orchestrator_event`] stay flat.
+    fn push_recent(&mut self, kind: &'static str, summary: String, identifier: Option<String>) {
+        if self.recent_events.len() == RECENT_EVENTS_CAP {
+            self.recent_events.pop_front();
+        }
+        self.recent_events.push_back(RecentEvent {
+            at: Instant::now(),
+            kind,
+            summary,
+            identifier,
+        });
     }
 
     /// Update [`AppState::active_issues`] from one orchestrator event.
@@ -284,9 +351,11 @@ impl AppState {
             OrchestratorEvent::StateChanged {
                 issue,
                 identifier,
+                previous,
                 current,
-                ..
             } => {
+                self.identifier_cache
+                    .insert(issue.clone(), identifier.clone());
                 let row = self
                     .active_issues
                     .entry(issue.clone())
@@ -302,6 +371,15 @@ impl AppState {
                 if let ClaimState::RetryQueued { attempt } = current {
                     row.attempt = *attempt;
                 }
+                let summary = match previous {
+                    Some(p) => format!(
+                        "{identifier} {} → {}",
+                        format_state(p),
+                        format_state(current)
+                    ),
+                    None => format!("{identifier} → {}", format_state(current)),
+                };
+                self.push_recent("state_changed", summary, Some(identifier.clone()));
             }
             OrchestratorEvent::Dispatched {
                 issue,
@@ -310,6 +388,8 @@ impl AppState {
                 backend,
                 attempt,
             } => {
+                self.identifier_cache
+                    .insert(issue.clone(), identifier.clone());
                 let row = self
                     .active_issues
                     .entry(issue.clone())
@@ -331,8 +411,20 @@ impl AppState {
                 self.cost
                     .session_backend
                     .insert(session.clone(), backend.clone());
+                self.push_recent(
+                    "dispatched",
+                    format!("{identifier} dispatched [{backend}] attempt {attempt}"),
+                    Some(identifier.clone()),
+                );
             }
-            OrchestratorEvent::Released { issue, .. } => {
+            OrchestratorEvent::Released {
+                issue,
+                identifier,
+                reason,
+                ..
+            } => {
+                self.identifier_cache
+                    .insert(issue.clone(), identifier.clone());
                 self.active_issues.remove(issue);
                 // Cost totals are intentionally *not* purged on
                 // release: the panel renders a cumulative-since-launch
@@ -340,8 +432,13 @@ impl AppState {
                 // its issue completes would make the dollar count run
                 // backwards. Sessions are pruned only when the TUI
                 // restarts.
+                self.push_recent(
+                    "released",
+                    format!("{identifier} released ({reason:?})"),
+                    Some(identifier.clone()),
+                );
             }
-            OrchestratorEvent::Agent { event, .. } => {
+            OrchestratorEvent::Agent { issue, event } => {
                 if let AgentEvent::TokenUsage { session, usage } = event {
                     // Replace, don't sum: backend adapters emit
                     // cumulative totals on every update, so the latest
@@ -351,12 +448,33 @@ impl AppState {
                         .session_tokens
                         .insert(session.clone(), usage.clone());
                 }
+                let identifier = self.identifier_cache.get(issue).cloned();
+                let label = identifier.clone().unwrap_or_else(|| "?".into());
+                let summary = format_agent_event(&label, event);
+                self.push_recent("agent", summary, identifier);
             }
-            OrchestratorEvent::RetryScheduled { .. } | OrchestratorEvent::Reconciled { .. } => {
-                // Other variants do not change *which* issues are
-                // active or *what state* they are in; later panels
-                // hook in here without touching the active-issues
-                // table.
+            OrchestratorEvent::RetryScheduled {
+                issue,
+                identifier,
+                attempt,
+                reason,
+                delay_ms,
+                ..
+            } => {
+                self.identifier_cache
+                    .insert(issue.clone(), identifier.clone());
+                self.push_recent(
+                    "retry_scheduled",
+                    format!("{identifier} retry attempt {attempt} in {delay_ms}ms ({reason:?})"),
+                    Some(identifier.clone()),
+                );
+            }
+            OrchestratorEvent::Reconciled { dropped } => {
+                self.push_recent(
+                    "reconciled",
+                    format!("reconciled: dropped {} issue(s)", dropped.len()),
+                    None,
+                );
             }
         }
     }
@@ -373,21 +491,120 @@ impl AppState {
         if key.kind != KeyEventKind::Press {
             return false;
         }
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
-                self.should_quit = true;
-                true
+
+        // Filter input mode swallows most keys: it is a tiny in-line
+        // text field, not a shortcut surface. We deliberately do *not*
+        // treat `q` as quit while typing — an operator filtering by
+        // `queue` would otherwise quit halfway through their search.
+        if self.filter_input_mode {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    // Cancel: clear the filter and exit input mode so
+                    // the panel returns to showing every event.
+                    self.event_filter.clear();
+                    self.filter_input_mode = false;
+                    true
+                }
+                (KeyCode::Enter, _) => {
+                    // Commit: keep the filter, exit input mode. The
+                    // panel header continues to show the active filter
+                    // so the operator never forgets it is on.
+                    self.filter_input_mode = false;
+                    true
+                }
+                (KeyCode::Backspace, _) => {
+                    self.event_filter.pop();
+                    true
+                }
+                // Ctrl+C is an emergency exit even from input mode.
+                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                    true
+                }
+                (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                    // Cap the filter at a sane upper bound: the input
+                    // line is one terminal row and identifiers in the
+                    // wild are short. 64 chars is comfortably more than
+                    // any real tracker key.
+                    if self.event_filter.len() < 64 {
+                        self.event_filter.push(c);
+                    }
+                    true
+                }
+                _ => false,
             }
-            // Ctrl+C is an explicit quit signal: SIGINT does not reach
-            // a process running in raw mode, so we have to translate
-            // the keystroke ourselves.
-            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-                true
+        } else {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                    self.should_quit = true;
+                    true
+                }
+                // Ctrl+C is an explicit quit signal: SIGINT does not
+                // reach a process running in raw mode, so we have to
+                // translate the keystroke ourselves.
+                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true;
+                    true
+                }
+                (KeyCode::Char('f'), _) => {
+                    // Enter filter input mode. We do *not* clear the
+                    // existing filter so an operator can refine it
+                    // (`f`, edit, Enter) without retyping from scratch.
+                    self.filter_input_mode = true;
+                    true
+                }
+                _ => false,
             }
-            _ => false,
         }
     }
+}
+
+/// Build a one-line summary of an [`AgentEvent`] for the recent-events
+/// log. Pulled out so the routing in [`AppState::apply_orchestrator_event`]
+/// stays a flat match rather than a nested one. The `label` argument is
+/// the issue identifier (or `"?"` if the cache has not seen one yet).
+///
+/// Long message bodies are truncated to 60 characters with an ellipsis;
+/// the panel is one row per event and full transcripts belong in the
+/// SSE stream itself, not the log surface.
+fn format_agent_event(label: &str, event: &AgentEvent) -> String {
+    match event {
+        AgentEvent::Started { .. } => format!("{label} session started"),
+        AgentEvent::Message { role, content, .. } => {
+            format!("{label} {role}: {}", truncate_one_line(content, 60))
+        }
+        AgentEvent::ToolUse { tool, .. } => format!("{label} tool: {tool}"),
+        AgentEvent::TokenUsage { usage, .. } => format!(
+            "{label} tokens in {} out {} total {}",
+            usage.input, usage.output, usage.total
+        ),
+        AgentEvent::RateLimit { .. } => format!("{label} rate limited"),
+        AgentEvent::Completed { reason, .. } => format!("{label} completed: {reason:?}"),
+        AgentEvent::Failed { error, .. } => format!("{label} failed: {error}"),
+    }
+}
+
+/// Trim a free-text string to a single line, truncating to `max` chars
+/// with an ellipsis if needed. Newlines and tabs are collapsed to
+/// spaces so multi-line message content does not break the panel
+/// layout. Pure ASCII handling — we measure in chars to stay
+/// codepoint-safe for non-ASCII content.
+fn truncate_one_line(s: &str, max: usize) -> String {
+    let collapsed: String = s
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if collapsed.chars().count() <= max {
+        return collapsed;
+    }
+    let head: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// Render the TUI layout against any backend.
@@ -398,9 +615,11 @@ impl AppState {
 /// 2. **Active issues table** (flex, bordered) — one row per
 ///    currently-claimed issue with identifier, state, elapsed,
 ///    backend.
-/// 3. **Recent activity** (3 lines, bordered) — placeholder one-liner
-///    until the recent-events log panel lands in the next iteration.
-/// 4. **Footer** (1 line, no border) — key bindings.
+/// 3. **Cost summary** (3 lines, bordered) — token + dollar totals.
+/// 4. **Recent events log** (flex, bordered) — colour-coded ring
+///    buffer of the last [`RECENT_EVENTS_CAP`] events, optionally
+///    filtered by identifier substring (`f`).
+/// 5. **Footer** (1 line, no border) — key bindings or filter input.
 ///
 /// Taking `now: Instant` as a parameter (rather than calling
 /// [`Instant::now`] internally) lets unit tests pin elapsed-time
@@ -411,9 +630,9 @@ pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Min(5),
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Min(5),
             Constraint::Length(1),
         ])
         .split(area);
@@ -437,25 +656,163 @@ pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
 
     render_active_issues(state, now, frame, chunks[1]);
     render_cost_summary(state, frame, chunks[2]);
+    render_recent_events(state, now, frame, chunks[3]);
+    render_footer(state, frame, chunks[4]);
+}
 
-    let body = state
-        .last_event_summary
-        .clone()
-        .unwrap_or_else(|| "(awaiting events…)".into());
-    frame.render_widget(
-        Paragraph::new(body).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("recent activity (placeholder)"),
-        ),
-        chunks[3],
-    );
+/// Render the footer line: shortcut help when idle, an inline filter
+/// editor when [`AppState::filter_input_mode`] is on. We deliberately
+/// keep this to a single row so the body panels do not jitter when the
+/// user opens or closes the input.
+fn render_footer(state: &AppState, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    let line = if state.filter_input_mode {
+        // The trailing `_` is a fake caret — crossterm does not draw
+        // one in a Paragraph and a blinking cursor would require
+        // routing terminal control through ratatui, which is more
+        // ceremony than this footer is worth.
+        Line::from(vec![
+            Span::styled(
+                "filter: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(state.event_filter.clone()),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw("  "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" apply  "),
+            Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ])
+    } else {
+        let mut spans = vec![
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" quit  "),
+            Span::styled("f", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" filter"),
+        ];
+        if !state.event_filter.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("[filter: {}]", state.event_filter),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        Line::from(spans)
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
 
-    let footer = Line::from(vec![
-        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" quit"),
-    ]);
-    frame.render_widget(Paragraph::new(footer), chunks[4]);
+/// Foreground colour used to tint a recent-event row by its variant.
+///
+/// Picks distinct hues across the six orchestrator variants so a busy
+/// feed is scannable at a glance. `lagged` is red because it is the
+/// only line that signals data loss.
+fn event_kind_colour(kind: &str) -> Color {
+    match kind {
+        "state_changed" => Color::Cyan,
+        "dispatched" => Color::Green,
+        "agent" => Color::Gray,
+        "retry_scheduled" => Color::Yellow,
+        "reconciled" => Color::Magenta,
+        "released" => Color::Blue,
+        "lagged" => Color::Red,
+        // A future variant added on the wire side will land here until
+        // the TUI catches up; default to no tint rather than panic so
+        // the panel keeps rendering.
+        _ => Color::White,
+    }
+}
+
+/// Render the recent-events log: newest at the top, colour-coded by
+/// variant, optionally filtered by identifier substring.
+///
+/// Filter rules:
+/// - Empty filter renders every event.
+/// - Non-empty filter keeps only events whose `identifier` contains the
+///   filter substring (case-sensitive — tracker identifiers are
+///   conventionally fixed case, so a permissive `to_lowercase` would
+///   only mask real mismatches).
+/// - Events without an identifier (`reconciled`, `lagged`) are hidden
+///   when a filter is active. They are not "about" any one issue, so
+///   showing them under a per-issue filter would be misleading.
+fn render_recent_events(
+    state: &AppState,
+    now: Instant,
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+) {
+    let title = if state.event_filter.is_empty() {
+        format!("recent events ({})", state.recent_events.len())
+    } else {
+        let visible = state
+            .recent_events
+            .iter()
+            .filter(|e| {
+                e.identifier
+                    .as_deref()
+                    .is_some_and(|id| id.contains(&state.event_filter))
+            })
+            .count();
+        format!(
+            "recent events ({}/{}) [filter: {}]",
+            visible,
+            state.recent_events.len(),
+            state.event_filter
+        )
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    if state.recent_events.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "(no events yet)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    // Newest-first: iterate the deque in reverse so the most recent
+    // line sits at the top of the viewport. Operators read the panel
+    // top-to-bottom and the freshest information is what they care
+    // about.
+    let items: Vec<ListItem> = state
+        .recent_events
+        .iter()
+        .rev()
+        .filter(|e| {
+            if state.event_filter.is_empty() {
+                true
+            } else {
+                e.identifier
+                    .as_deref()
+                    .is_some_and(|id| id.contains(&state.event_filter))
+            }
+        })
+        .map(|e| {
+            let elapsed = format_elapsed(now.saturating_duration_since(e.at));
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{elapsed:>6} "),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    format!("{:<16} ", e.kind),
+                    Style::default()
+                        .fg(event_kind_colour(e.kind))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(e.summary.clone()),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// Render the single-line cost-summary panel.
@@ -837,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_event_summarises_by_serde_tag() {
+    fn apply_event_pushes_recent_event() {
         let mut s = AppState::default();
         s.apply(&WatchEvent::Event(OrchestratorEvent::StateChanged {
             issue: IssueId::new("ENG-1"),
@@ -845,11 +1202,22 @@ mod tests {
             previous: None,
             current: ClaimState::Running,
         }));
-        let summary = s.last_event_summary.expect("summary set");
-        assert!(
-            summary.contains("state_changed") || summary.contains("StateChanged"),
-            "unexpected summary: {summary}"
-        );
+        assert_eq!(s.recent_events.len(), 1);
+        let ev = s.recent_events.back().unwrap();
+        assert_eq!(ev.kind, "state_changed");
+        assert_eq!(ev.identifier.as_deref(), Some("ENG-1"));
+        assert!(ev.summary.contains("ENG-1"), "summary: {}", ev.summary);
+        assert!(ev.summary.contains("running"), "summary: {}", ev.summary);
+    }
+
+    #[test]
+    fn apply_lagged_pushes_recent_event_without_identifier() {
+        let mut s = AppState::default();
+        s.apply(&WatchEvent::Lagged { missed: 7 });
+        let ev = s.recent_events.back().unwrap();
+        assert_eq!(ev.kind, "lagged");
+        assert!(ev.identifier.is_none());
+        assert!(ev.summary.contains("7"));
     }
 
     #[test]
@@ -903,7 +1271,7 @@ mod tests {
 
     #[test]
     fn render_pending_state_shows_connecting_label() {
-        let backend = TestBackend::new(60, 8);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState::default();
         terminal
@@ -917,7 +1285,7 @@ mod tests {
 
     #[test]
     fn render_connected_state_shows_url() {
-        let backend = TestBackend::new(60, 8);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::default();
         state.apply(&WatchEvent::Connected {
@@ -1098,7 +1466,7 @@ mod tests {
             attempt: 1,
         });
 
-        let backend = TestBackend::new(80, 16);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let now = Instant::now();
         terminal.draw(|f| render(&s, now, f)).unwrap();
@@ -1118,7 +1486,7 @@ mod tests {
 
     #[test]
     fn render_active_issues_panel_shows_placeholder_when_empty() {
-        let backend = TestBackend::new(80, 12);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let s = AppState::default();
         terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
@@ -1346,7 +1714,7 @@ mod tests {
 
     #[test]
     fn render_cost_panel_shows_zero_dollars_when_unconfigured() {
-        let backend = TestBackend::new(80, 16);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let s = AppState::default();
         terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
@@ -1387,7 +1755,7 @@ mod tests {
                 },
             },
         });
-        let backend = TestBackend::new(80, 18);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
         let buf = terminal.backend().to_string();
@@ -1420,10 +1788,319 @@ mod tests {
             .dispatched_at = Some(dispatched);
         let now = dispatched + Duration::from_secs(90);
 
-        let backend = TestBackend::new(80, 16);
+        let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(&s, now, f)).unwrap();
         let buf = terminal.backend().to_string();
         assert!(buf.contains("1m30s"), "elapsed missing in buf: {buf}");
+    }
+
+    // ---- recent-events log panel ---------------------------------------
+
+    #[test]
+    fn dispatched_pushes_recent_event_with_backend_label() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: session("t", "u"),
+            backend: "claude".into(),
+            attempt: 2,
+        });
+        let ev = s.recent_events.back().unwrap();
+        assert_eq!(ev.kind, "dispatched");
+        assert!(ev.summary.contains("claude"), "summary: {}", ev.summary);
+        assert!(ev.summary.contains("attempt 2"), "summary: {}", ev.summary);
+    }
+
+    #[test]
+    fn agent_event_uses_identifier_cache_for_label() {
+        let mut s = AppState::default();
+        // Seed the cache via a StateChanged so the Agent event below
+        // resolves to the human identifier rather than "?".
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("id-1"),
+            identifier: "ENG-42".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("id-1"),
+            event: AgentEvent::Message {
+                session: session("t", "u"),
+                role: "assistant".into(),
+                content: "hello world".into(),
+            },
+        });
+        let ev = s.recent_events.back().unwrap();
+        assert_eq!(ev.kind, "agent");
+        assert_eq!(ev.identifier.as_deref(), Some("ENG-42"));
+        assert!(ev.summary.starts_with("ENG-42"), "summary: {}", ev.summary);
+        assert!(ev.summary.contains("assistant"), "summary: {}", ev.summary);
+    }
+
+    #[test]
+    fn agent_event_without_cached_identifier_uses_placeholder() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("id-x"),
+            event: AgentEvent::Started {
+                session: session("t", "u"),
+                issue: IssueId::new("id-x"),
+            },
+        });
+        let ev = s.recent_events.back().unwrap();
+        assert!(ev.summary.starts_with("? "), "summary: {}", ev.summary);
+        assert!(ev.identifier.is_none());
+    }
+
+    #[test]
+    fn ring_buffer_caps_at_recent_events_cap() {
+        let mut s = AppState::default();
+        for i in 0..(RECENT_EVENTS_CAP + 25) {
+            s.push_recent("agent", format!("evt {i}"), Some(format!("ENG-{i}")));
+        }
+        assert_eq!(s.recent_events.len(), RECENT_EVENTS_CAP);
+        // Oldest 25 entries should have been evicted; the head is now
+        // the 25th-pushed event.
+        assert_eq!(s.recent_events.front().unwrap().summary, "evt 25");
+        assert_eq!(
+            s.recent_events.back().unwrap().summary,
+            format!("evt {}", RECENT_EVENTS_CAP + 24)
+        );
+    }
+
+    #[test]
+    fn truncate_one_line_caps_long_content_and_collapses_newlines() {
+        assert_eq!(truncate_one_line("hi", 10), "hi");
+        assert_eq!(truncate_one_line("a\nb\tc", 10), "a b c");
+        let long = "x".repeat(100);
+        let out = truncate_one_line(&long, 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn handle_key_f_enters_filter_input_mode() {
+        let mut s = AppState::default();
+        assert!(s.handle_key(key(KeyCode::Char('f'))));
+        assert!(s.filter_input_mode);
+        assert!(!s.should_quit);
+    }
+
+    #[test]
+    fn handle_key_in_filter_mode_appends_chars_and_does_not_quit_on_q() {
+        let mut s = AppState {
+            filter_input_mode: true,
+            ..Default::default()
+        };
+        s.handle_key(key(KeyCode::Char('q')));
+        s.handle_key(key(KeyCode::Char('u')));
+        s.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(s.event_filter, "que");
+        assert!(!s.should_quit, "q while filtering must not quit");
+    }
+
+    #[test]
+    fn handle_key_filter_backspace_pops_char() {
+        let mut s = AppState {
+            filter_input_mode: true,
+            event_filter: "ENG".into(),
+            ..Default::default()
+        };
+        s.handle_key(key(KeyCode::Backspace));
+        assert_eq!(s.event_filter, "EN");
+    }
+
+    #[test]
+    fn handle_key_filter_enter_commits_and_exits_input_mode() {
+        let mut s = AppState {
+            filter_input_mode: true,
+            event_filter: "ENG-1".into(),
+            ..Default::default()
+        };
+        s.handle_key(key(KeyCode::Enter));
+        assert!(!s.filter_input_mode);
+        assert_eq!(s.event_filter, "ENG-1");
+    }
+
+    #[test]
+    fn handle_key_filter_esc_cancels_and_clears_filter() {
+        let mut s = AppState {
+            filter_input_mode: true,
+            event_filter: "ENG".into(),
+            ..Default::default()
+        };
+        s.handle_key(key(KeyCode::Esc));
+        assert!(!s.filter_input_mode);
+        assert!(s.event_filter.is_empty());
+        assert!(!s.should_quit);
+    }
+
+    #[test]
+    fn handle_key_ctrl_c_quits_even_in_filter_mode() {
+        let mut s = AppState {
+            filter_input_mode: true,
+            ..Default::default()
+        };
+        let k = KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        assert!(s.handle_key(k));
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn handle_key_filter_caps_input_length() {
+        let mut s = AppState {
+            filter_input_mode: true,
+            ..Default::default()
+        };
+        for _ in 0..200 {
+            s.handle_key(key(KeyCode::Char('x')));
+        }
+        assert_eq!(s.event_filter.len(), 64);
+    }
+
+    #[test]
+    fn render_recent_events_panel_shows_summaries() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("id-1"),
+            identifier: "ENG-1".into(),
+            session: session("t", "u"),
+            backend: "codex".into(),
+            attempt: 1,
+        });
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("recent events (1)"), "buf: {buf}");
+        assert!(buf.contains("dispatched"), "buf: {buf}");
+        assert!(buf.contains("ENG-1"), "buf: {buf}");
+        assert!(buf.contains("codex"), "buf: {buf}");
+    }
+
+    #[test]
+    fn render_recent_events_filter_hides_non_matching_rows() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("id-1"),
+            identifier: "ENG-1".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("id-2"),
+            identifier: "ENG-2".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.event_filter = "ENG-1".into();
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+
+        // Title shows visible/total + active filter.
+        assert!(buf.contains("recent events (1/2)"), "buf: {buf}");
+        assert!(buf.contains("[filter: ENG-1]"), "buf: {buf}");
+        // The non-matching event-row text must not appear in the
+        // recent-events region. (`ENG-2` still appears in the
+        // active-issues table — so we only assert no `ENG-2 → running`
+        // *summary* line shows up in the events panel by checking the
+        // summary string is absent.)
+        let summary_for_eng2 = format!("ENG-2 → {}", format_state(&ClaimState::Running));
+        assert!(
+            !buf.contains(&summary_for_eng2),
+            "filter leaked ENG-2 summary into events panel: {buf}"
+        );
+    }
+
+    #[test]
+    fn render_recent_events_panel_empty_state() {
+        let s = AppState::default();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("recent events (0)"), "buf: {buf}");
+        assert!(buf.contains("no events yet"), "buf: {buf}");
+    }
+
+    #[test]
+    fn render_footer_shows_filter_indicator_when_set() {
+        let s = AppState {
+            event_filter: "ENG-1".into(),
+            ..Default::default()
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("q quit"), "buf: {buf}");
+        assert!(buf.contains("f filter"), "buf: {buf}");
+        assert!(buf.contains("[filter: ENG-1]"), "buf: {buf}");
+    }
+
+    #[test]
+    fn render_footer_in_filter_mode_shows_input_line() {
+        let s = AppState {
+            filter_input_mode: true,
+            event_filter: "EN".into(),
+            ..Default::default()
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("filter:"), "buf: {buf}");
+        assert!(buf.contains("EN"), "buf: {buf}");
+        assert!(buf.contains("Enter"), "buf: {buf}");
+        assert!(buf.contains("Esc"), "buf: {buf}");
+    }
+
+    #[test]
+    fn agent_token_usage_summary_includes_totals() {
+        let summary = format_agent_event(
+            "ENG-9",
+            &AgentEvent::TokenUsage {
+                session: session("t", "u"),
+                usage: TokenUsage {
+                    input: 100,
+                    output: 50,
+                    cached_input: 0,
+                    total: 150,
+                },
+            },
+        );
+        assert!(summary.contains("ENG-9"));
+        assert!(summary.contains("100"));
+        assert!(summary.contains("50"));
+        assert!(summary.contains("150"));
+    }
+
+    #[test]
+    fn event_kind_colour_distinct_per_variant() {
+        // Spot-check that the six variants do not collapse to the same
+        // colour — a regression here would make the panel unscannable.
+        let palette = [
+            event_kind_colour("state_changed"),
+            event_kind_colour("dispatched"),
+            event_kind_colour("agent"),
+            event_kind_colour("retry_scheduled"),
+            event_kind_colour("reconciled"),
+            event_kind_colour("released"),
+            event_kind_colour("lagged"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for c in palette {
+            assert!(seen.insert(format!("{c:?}")), "colour collision: {c:?}");
+        }
     }
 }

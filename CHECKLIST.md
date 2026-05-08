@@ -208,7 +208,7 @@ keep one-task-per-iteration discipline.
 - [x] TUI panel — **cost summary**: tokens (input/output/cached),
       cumulative dollars from `AgentEvent::TokenUsage`. [active issues
       panel]
-- [ ] TUI panel — **recent events log**: ring buffer of the last N
+- [x] TUI panel — **recent events log**: ring buffer of the last N
       events, colour-coded by variant. Hotkey `f` filters by issue
       identifier substring. [active issues panel]
 - [ ] TUI panel — **tandem activity**: visible only when at least one
