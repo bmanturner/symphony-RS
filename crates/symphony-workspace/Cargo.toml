@@ -1,0 +1,19 @@
+[package]
+name = "symphony-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Per-issue workspace lifecycle and path containment for Symphony-RS."
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rstest.workspace = true
+tokio-test.workspace = true

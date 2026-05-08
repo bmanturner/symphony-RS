@@ -1,0 +1,7 @@
+[toolchain]
+# Pin to a current stable channel so every loop iteration builds against the
+# same compiler. We rely on edition 2024 and a few recent stabilizations
+# (e.g. `let ... else`, async fn in traits via `async-trait`).
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "rust-docs"]
+profile = "default"

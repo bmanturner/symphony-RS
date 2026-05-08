@@ -1,0 +1,101 @@
+# Symphony-RS — Rust port of OpenAI's Symphony orchestrator.
+#
+# The repository is a Cargo workspace. Each member crate maps to one of the
+# eight architectural layers from SPEC.md §3.2, plus the `symphony-cli`
+# binary that composes them. The split is intentional: the orchestrator
+# only depends on the trait crates (`symphony-tracker`, `symphony-agent`,
+# `symphony-workspace`), never on a concrete adapter, so we can swap
+# Linear ↔ GitHub-Issues or Codex ↔ Claude without touching the core.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/symphony-core",
+    "crates/symphony-config",
+    "crates/symphony-tracker",
+    "crates/symphony-agent",
+    "crates/symphony-workspace",
+    "crates/symphony-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/foglet-io/rust-symphony"
+
+# ---------------------------------------------------------------------------
+# Pre-approved crate budget. Adding anything outside this list requires an
+# ADR entry in ARCHITECTURE.md § Decisions explaining why a hand-rolled
+# alternative would be worse.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# Async / runtime: tokio is the only async runtime we target. `async-trait`
+# unlocks dyn-compatible async traits which we need at the orchestrator
+# composition boundary.
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = "0.1"
+
+# Serde stack: serde_json for protocol parsing (Codex/Claude both speak
+# JSONL), serde_yaml for WORKFLOW.md front matter, gray_matter to split
+# front matter from prompt body in one pass.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+gray_matter = "0.2"
+
+# HTTP / GraphQL: reqwest with rustls so we never need a system OpenSSL.
+# graphql_client gives us typed Linear queries from .graphql files.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+graphql_client = { version = "0.14", features = ["reqwest-rustls"] }
+url = "2"
+
+# CLI / config: clap derive for the subcommand surface, figment for layered
+# config (defaults → env → WORKFLOW.md), secrecy to keep API tokens out of
+# Debug output, dotenvy for local development ergonomics.
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+secrecy = { version = "0.10", features = ["serde"] }
+figment = { version = "0.10", features = ["env", "yaml", "toml"] }
+
+# Logging: tracing is the only log facade we use. The CLI installs the
+# subscriber once at startup with env-filter and JSON output for prod.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Errors / IDs: anyhow at process boundaries, thiserror inside library
+# crates, uuid v4 for per-run identifiers.
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Filesystem / process: notify watches WORKFLOW.md for hot-reload, which
+# locates `codex` / `claude` binaries on PATH, tempfile gives us throwaway
+# workspaces in tests.
+notify = "8"
+which = "8"
+tempfile = "3"
+
+# Test-only: tokio-test for #[tokio::test] runtimes, wiremock for HTTP
+# fakes (Linear), rstest for parameterized tests, insta for snapshot tests
+# of normalized AgentEvent streams, assert_cmd + predicates for CLI smoke
+# tests.
+tokio-test = "0.4"
+wiremock = "0.6"
+rstest = "0.26"
+insta = { version = "1", features = ["yaml", "json"] }
+assert_cmd = "2"
+predicates = "3"
+
+[profile.dev]
+# Faster incremental rebuilds during the loop.
+opt-level = 0
+debug = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

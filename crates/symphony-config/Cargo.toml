@@ -1,0 +1,17 @@
+[package]
+name = "symphony-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WORKFLOW.md parser and layered configuration for Symphony-RS."
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+gray_matter.workspace = true
+figment.workspace = true
+thiserror.workspace = true
+secrecy.workspace = true
+tracing.workspace = true
+notify.workspace = true

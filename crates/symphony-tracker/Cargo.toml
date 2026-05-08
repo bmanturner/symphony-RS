@@ -1,0 +1,24 @@
+[package]
+name = "symphony-tracker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IssueTracker trait and concrete adapters (Linear today, others later)."
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+graphql_client.workspace = true
+url.workspace = true
+secrecy.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio-test.workspace = true
+rstest.workspace = true

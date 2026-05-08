@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.env
+.env.local
+.DS_Store
+
+# Ralph loop runtime state — per-iteration logs and locks live outside the
+# tracked project history.
+.ralph/
