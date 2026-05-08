@@ -68,7 +68,7 @@ under their phase header and are added or refined as the project evolves.
       (paginated `state=closed` + label-derived state filtering).
       Wiremock tests covering 4xx (auth + other), 5xx, malformed JSON.
       [GitHubTracker (a)]
-- [ ] **GitHubTracker (c)** — parse `blocked_by` from issue body
+- [x] **GitHubTracker (c)** — parse `blocked_by` from issue body
       "blocked by #N" / "depends on #N" refs (no server-side resolution
       yet; `BlockerRef.id` stays `None`, only `identifier` is filled).
       Add `github_canonical_scenario()` mirroring the Linear fixture but

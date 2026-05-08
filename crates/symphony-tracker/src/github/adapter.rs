@@ -52,7 +52,7 @@ use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::IssueTracker;
-use symphony_core::tracker::{Issue, IssueId, IssueState};
+use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
 use symphony_core::tracker_trait::{TrackerError, TrackerResult};
 
 /// Operator-supplied configuration for [`GitHubTracker`].
@@ -294,8 +294,10 @@ fn lowercase_set(states: &[String]) -> std::collections::HashSet<String> {
 fn gh_to_issue(gh: GhIssue, status_prefix: &str) -> Issue {
     // Note: `body` is the raw markdown body. We hand it through verbatim
     // so the orchestrator's prompt template can include the user's
-    // exact text (and so item (c) can later regex over it for blocker
-    // refs).
+    // exact text, *and* feed a copy through `parse_blocked_by` first so
+    // the orchestrator gets a structured view of any "blocked by #N" /
+    // "depends on #N" refs without having to parse markdown itself.
+    let blocked_by = parse_blocked_by(gh.body.as_deref());
     let (state, labels) = derive_state(&gh, status_prefix);
     Issue {
         id: IssueId::new(gh.number.to_string()),
@@ -310,8 +312,7 @@ fn gh_to_issue(gh: GhIssue, status_prefix: &str) -> Issue {
         branch_name: None,
         url: Some(gh.html_url.to_string()),
         labels,
-        // Lands in (c).
-        blocked_by: Vec::new(),
+        blocked_by,
         created_at: Some(gh.created_at.to_rfc3339()),
         updated_at: Some(gh.updated_at.to_rfc3339()),
     }
@@ -344,6 +345,84 @@ fn derive_state(gh: &GhIssue, status_prefix: &str) -> (IssueState, Vec<String>) 
         _ => "open".to_string(),
     });
     (IssueState::new(state), others)
+}
+
+/// Pull `blocked by #N` / `depends on #N` references out of a GitHub
+/// issue body.
+///
+/// GitHub does not expose a structured "blocks" relation (Linear does);
+/// the convention is to drop one of these phrases into the issue body and
+/// let humans + bots scan for it. Symphony parses them eagerly so the
+/// orchestrator can decide whether dispatch should wait on the listed
+/// blockers, even though we cannot yet resolve `id`.
+///
+/// ## Contract — what stays `None`
+///
+/// Per [`BlockerRef`] and the `Issue` fabrication policy in SPEC §4.1.1,
+/// body parsing only knows the human-readable issue *number*. Server-side
+/// resolution of `id` and `state` lands in a later iteration; until then
+/// both fields stay `None` (never invented). The conformance suite's
+/// `assert_no_fabricated_optionals` enforces this.
+///
+/// ## What we match
+///
+/// * Case-insensitive `"blocked by"` and `"depends on"` triggers.
+/// * Optional whitespace and a single optional `:` after the trigger.
+/// * A literal `#`, then one or more ASCII digits.
+/// * Duplicates (same number repeated across phrases) collapse — the
+///   first occurrence wins.
+///
+/// ## What we deliberately do not match
+///
+/// * Comma-separated lists like `"blocked by #1, #2, #3"`. Each blocker
+///   gets its own phrase or is missed; we'd rather drop a hint than
+///   guess at "did they mean the second `#2` is also a blocker?".
+/// * Cross-repo refs like `acme/robot#42`. The orchestrator only ever
+///   acts within a single repo today.
+fn parse_blocked_by(body: Option<&str>) -> Vec<BlockerRef> {
+    let Some(body) = body else {
+        return Vec::new();
+    };
+    // Lowercase mirror used only for trigger lookup; the original `body`
+    // remains the source of truth for indexing so byte offsets stay in
+    // step (both strings have identical byte layouts because
+    // `to_ascii_lowercase` only swaps single-byte characters).
+    let lc = body.to_ascii_lowercase();
+
+    let triggers: &[&str] = &["blocked by", "depends on"];
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut out: Vec<BlockerRef> = Vec::new();
+
+    for trigger in triggers {
+        let mut from = 0usize;
+        while let Some(rel) = lc[from..].find(trigger) {
+            let after = from + rel + trigger.len();
+            // Walk past any whitespace or a single `:` joiner ("blocked
+            // by: #42") before the `#`.
+            let tail = &body[after..];
+            let trimmed = tail.trim_start_matches(|c: char| c.is_whitespace() || c == ':');
+            if let Some(after_hash) = trimmed.strip_prefix('#') {
+                let digits: String = after_hash
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<u64>()
+                    && seen.insert(n)
+                {
+                    out.push(BlockerRef {
+                        id: None,
+                        identifier: Some(format!("#{n}")),
+                        state: None,
+                    });
+                }
+            }
+            // Advance past this trigger occurrence — without this we'd
+            // loop forever when the body contains the trigger phrase
+            // without a following `#N`.
+            from = after;
+        }
+    }
+    out
 }
 
 /// Translate `octocrab`'s rich error type into our coarse
@@ -403,6 +482,68 @@ mod tests {
         assert_eq!(cfg.base_uri.to_string(), "https://api.github.com/");
         assert_eq!(cfg.status_label_prefix, "status:");
         assert_eq!(cfg.page_size, 50);
+    }
+
+    #[test]
+    fn parse_blocked_by_returns_empty_for_none_or_no_triggers() {
+        assert!(parse_blocked_by(None).is_empty());
+        assert!(parse_blocked_by(Some("Just a regular description.")).is_empty());
+        assert!(
+            parse_blocked_by(Some("see #42 for context")).is_empty(),
+            "bare `#N` without a trigger phrase must not be picked up — \
+             those are usually cross-references, not blockers"
+        );
+    }
+
+    #[test]
+    fn parse_blocked_by_picks_up_blocked_by_and_depends_on_variants() {
+        let body = "Blocked by #1.\nAlso depends on #2 because reasons.";
+        let refs = parse_blocked_by(Some(body));
+        let identifiers: Vec<_> = refs
+            .iter()
+            .filter_map(|b| b.identifier.as_deref())
+            .collect();
+        assert_eq!(identifiers, vec!["#1", "#2"]);
+        for b in &refs {
+            assert!(
+                b.id.is_none(),
+                "id must stay None until server-side resolution"
+            );
+            assert!(
+                b.state.is_none(),
+                "state must stay None — body parsing has no state hint"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_blocked_by_is_case_insensitive_and_handles_colon_joiner() {
+        let body = "BLOCKED BY: #7\nDepends On  #8";
+        let refs = parse_blocked_by(Some(body));
+        let identifiers: Vec<_> = refs
+            .iter()
+            .filter_map(|b| b.identifier.as_deref())
+            .collect();
+        assert_eq!(identifiers, vec!["#7", "#8"]);
+    }
+
+    #[test]
+    fn parse_blocked_by_dedupes_by_issue_number() {
+        // Same blocker phrased twice should produce one entry, not two.
+        let body = "Blocked by #99. We are also blocked by #99 in the meantime.";
+        let refs = parse_blocked_by(Some(body));
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].identifier.as_deref(), Some("#99"));
+    }
+
+    #[test]
+    fn parse_blocked_by_does_not_match_bare_text_after_trigger() {
+        // The trigger must be followed by `#N`, not by prose. This
+        // protects against bodies like "blocked by upstream rate limits".
+        assert!(parse_blocked_by(Some("blocked by upstream limits")).is_empty());
+        // And: digits without a `#` are not blockers — that would over-
+        // match unrelated numbers in prose.
+        assert!(parse_blocked_by(Some("depends on 42 things")).is_empty());
     }
 
     #[tokio::test]

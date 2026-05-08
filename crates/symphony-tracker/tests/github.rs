@@ -18,11 +18,14 @@
 //!
 //! [`IssueTracker::fetch_active`]: symphony_tracker::IssueTracker::fetch_active
 
+use std::sync::Arc;
+
 use http::Uri;
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use symphony_core::tracker::{IssueId, IssueState};
+use symphony_core::tracker::{Issue, IssueId, IssueState};
 use symphony_core::tracker_trait::TrackerError;
+use symphony_tracker::conformance::{Scenario, github_canonical_scenario, run_full_suite};
 use symphony_tracker::{GitHubConfig, GitHubTracker, IssueTracker};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -469,4 +472,148 @@ async fn malformed_json_payload_maps_to_malformed() {
     let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
     let err = tracker.fetch_active().await.unwrap_err();
     assert!(matches!(err, TrackerError::Malformed(_)), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Full conformance suite, GitHub-flavoured
+// ---------------------------------------------------------------------------
+//
+// The shared `canonical_scenario()` uses Linear-style identifiers and
+// optional fields (`priority = Some(..)`, structured `BlockerRef`s with
+// `id` populated) that the GitHub adapter cannot honestly produce — the
+// REST surface has no priority field, and `blocked_by` is recovered from
+// body text so the blocker's `id` and `state` stay `None`.
+//
+// `github_canonical_scenario()` mirrors the *shape* of the canonical
+// fixture (mixed-case states, multiple terminals, one issue with a
+// blocker hint) while staying within what the GitHub backend exposes.
+// The wire fixture below renders each scenario issue as a GitHub REST
+// payload, with the blocker hint injected verbatim into the issue body
+// so `parse_blocked_by` can recover it.
+
+/// Render a [`Scenario`] issue as the GitHub-shaped JSON payload the
+/// adapter will receive on the wire.
+fn scenario_issue_to_gh_json(issue: &Issue) -> Value {
+    // Status label that round-trips to `issue.state` after the adapter's
+    // status-prefix derivation. Preserves the fixture's casing so the
+    // mixed-case states from the scenario survive the trip.
+    let status_label = format!("status:{}", issue.state.as_str());
+    // The status label is stripped from `Issue::labels` by `derive_state`,
+    // so we need to *add* it on the wire on top of the normal labels.
+    let mut wire_labels: Vec<&str> = vec![status_label.as_str()];
+    for l in &issue.labels {
+        wire_labels.push(l);
+    }
+    let n: u64 = issue
+        .id
+        .as_str()
+        .parse()
+        .expect("github fixture ids are numeric");
+    gh_issue_json(
+        n,
+        &issue.title,
+        issue.description.as_deref(),
+        // Native state — we drive everything through the status label,
+        // so the native field is just whatever shape octocrab needs.
+        "open",
+        &wire_labels,
+        false,
+    )
+}
+
+/// Stand up a wiremock server primed with a [`Scenario`] and a
+/// [`GitHubTracker`] pointed at it.
+///
+/// Mounts three responder families:
+/// * `GET /repos/acme/robot/issues?state=open` → all active issues
+/// * `GET /repos/acme/robot/issues?state=closed` → all terminal issues
+/// * `GET /repos/acme/robot/issues/{n}` → per-id lookup
+///
+/// Each per-id mount is keyed on the actual scenario id, so adding a
+/// new fixture issue just works.
+async fn github_against(scenario: Scenario) -> (MockServer, GitHubTracker) {
+    let server = MockServer::start().await;
+
+    let active_payload: Vec<Value> = scenario
+        .active_issues
+        .iter()
+        .map(scenario_issue_to_gh_json)
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Value::Array(active_payload)))
+        .mount(&server)
+        .await;
+
+    let terminal_payload: Vec<Value> = scenario
+        .terminal_issues
+        .iter()
+        .map(scenario_issue_to_gh_json)
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues"))
+        .and(query_param("state", "closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Value::Array(terminal_payload)))
+        .mount(&server)
+        .await;
+
+    for issue in scenario
+        .active_issues
+        .iter()
+        .chain(scenario.terminal_issues.iter())
+    {
+        let n: u64 = issue.id.as_str().parse().unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/robot/issues/{n}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(scenario_issue_to_gh_json(issue)),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let cfg = GitHubConfig {
+        token: SecretString::from("ghp_test".to_string()),
+        owner: "acme".into(),
+        repo: "robot".into(),
+        active_states: scenario.active_states.clone(),
+        status_label_prefix: "status:".into(),
+        base_uri: server.uri().parse().expect("parse wiremock uri"),
+        page_size: 50,
+    };
+    let tracker = GitHubTracker::new(cfg).expect("GitHubTracker::new");
+    (server, tracker)
+}
+
+#[tokio::test]
+async fn github_tracker_passes_the_full_conformance_suite() {
+    let scenario = github_canonical_scenario();
+    let (_server, tracker) = github_against(scenario.clone()).await;
+    let dyn_tracker: Arc<dyn IssueTracker> = Arc::new(tracker);
+    run_full_suite(dyn_tracker.as_ref(), &scenario).await;
+}
+
+#[tokio::test]
+async fn fetch_active_recovers_blocked_by_from_issue_body_text() {
+    // The conformance suite enforces this end-to-end via the
+    // fabrication check, but it's worth a focused assertion so a future
+    // refactor that breaks body parsing surfaces with a clear failure
+    // (rather than a generic "fabricated optionals" panic).
+    let scenario = github_canonical_scenario();
+    let (_server, tracker) = github_against(scenario.clone()).await;
+
+    let active = tracker.fetch_active().await.expect("fetch_active");
+    let issue_3 = active
+        .iter()
+        .find(|i| i.id.as_str() == "3")
+        .expect("scenario includes #3");
+    assert_eq!(issue_3.blocked_by.len(), 1);
+    let b = &issue_3.blocked_by[0];
+    assert_eq!(b.identifier.as_deref(), Some("#1"));
+    assert!(b.id.is_none(), "id stays None until server-side resolution");
+    assert!(
+        b.state.is_none(),
+        "state stays None — body text has no state hint"
+    );
 }
