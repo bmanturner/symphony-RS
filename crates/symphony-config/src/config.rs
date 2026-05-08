@@ -16,10 +16,11 @@
 //! 2. **Defaults documented as code.** Every `#[serde(default = "...")]`
 //!    points at a function whose name encodes the SPEC default value, so
 //!    a reviewer can audit a default with `git grep`.
-//! 3. **Forward compatibility.** Unknown top-level keys are ignored
-//!    (SPEC §5.3) but unknown nested keys inside known sections are
-//!    rejected — typos in `polling.interva_ms` should not silently fall
-//!    back to defaults.
+//! 3. **Strictness over ambiguity.** Unknown keys at *any* level are
+//!    rejected (SPEC v2 §5: "Unknown top-level and nested keys MUST be
+//!    rejected"). Typos in `polling.interva_ms` should not silently fall
+//!    back to defaults, and a stray top-level `routes:` (when the schema
+//!    expects `routing:`) should fail load loudly.
 //!
 //! ## Deviations from the upstream Symphony spec
 //!
@@ -40,9 +41,18 @@ use serde::{Deserialize, Serialize};
 /// Round-trips losslessly through `serde_yaml`. Constructed either via
 /// `serde_yaml::from_str` (during load) or `WorkflowConfig::default()`
 /// (for tests and the in-memory base layer of the figment merge).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
+    /// Workflow schema version. Optional while the project is
+    /// pre-adoption: omitting it defaults to [`SUPPORTED_SCHEMA_VERSION`]
+    /// (currently `1`). If present, it MUST equal that constant. Any
+    /// other value is a validation error so a stale `WORKFLOW.md` that
+    /// expected a different schema fails loudly at load time rather than
+    /// being silently coerced. See SPEC v2 §5.0.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+
     /// Issue-tracker selection and credentials. See SPEC §5.3.1.
     #[serde(default)]
     pub tracker: TrackerConfig,
@@ -80,6 +90,30 @@ pub struct WorkflowConfig {
     /// operator with an open port on a public interface.
     #[serde(default)]
     pub status: StatusConfig,
+}
+
+/// The only `schema_version` accepted by this build. Bumped only when
+/// `WORKFLOW.md` requires an explicit format migration; ordinary product
+/// evolution should not bump this constant.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    SUPPORTED_SCHEMA_VERSION
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: SUPPORTED_SCHEMA_VERSION,
+            tracker: TrackerConfig::default(),
+            polling: PollingConfig::default(),
+            workspace: WorkspaceConfig::default(),
+            hooks: HooksConfig::default(),
+            agent: AgentConfig::default(),
+            codex: CodexConfig::default(),
+            status: StatusConfig::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +543,12 @@ fn default_status_replay_buffer() -> usize {
 /// but is semantically invalid per SPEC §5.3.5.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigValidationError {
+    /// `schema_version` must equal [`SUPPORTED_SCHEMA_VERSION`]. We
+    /// reject every other value (including `0`) so a stale or
+    /// future-dated workflow file fails fast instead of being coerced.
+    #[error("schema_version {0} is not supported (only {SUPPORTED_SCHEMA_VERSION} is accepted)")]
+    UnsupportedSchemaVersion(u32),
+
     /// `agent.max_turns` must be a positive integer.
     #[error("agent.max_turns must be > 0 (got {0})")]
     MaxTurnsZero(u32),
@@ -551,6 +591,11 @@ impl WorkflowConfig {
     /// the orchestrator. The CLI's `symphony validate` subcommand maps
     /// the resulting errors to non-zero exits.
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self.schema_version != SUPPORTED_SCHEMA_VERSION {
+            return Err(ConfigValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
         if self.agent.max_turns == 0 {
             return Err(ConfigValidationError::MaxTurnsZero(self.agent.max_turns));
         }
@@ -607,6 +652,73 @@ impl WorkflowConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_schema_version_is_supported() {
+        let cfg = WorkflowConfig::default();
+        assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_version_defaults_when_omitted() {
+        let yaml = "tracker:\n  project_slug: ENG\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.schema_version, SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(parsed.validate(), Ok(()));
+    }
+
+    #[test]
+    fn schema_version_explicit_one_is_accepted() {
+        let yaml = "schema_version: 1\ntracker:\n  project_slug: ENG\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.schema_version, 1);
+        assert_eq!(parsed.validate(), Ok(()));
+    }
+
+    #[test]
+    fn schema_version_zero_is_rejected_by_validate() {
+        let yaml = "schema_version: 0\ntracker:\n  project_slug: ENG\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            parsed.validate(),
+            Err(ConfigValidationError::UnsupportedSchemaVersion(0))
+        );
+    }
+
+    #[test]
+    fn schema_version_future_value_is_rejected_by_validate() {
+        let yaml = "schema_version: 2\ntracker:\n  project_slug: ENG\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            parsed.validate(),
+            Err(ConfigValidationError::UnsupportedSchemaVersion(2))
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        // SPEC v2 §5: unknown top-level keys MUST be rejected.
+        let yaml = "schema_version: 1\nroutes:\n  default: lead\n";
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("routes") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_version_roundtrips() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        let yaml = serde_yaml::to_string(&cfg).expect("serialises");
+        assert!(
+            yaml.contains("schema_version: 1"),
+            "expected schema_version in serialised YAML, got: {yaml}"
+        );
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&yaml).expect("re-parses");
+        assert_eq!(reparsed.schema_version, 1);
+        assert_eq!(reparsed, cfg);
+    }
 
     #[test]
     fn defaults_match_spec_5_3() {
