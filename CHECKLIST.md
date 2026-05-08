@@ -186,7 +186,7 @@ keep one-task-per-iteration discipline.
       true), `bind` (default `"127.0.0.1:6280"`), `replay_buffer`
       (default 256). `deny_unknown_fields`, defaults via
       `default_status_*` free functions per the existing convention.
-- [ ] Build the SSE handler in `symphony-cli`: an `axum` router with
+- [x] Build the SSE handler in `symphony-cli`: an `axum` router with
       `GET /events` that subscribes to the orchestrator's broadcast bus
       and serialises each `OrchestratorEvent` as one SSE `data:` frame.
       Bound concurrent subscribers; drop slow consumers with a
