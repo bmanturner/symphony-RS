@@ -2,7 +2,7 @@
 
 This is the strategic plan for shaping Symphony-RS into a specialist-agent orchestration product.
 
-The v2 direction intentionally borrows lessons from Paperclip without cloning Paperclip. The target product is configurable: platform-lead and QA behaviors are first-class because they preserve the crux of the workflow, while all other specialist roles are workflow-defined.
+The v2 direction intentionally borrows lessons from prior orchestration work without cloning its organization. The target product is configurable: platform-lead and QA behaviors are first-class because they preserve the crux of the workflow, while all other specialist roles are workflow-defined.
 
 ## Product Thesis
 
@@ -16,7 +16,7 @@ intake -> decompose -> specialist execution -> integration owner -> exhaustive Q
 
 ### Phase 0 — v2 Design Grounding
 
-Create v2 state files and fixtures. Keep existing v1 docs as implementation history. v2 documents are the target product direction.
+Create v2 state files and fixtures. Treat v2 documents as the product direction and update existing implementation docs/code as needed.
 
 ### Phase 1 — Config v2 Schema
 
@@ -28,7 +28,7 @@ Success bar: a full v2 fixture validates and negative fixtures fail loudly.
 
 Introduce persistent state for work items, runs, edges, handoffs, QA verdicts, workspace claims, and events.
 
-Success bar: a mock run survives process restart with enough state to recover safely.
+Success bar: a deterministic fake run survives process restart with enough state to recover safely.
 
 ### Phase 3 — Domain Model
 
@@ -80,7 +80,7 @@ Success bar: follow-ups are linked, scoped, acceptance-tested, and clearly block
 
 ### Phase 11 — Scheduler v2
 
-Replace the flat v1 poll loop with durable logical queues, leases, recovery, retries, and multi-level concurrency.
+Replace the current flat poll loop with durable logical queues, leases, recovery, retries, and multi-level concurrency.
 
 Success bar: crash/restart recovery leaves no phantom running work and no duplicate active leases.
 
@@ -92,36 +92,35 @@ Success bar: an operator can answer “what is blocked, who owns it, what branch
 
 ### Phase 13 — End-to-End Scenarios
 
-Use mock trackers/agents to test the whole product loop before relying on real providers.
+Use deterministic fake trackers/agents to test the whole product loop before relying on live GitHub, Linear, Codex, Claude, or Hermes.
 
 Success bar: broad issue -> decomposition -> child execution -> integration -> QA failure -> blocker -> rework -> QA pass is covered by an automated test.
 
 ### Phase 14 — Documentation and Productization
 
-Document workflow schema, role semantics, workspace policy, QA protocol, and migration from v1.
+Document workflow schema, role semantics, workspace policy, QA protocol, and the upgrade path from the current implementation.
 
 ## Design Constraints
 
 - Do not hardcode a full org chart.
 - Do codify `integration_owner` and `qa_gate` role kinds.
-- Keep adapters replaceable.
+- Keep the product adapter set deliberately small: git, GitHub, Linear, Codex, Claude, Hermes. Deterministic fakes are allowed only for tests.
 - Make tracker mutation capability explicit.
 - Make state durable before complex autonomous loops depend on it.
 - Prefer strict schemas over prompt-only conventions.
-- Prefer local deterministic mock E2E tests before real tracker tests.
+- Prefer local deterministic fake E2E tests before live adapter tests.
 
 ## Pending Refactors
 
-- Replace v1 prompt string substitution with a strict template/renderer.
+- Replace current prompt string substitution with a strict template/renderer.
 - Split current `IssueTracker` into read and mutation traits.
-- Move v1 in-memory scheduler state behind a durable state abstraction.
+- Move current in-memory scheduler state behind a durable state abstraction.
 - Promote `LocalFsWorkspace` return values into `WorkspaceClaim`.
 - Reconcile retry queue comments/checklist with actual production wiring.
 
 ## Open Questions
 
 1. Persistence crate choice: `sqlx` vs `rusqlite`.
-2. Whether v2 should keep v1 `symphony run` behavior as `run-v1` during migration.
-3. Whether tracker mutations should be direct adapter methods or exposed as agent tools plus audited orchestrator wrappers.
-4. Whether integration branch operations should be implemented in core or delegated to a VCS adapter crate.
-5. How much of the live dashboard should ship before the durable CLI status is excellent.
+2. Whether tracker mutations should be direct adapter methods or exposed as agent tools plus audited orchestrator wrappers.
+3. Whether integration branch operations should live in core orchestration or the git adapter.
+4. How much of the live dashboard should ship before the durable CLI status is excellent.

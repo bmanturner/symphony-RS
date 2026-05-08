@@ -6,7 +6,7 @@ This document describes the target architecture for the v2 product direction: a 
 
 ## 1. Architectural Goal
 
-Symphony-RS v2 should evolve from a single daemon that polls issues and runs agents into a durable orchestration kernel with pluggable adapters.
+Symphony-RS should evolve from its current issue-polling runner into a durable orchestration kernel with a deliberately small adapter set.
 
 The kernel owns workflow truth:
 
@@ -23,11 +23,10 @@ The kernel owns workflow truth:
 
 Adapters own external protocol details:
 
-- trackers;
-- VCS/hosting providers;
-- agent runtimes;
-- workspace backends;
-- notification/approval channels.
+- GitHub and Linear tracker APIs;
+- git source-control operations;
+- Codex, Claude, and Hermes agent runtimes;
+- local workspaces managed through the git/workspace layer.
 
 ## 2. Layered View
 
@@ -49,25 +48,25 @@ Adapters own external protocol details:
 │   worktrees, branch claims, cwd/ref verification, cleanup               │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Adapter Traits                                                        │
-│   TrackerRead/Mutations, AgentRuntime, VcsProvider, WorkspaceManager   │
+│   TrackerRead/Mutations, AgentRuntime, GitProvider, WorkspaceManager   │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Concrete Adapters                                                     │
-│   GitHub, Linear, Paperclip, Codex, Claude, Hermes, LocalFs/Git        │
+│   git, GitHub, Linear, Codex, Claude, Hermes                           │
 ├───────────────────────────────────────────────────────────────────────┤
 │ Observability / Control                                               │
 │   logs, status, SSE, TUI/dashboard, approvals, audit exports            │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-## 3. Key Design Shifts From v1
+## 3. Key Design Shifts From Current Implementation
 
 ### 3.1 From issue runner to workflow kernel
 
-v1 poll loop dispatches active issues. v2 needs a kernel that can create internal work items, link them, block parent completion, and drive staged handoffs.
+The current poll loop dispatches active issues. The target kernel creates internal work items, links them, blocks parent completion, and drives staged handoffs.
 
 ### 3.2 From single `agent.kind` to role-routed agents
 
-v1 has `agent.kind`. v2 has named roles and named agents. A role selects an agent and defines authority. A backend executes sessions.
+The current config centers on `agent.kind`. The target config has named roles and named agents. A role selects an agent and defines authority. A backend executes sessions.
 
 ### 3.3 From comments-as-state to durable workflow objects
 
@@ -113,7 +112,7 @@ Add typed v2 workflow config:
 - `PersistenceConfig`;
 - `BudgetConfig`.
 
-Keep v1 config loadable during transition. The loader should detect `version: 2` and parse v2. Missing version defaults to v1 until the project intentionally flips.
+Make the target workflow schema the product direction. The loader should parse `version: 2` strictly and existing config should be changed as necessary rather than protected indefinitely.
 
 ### 4.2 `symphony-core`
 
@@ -136,7 +135,7 @@ crates/symphony-core/src/
   lease.rs
 ```
 
-Core owns pure state transitions and invariants. It should not call GitHub, Linear, Paperclip, Codex, Claude, or Hermes directly.
+Core owns pure state transitions and invariants. It should not call git, GitHub, Linear, Codex, Claude, or Hermes directly.
 
 ### 4.3 `symphony-state`
 
@@ -182,7 +181,7 @@ If an adapter only supports read, the workflow can still run in advisory mode bu
 
 ### 4.5 `symphony-agent`
 
-Keep backend adapters, but move from generic prompt-only execution to structured run requests:
+Keep agent adapters limited to Codex, Claude, and Hermes, but move from generic prompt-only execution to structured run requests:
 
 ```rust
 pub struct AgentRunRequest {
@@ -206,11 +205,11 @@ Evolve from `LocalFsWorkspace` into policy-driven workspace management:
 - `existing_worktree` strategy;
 - `shared_integration_branch` strategy.
 
-Add VCS provider trait:
+Add git operations trait:
 
 ```rust
 #[async_trait]
-pub trait VcsProvider {
+pub trait GitProvider {
     async fn prepare_branch(&self, req: BranchRequest) -> Result<BranchClaim>;
     async fn verify_claim(&self, claim: &WorkspaceClaim) -> Result<VerificationReport>;
     async fn integrate_child(&self, req: IntegrateChildRequest) -> Result<IntegrationStep>;
@@ -222,7 +221,7 @@ pub trait VcsProvider {
 
 Add v2 CLI surfaces:
 
-- `symphony validate WORKFLOW.md` — validate v1/v2 config.
+- `symphony validate WORKFLOW.md` — validate workflow config.
 - `symphony run WORKFLOW.md` — start kernel.
 - `symphony status` — summarize durable state.
 - `symphony worktree verify <issue>` — debug workspace policy.
@@ -473,7 +472,7 @@ Events go to:
 
 ### 2026-05-08 — v2 centers integration ownership and QA gates
 
-Context: Paperclip experience showed that agents can implement bounded work, but broad work fails without a strong integrator and truthful QA gate. Decomposition alone is not completion.
+Context: prior orchestration experience showed that agents can implement bounded work, but broad work fails without a strong integrator and truthful QA gate. Decomposition alone is not completion.
 
 Decision: v2 elevates `integration_owner` and `qa_gate` to semantic role kinds. The exact org chart remains configurable, but those two behaviors are core.
 
@@ -481,11 +480,11 @@ Consequence: The kernel needs parent/child/blocker state, integration records, a
 
 ### 2026-05-08 — Durable state becomes mandatory
 
-Context: v1 intentionally avoids persistent orchestrator state. v2 needs recovery, audit, run history, blocker/QA evidence, and parent closeout gates.
+Context: the current implementation avoids persistent orchestrator state. The target product needs recovery, audit, run history, blocker/QA evidence, and parent closeout gates.
 
 Decision: Add a persistence layer, with SQLite as the default local implementation.
 
-Consequence: Scheduler code must become transaction-aware. Tests need migration fixtures and recovery scenarios.
+Consequence: Scheduler code must become transaction-aware. Tests need schema fixtures and recovery scenarios.
 
 ### 2026-05-08 — Tracker writes are a capability, not an agent prompt trick
 

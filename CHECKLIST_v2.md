@@ -5,13 +5,13 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 0 — v2 Grounding
 
 - [ ] Add `SPEC_v2.md`, `ARCHITECTURE_v2.md`, `PLAN_v2.md`, `CHECKLIST_v2.md`, and `PROMPT_v2.md` to the repo root.
-- [ ] Add README note that v1 files remain current implementation state while v2 files describe the target product direction.
+- [ ] Add README note that v2 files are the product direction and existing implementation docs should be updated as the code moves to that direction.
 - [ ] Add a `version: 2` fixture workflow under `tests/fixtures/v2-workflow/WORKFLOW.md` with roles, routing, integration, and QA sections.
 
 ## Phase 1 — Config v2 Schema
 
 - [ ] Add `WorkflowConfigV2` behind `version: 2` detection in `symphony-config`.
-- [ ] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`.
+- [ ] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`; `custom` is a role kind, not an adapter extension point.
 - [ ] Add typed `AgentProfileConfig` decoupled from role names.
 - [ ] Add typed `RoutingConfig` and `RoutingRule` with deterministic first-match behavior.
 - [ ] Add `DecompositionConfig`, `IntegrationConfig`, `QaConfig`, and `FollowupConfig`.
@@ -43,12 +43,13 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 4 — Tracker Capabilities
 
-- [ ] Split current `IssueTracker` into `TrackerRead` and `TrackerMutations` traits while preserving v1 adapter compatibility.
+- [ ] Split current `IssueTracker` into `TrackerRead` and `TrackerMutations` traits.
 - [ ] Add `TrackerCapabilities` so workflows can detect read-only vs mutation-capable adapters.
 - [ ] Add mutation request/response types: create issue, update issue, add comment, add blocker, link parent/child, attach artifact.
 - [ ] Implement mutation no-op/advisory wrapper for read-only trackers.
 - [ ] Extend GitHub adapter with issue create/comment/label-based blocker or relation mapping where feasible.
-- [ ] Add `PaperclipTracker` adapter spike against local Paperclip API or DB, behind a feature flag if needed.
+- [ ] Extend Linear adapter with issue create/comment/dependency mapping where feasible.
+- [ ] Keep product adapter scope limited to git, GitHub, Linear, Codex, Claude, and Hermes.
 - [ ] Add conformance tests for read adapter behavior and separate mutation conformance tests for capable adapters.
 
 ## Phase 5 — Routing and Decomposition
@@ -64,7 +65,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 6 — Workspace and Branch Claims
 
 - [ ] Replace path-only workspace return with `WorkspaceClaim` containing path, strategy, base ref, branch, and verification report.
-- [ ] Add `git_worktree` strategy with branch template expansion.
+- [ ] Add `git_worktree` strategy with branch template expansion using the git adapter.
 - [ ] Add `existing_worktree` strategy with required branch verification.
 - [ ] Add shared integration branch strategy for explicit same-branch workflows.
 - [ ] Add cwd verification immediately before agent launch.
@@ -86,7 +87,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add integration queue fed by completed child issues or broad issues requiring consolidation.
 - [ ] Implement integration-owner run request with child handoffs and branch/workspace claims.
 - [ ] Add integration record persistence.
-- [ ] Add VCS integration operation abstraction: merge/cherry-pick/shared-branch verification.
+- [ ] Add git integration operation abstraction: merge/cherry-pick/shared-branch verification.
 - [ ] Add gate requiring all child issues terminal before integration unless explicitly waived.
 - [ ] Add gate requiring no open blockers before QA request.
 - [ ] Add tests for child completion, blocker prevention, successful integration handoff, and conflict/rework path.
@@ -133,18 +134,18 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 13 — End-to-End Scenarios
 
-- [ ] Add mock scenario: broad parent decomposes into two child specialist issues, integrates, passes QA, closes parent.
-- [ ] Add mock scenario: QA files blocker, blocker routes to specialist, integration reruns, QA passes.
-- [ ] Add mock scenario: specialist files non-blocking follow-up while current work proceeds.
-- [ ] Add mock scenario: dirty/wrong branch blocks agent launch.
-- [ ] Add mock scenario: integration owner cannot close parent with unresolved child.
+- [ ] Add deterministic test scenario: broad parent decomposes into two child specialist issues, integrates, passes QA, closes parent.
+- [ ] Add deterministic test scenario: QA files blocker, blocker routes to specialist, integration reruns, QA passes.
+- [ ] Add deterministic test scenario: specialist files non-blocking follow-up while current work proceeds.
+- [ ] Add deterministic test scenario: dirty/wrong branch blocks agent launch.
+- [ ] Add deterministic test scenario: integration owner cannot close parent with unresolved child.
 - [ ] Add crash/restart scenario proving durable recovery of queued/running/blocked work.
 
 ## Phase 14 — Documentation and Productization
 
 - [ ] Write `docs/workflow-v2.md` with full schema examples.
-- [ ] Write `docs/roles.md` explaining integration owner, QA gate, and custom specialists.
+- [ ] Write `docs/roles.md` explaining integration owner, QA gate, and configurable specialists.
 - [ ] Write `docs/workspaces.md` explaining worktree/shared-branch policies.
 - [ ] Write `docs/qa.md` explaining verdicts, blockers, evidence, and waivers.
-- [ ] Write migration note from v1 runner workflow to v2 orchestration workflow.
-- [ ] Add quickstart fixture and README walkthrough for v2 mock workflow.
+- [ ] Write upgrade note explaining how existing implementation docs/code are being reshaped into v2 orchestration workflow.
+- [ ] Add quickstart fixture and README walkthrough for v2 workflow.
