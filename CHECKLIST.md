@@ -205,7 +205,7 @@ keep one-task-per-iteration discipline.
 - [x] TUI panel — **active issues** table: identifier, state, elapsed,
       agent backend. Updates from `StateChanged` and `Dispatched`.
       [TUI scaffold]
-- [ ] TUI panel — **cost summary**: tokens (input/output/cached),
+- [x] TUI panel — **cost summary**: tokens (input/output/cached),
       cumulative dollars from `AgentEvent::TokenUsage`. [active issues
       panel]
 - [ ] TUI panel — **recent events log**: ring buffer of the last N

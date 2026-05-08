@@ -42,6 +42,8 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use symphony_agent::tandem::CostModel;
+use symphony_core::agent::{AgentEvent, SessionId, TokenUsage};
 use symphony_core::events::OrchestratorEvent;
 use symphony_core::state_machine::ClaimState;
 use symphony_core::tracker::IssueId;
@@ -115,6 +117,74 @@ pub struct ActiveIssue {
     pub attempt: u32,
 }
 
+/// Running cost-summary aggregate.
+///
+/// `AgentEvent::TokenUsage` is *cumulative-per-session*: both the Claude
+/// and Codex runners merge each backend snapshot into a per-session
+/// running total and re-emit the full total on every update (see
+/// `crates/symphony-agent/src/claude/runner.rs` `merge_usage` and
+/// `codex/runner.rs` `merge_tokens`). That means a naive "sum every
+/// `TokenUsage` event" approach over-counts by the number of intermediate
+/// emissions. We instead remember the **latest** snapshot keyed by
+/// [`SessionId`] and treat the table's sum as the cumulative total — that
+/// way an adapter that only ever reports a final cumulative is identical
+/// to one that streams progressive cumulatives.
+///
+/// Dollars are derived per-backend via [`CostModel::cost_usd`]. Pricing
+/// lives in [`CostState::pricing`] and **defaults to empty** — we never
+/// fabricate a price (mirrors the tandem-telemetry contract). Operators
+/// supply real rates via configuration; until then the panel honestly
+/// renders `$0.00` while still showing accurate token counts.
+#[derive(Debug, Clone, Default)]
+pub struct CostState {
+    /// Latest cumulative [`TokenUsage`] per session. Replaced (not
+    /// summed) on every `AgentEvent::TokenUsage` because backend
+    /// adapters emit cumulative totals.
+    pub session_tokens: HashMap<SessionId, TokenUsage>,
+    /// Session → backend label, populated on
+    /// [`OrchestratorEvent::Dispatched`]. Required so cost can pick the
+    /// right `CostModel` per session — token events do not carry the
+    /// backend label themselves.
+    pub session_backend: HashMap<SessionId, String>,
+    /// Per-backend pricing. Empty by default; an operator/config-loader
+    /// populates this from `WORKFLOW.md`. Unknown backends fall through
+    /// to a zero model (no fabrication).
+    pub pricing: HashMap<String, CostModel>,
+}
+
+impl CostState {
+    /// Sum of every session's latest cumulative token snapshot. Each
+    /// scalar is a straight `u64::saturating_add` so the panel never
+    /// silently wraps under absurd inputs.
+    pub fn aggregate_tokens(&self) -> TokenUsage {
+        let mut acc = TokenUsage::default();
+        for u in self.session_tokens.values() {
+            acc.input = acc.input.saturating_add(u.input);
+            acc.output = acc.output.saturating_add(u.output);
+            acc.cached_input = acc.cached_input.saturating_add(u.cached_input);
+            acc.total = acc.total.saturating_add(u.total);
+        }
+        acc
+    }
+
+    /// Cumulative dollars across all sessions, applying each session's
+    /// per-backend pricing. Sessions whose backend has no entry in
+    /// [`CostState::pricing`] contribute `$0` rather than guessing.
+    pub fn aggregate_dollars(&self) -> f64 {
+        let mut total = 0.0;
+        for (sid, tokens) in &self.session_tokens {
+            let backend = match self.session_backend.get(sid) {
+                Some(b) => b,
+                None => continue,
+            };
+            if let Some(model) = self.pricing.get(backend) {
+                total += model.cost_usd(tokens);
+            }
+        }
+        total
+    }
+}
+
 /// All state the TUI needs to render a frame.
 ///
 /// Future panels (cost summary, recent-events log, tandem activity)
@@ -137,6 +207,8 @@ pub struct AppState {
     /// that panel exists this field becomes redundant and is removed
     /// in the same commit.
     pub last_event_summary: Option<String>,
+    /// Token + dollar accumulator surfaced in the cost-summary panel.
+    pub cost: CostState,
     /// Set true when the user pressed `q` (or `Ctrl+C`); the run loop
     /// terminates on the next iteration. Tests inspect this directly.
     pub should_quit: bool,
@@ -234,9 +306,9 @@ impl AppState {
             OrchestratorEvent::Dispatched {
                 issue,
                 identifier,
+                session,
                 backend,
                 attempt,
-                ..
             } => {
                 let row = self
                     .active_issues
@@ -253,13 +325,34 @@ impl AppState {
                 row.backend = Some(backend.clone());
                 row.attempt = *attempt;
                 row.dispatched_at = Some(Instant::now());
+                // Capture the session→backend mapping so the cost panel
+                // can apply per-backend pricing to later TokenUsage
+                // events. Token events carry only the SessionId.
+                self.cost
+                    .session_backend
+                    .insert(session.clone(), backend.clone());
             }
             OrchestratorEvent::Released { issue, .. } => {
                 self.active_issues.remove(issue);
+                // Cost totals are intentionally *not* purged on
+                // release: the panel renders a cumulative-since-launch
+                // figure, and dropping a session's contribution when
+                // its issue completes would make the dollar count run
+                // backwards. Sessions are pruned only when the TUI
+                // restarts.
             }
-            OrchestratorEvent::Agent { .. }
-            | OrchestratorEvent::RetryScheduled { .. }
-            | OrchestratorEvent::Reconciled { .. } => {
+            OrchestratorEvent::Agent { event, .. } => {
+                if let AgentEvent::TokenUsage { session, usage } = event {
+                    // Replace, don't sum: backend adapters emit
+                    // cumulative totals on every update, so the latest
+                    // snapshot already includes everything that came
+                    // before. See [`CostState`] docs.
+                    self.cost
+                        .session_tokens
+                        .insert(session.clone(), usage.clone());
+                }
+            }
+            OrchestratorEvent::RetryScheduled { .. } | OrchestratorEvent::Reconciled { .. } => {
                 // Other variants do not change *which* issues are
                 // active or *what state* they are in; later panels
                 // hook in here without touching the active-issues
@@ -320,6 +413,7 @@ pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
             Constraint::Length(3),
             Constraint::Min(3),
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
@@ -342,6 +436,7 @@ pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
     );
 
     render_active_issues(state, now, frame, chunks[1]);
+    render_cost_summary(state, frame, chunks[2]);
 
     let body = state
         .last_event_summary
@@ -353,14 +448,68 @@ pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
                 .borders(Borders::ALL)
                 .title("recent activity (placeholder)"),
         ),
-        chunks[2],
+        chunks[3],
     );
 
     let footer = Line::from(vec![
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
     ]);
-    frame.render_widget(Paragraph::new(footer), chunks[3]);
+    frame.render_widget(Paragraph::new(footer), chunks[4]);
+}
+
+/// Render the single-line cost-summary panel.
+///
+/// Shows the four token buckets (`in`, `out`, `cached`, `total`) followed
+/// by cumulative dollars. Numbers are thousand-separated so a six-figure
+/// token count is still legible in an 80-column terminal. When pricing
+/// is unconfigured (zero models for every backend) the dollar field
+/// renders as `$0.00` — accurate to the configuration, never fabricated.
+fn render_cost_summary(state: &AppState, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    let agg = state.cost.aggregate_tokens();
+    let dollars = state.cost.aggregate_dollars();
+    let line = Line::from(vec![
+        Span::styled("tok ", Style::default().add_modifier(Modifier::DIM)),
+        Span::raw(format!("in {}", thousands(agg.input))),
+        Span::raw("  "),
+        Span::raw(format!("out {}", thousands(agg.output))),
+        Span::raw("  "),
+        Span::raw(format!("cached {}", thousands(agg.cached_input))),
+        Span::raw("  "),
+        Span::raw(format!("total {}", thousands(agg.total))),
+        Span::raw("    "),
+        Span::styled(
+            format!("${dollars:.2}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).block(Block::default().borders(Borders::ALL).title("cost")),
+        area,
+    );
+}
+
+/// Thousand-separator format for token counts.
+///
+/// `1234567` → `"1,234,567"`. Pure ASCII so it renders identically across
+/// terminals and snapshot tests; no `num_format` dep needed.
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        // Insert a comma before every group of three digits except the
+        // first. `len - i` is the number of digits *remaining*, so a
+        // multiple-of-three boundary marks a separator point.
+        let remaining = bytes.len() - i;
+        if i > 0 && remaining.is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// Render the active-issues table into `area`.
@@ -979,6 +1128,280 @@ mod tests {
     }
 
     #[test]
+    fn thousands_formats_grouped_digits() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(123), "123");
+        assert_eq!(thousands(1_234), "1,234");
+        assert_eq!(thousands(12_345), "12,345");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn dispatched_records_session_backend_for_cost_lookup() {
+        let mut s = AppState::default();
+        let sid = session("t", "u");
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: sid.clone(),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+        assert_eq!(
+            s.cost.session_backend.get(&sid).map(String::as_str),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn token_usage_replaces_not_sums_for_cumulative_emissions() {
+        // Backend adapters emit cumulative TokenUsage on every update.
+        // Two emissions on the same session must leave the panel at the
+        // *latest* total, not the sum of both.
+        let mut s = AppState::default();
+        let sid = session("t", "u");
+        let emit = |s: &mut AppState, input: u64, output: u64, total: u64| {
+            s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+                issue: IssueId::new("ENG-1"),
+                event: AgentEvent::TokenUsage {
+                    session: sid.clone(),
+                    usage: TokenUsage {
+                        input,
+                        output,
+                        cached_input: 0,
+                        total,
+                    },
+                },
+            });
+        };
+        emit(&mut s, 100, 50, 150);
+        emit(&mut s, 300, 200, 500);
+        let agg = s.cost.aggregate_tokens();
+        assert_eq!(agg.input, 300);
+        assert_eq!(agg.output, 200);
+        assert_eq!(agg.total, 500);
+    }
+
+    #[test]
+    fn token_usage_sums_across_sessions() {
+        let mut s = AppState::default();
+        for (sid, input, output) in [
+            (session("t", "u1"), 100u64, 50u64),
+            (session("t", "u2"), 200, 75),
+        ] {
+            s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+                issue: IssueId::new("ENG-1"),
+                event: AgentEvent::TokenUsage {
+                    session: sid,
+                    usage: TokenUsage {
+                        input,
+                        output,
+                        cached_input: 0,
+                        total: input + output,
+                    },
+                },
+            });
+        }
+        let agg = s.cost.aggregate_tokens();
+        assert_eq!(agg.input, 300);
+        assert_eq!(agg.output, 125);
+        assert_eq!(agg.total, 425);
+    }
+
+    #[test]
+    fn aggregate_dollars_is_zero_without_pricing() {
+        // No fabrication: an unconfigured pricing table yields $0.00
+        // even with non-zero tokens.
+        let mut s = AppState::default();
+        let sid = session("t", "u");
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: sid.clone(),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::TokenUsage {
+                session: sid,
+                usage: TokenUsage {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    cached_input: 0,
+                    total: 2_000_000,
+                },
+            },
+        });
+        assert_eq!(s.cost.aggregate_dollars(), 0.0);
+    }
+
+    #[test]
+    fn aggregate_dollars_applies_per_backend_pricing() {
+        let mut s = AppState::default();
+        s.cost.pricing.insert(
+            "claude".to_string(),
+            CostModel {
+                input_per_million_usd: 3.0,
+                cached_input_per_million_usd: 0.30,
+                output_per_million_usd: 15.0,
+            },
+        );
+        let sid = session("t", "u");
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: sid.clone(),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::TokenUsage {
+                session: sid,
+                usage: TokenUsage {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    cached_input: 0,
+                    total: 2_000_000,
+                },
+            },
+        });
+        // 1M input @ $3 + 1M output @ $15 = $18.00.
+        let dollars = s.cost.aggregate_dollars();
+        assert!(
+            (dollars - 18.0).abs() < 1e-9,
+            "expected ~18.00, got {dollars}"
+        );
+    }
+
+    #[test]
+    fn aggregate_dollars_unknown_backend_contributes_zero() {
+        let mut s = AppState::default();
+        s.cost.pricing.insert(
+            "claude".to_string(),
+            CostModel {
+                input_per_million_usd: 3.0,
+                cached_input_per_million_usd: 0.30,
+                output_per_million_usd: 15.0,
+            },
+        );
+        let sid = session("t", "u");
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: sid.clone(),
+            backend: "exotic-backend".into(),
+            attempt: 1,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::TokenUsage {
+                session: sid,
+                usage: TokenUsage {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    cached_input: 0,
+                    total: 2_000_000,
+                },
+            },
+        });
+        assert_eq!(s.cost.aggregate_dollars(), 0.0);
+    }
+
+    #[test]
+    fn release_does_not_purge_session_tokens() {
+        // Cost panel renders cumulative-since-launch; releasing a
+        // completed issue must not rewind the dollar counter.
+        let mut s = AppState::default();
+        let sid = session("t", "u");
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: sid.clone(),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::TokenUsage {
+                session: sid,
+                usage: TokenUsage {
+                    input: 100,
+                    output: 50,
+                    cached_input: 0,
+                    total: 150,
+                },
+            },
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Released {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            reason: ReleaseReason::Completed,
+            final_state: None,
+        });
+        assert_eq!(s.cost.aggregate_tokens().total, 150);
+    }
+
+    #[test]
+    fn render_cost_panel_shows_zero_dollars_when_unconfigured() {
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let s = AppState::default();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("cost"), "buf: {buf}");
+        assert!(buf.contains("$0.00"), "buf: {buf}");
+        assert!(buf.contains("in 0"), "buf: {buf}");
+    }
+
+    #[test]
+    fn render_cost_panel_shows_aggregated_tokens_and_dollars() {
+        let mut s = AppState::default();
+        s.cost.pricing.insert(
+            "claude".to_string(),
+            CostModel {
+                input_per_million_usd: 3.0,
+                cached_input_per_million_usd: 0.30,
+                output_per_million_usd: 15.0,
+            },
+        );
+        let sid = session("t", "u");
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: sid.clone(),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::TokenUsage {
+                session: sid,
+                usage: TokenUsage {
+                    input: 12_345,
+                    output: 6_789,
+                    cached_input: 1_000,
+                    total: 19_134,
+                },
+            },
+        });
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("12,345"), "in tokens missing: {buf}");
+        assert!(buf.contains("6,789"), "out tokens missing: {buf}");
+        assert!(buf.contains("1,000"), "cached missing: {buf}");
+        assert!(buf.contains("19,134"), "total missing: {buf}");
+        // 12_345 @ $3 + 1_000 @ $0.30 + 6_789 @ $15 = $0.139... ≈ $0.14
+        // (12345 - 1000)*3/1e6 + 1000*0.30/1e6 + 6789*15/1e6
+        // = 0.034035 + 0.0003 + 0.101835 = 0.13617
+        assert!(buf.contains("$0.14"), "dollars missing: {buf}");
+    }
+
+    #[test]
     fn render_active_issues_shows_elapsed_for_dispatched_row() {
         let mut s = AppState::default();
         s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
@@ -997,7 +1420,7 @@ mod tests {
             .dispatched_at = Some(dispatched);
         let now = dispatched + Duration::from_secs(90);
 
-        let backend = TestBackend::new(80, 12);
+        let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(&s, now, f)).unwrap();
         let buf = terminal.backend().to_string();
