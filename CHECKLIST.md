@@ -63,7 +63,7 @@ under their phase header and are added or refined as the project evolves.
       `blocked_by = []` for now — those land in (c) and (d). Pure unit
       tests on the normalization helpers + a happy-path wiremock test.
       [octocrab in budget]
-- [ ] **GitHubTracker (b)** — `fetch_state(&[IssueId])` (per-number GET
+- [x] **GitHubTracker (b)** — `fetch_state(&[IssueId])` (per-number GET
       preserving caller order) and `fetch_terminal_recent(&[IssueState])`
       (paginated `state=closed` + label-derived state filtering).
       Wiremock tests covering 4xx (auth + other), 5xx, malformed JSON.

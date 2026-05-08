@@ -195,26 +195,84 @@ impl IssueTracker for GitHubTracker {
         Ok(out)
     }
 
-    async fn fetch_state(&self, _ids: &[IssueId]) -> TrackerResult<Vec<Issue>> {
-        // Lands in checklist item GitHubTracker (b). Returning a
-        // structured error rather than `Ok(vec![])` is deliberate: a
-        // silent empty would let the orchestrator's reconcile pass
-        // believe every tracked issue had been deleted.
-        Err(TrackerError::Other(
-            "GitHubTracker::fetch_state not implemented yet (see CHECKLIST item GitHubTracker (b))"
-                .into(),
-        ))
+    async fn fetch_state(&self, ids: &[IssueId]) -> TrackerResult<Vec<Issue>> {
+        // Per-id GET against `/repos/{owner}/{repo}/issues/{number}`.
+        //
+        // We deliberately preserve the caller's id ordering in the
+        // returned vector — the orchestrator's reconcile pass walks
+        // the result alongside its own ordered worker list, and the
+        // conformance suite (`assert_fetch_state_preserves_caller_ordering`)
+        // pins this contract for every adapter.
+        //
+        // No silent dropping: any 404 (or other failure) on a single id
+        // surfaces as the whole call returning an error, matching the
+        // trait contract on [`IssueTracker::fetch_state`]. Otherwise a
+        // deleted issue would masquerade as still-running.
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let number: u64 = id.as_str().parse().map_err(|e| {
+                TrackerError::Misconfigured(format!(
+                    "GitHub issue ids are positive integers; got {:?}: {e}",
+                    id.as_str()
+                ))
+            })?;
+            let gh = self
+                .client
+                .issues(&self.config.owner, &self.config.repo)
+                .get(number)
+                .await
+                .map_err(map_octocrab_error)?;
+            out.push(gh_to_issue(gh, &self.config.status_label_prefix));
+        }
+        Ok(out)
     }
 
     async fn fetch_terminal_recent(
         &self,
-        _terminal_states: &[IssueState],
+        terminal_states: &[IssueState],
     ) -> TrackerResult<Vec<Issue>> {
-        Err(TrackerError::Other(
-            "GitHubTracker::fetch_terminal_recent not implemented yet \
-             (see CHECKLIST item GitHubTracker (b))"
-                .into(),
-        ))
+        // Empty filter short-circuits — matches the Linear adapter's
+        // contract and avoids a wasted round trip when the operator
+        // configured no terminal states.
+        if terminal_states.is_empty() {
+            return Ok(Vec::new());
+        }
+        // List closed issues (paginated). GitHub's native `closed`
+        // state is the broadest signal; we then narrow to the operator's
+        // configured terminal states by re-deriving each issue's state
+        // from its labels (same rule as `fetch_active`). Issues with no
+        // status label fall back to native `"closed"` — so an operator
+        // who lists `"closed"` as terminal gets every closed issue,
+        // while one who lists `"done"` only gets issues actually
+        // labelled `status:done`.
+        let first = self
+            .client
+            .issues(&self.config.owner, &self.config.repo)
+            .list()
+            .state(GhState::Closed)
+            .per_page(self.config.page_size)
+            .send()
+            .await
+            .map_err(map_octocrab_error)?;
+        let raw = self
+            .client
+            .all_pages(first)
+            .await
+            .map_err(map_octocrab_error)?;
+
+        let allowed: std::collections::HashSet<String> =
+            terminal_states.iter().map(|s| s.normalized()).collect();
+        let mut out = Vec::with_capacity(raw.len());
+        for gh in raw {
+            if gh.pull_request.is_some() {
+                continue;
+            }
+            let issue = gh_to_issue(gh, &self.config.status_label_prefix);
+            if allowed.contains(&issue.state.normalized()) {
+                out.push(issue);
+            }
+        }
+        Ok(out)
     }
 }
 

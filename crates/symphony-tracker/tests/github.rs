@@ -21,8 +21,10 @@
 use http::Uri;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use symphony_core::tracker::{IssueId, IssueState};
+use symphony_core::tracker_trait::TrackerError;
 use symphony_tracker::{GitHubConfig, GitHubTracker, IssueTracker};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build the JSON payload for a single GitHub issue with every
@@ -232,4 +234,239 @@ async fn fetch_active_falls_back_to_native_state_when_no_status_label_matches() 
     let active = tracker.fetch_active().await.unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].state.as_str(), "open");
+}
+
+// ---------------------------------------------------------------------------
+// fetch_state — per-id GET, caller order preserved
+// ---------------------------------------------------------------------------
+
+/// Build a tracker pointing at `server` with the canonical config used
+/// by the failure-mode tests below. Pulled out so each test can mount
+/// its own responders and not duplicate the config block.
+fn cfg_for(server: &MockServer) -> GitHubConfig {
+    GitHubConfig {
+        token: SecretString::from("ghp_test".to_string()),
+        owner: "acme".into(),
+        repo: "robot".into(),
+        active_states: vec!["todo".into(), "in progress".into()],
+        status_label_prefix: "status:".into(),
+        base_uri: server.uri().parse().expect("parse wiremock uri"),
+        page_size: 50,
+    }
+}
+
+#[tokio::test]
+async fn fetch_state_preserves_caller_order_across_per_issue_gets() {
+    // Mount one responder per issue. Caller asks in order [10, 7, 42];
+    // the wiremock responses are mounted in a different sequence (42
+    // first, then 7, then 10) so the test would fail if the adapter
+    // returned them in mount/discovery order rather than caller order.
+    let server = MockServer::start().await;
+    for n in [42u64, 7, 10] {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/robot/issues/{n}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+                n,
+                &format!("issue-{n}"),
+                None,
+                "open",
+                &["status:todo"],
+                false,
+            )))
+            .mount(&server)
+            .await;
+    }
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+
+    let ids = vec![IssueId::new("10"), IssueId::new("7"), IssueId::new("42")];
+    let refreshed = tracker.fetch_state(&ids).await.expect("fetch_state");
+
+    let returned: Vec<String> = refreshed
+        .iter()
+        .map(|i| i.id.as_str().to_string())
+        .collect();
+    assert_eq!(returned, vec!["10", "7", "42"]);
+    // Spot-check normalization round-trips for one of them.
+    assert_eq!(refreshed[1].state.as_str(), "todo");
+    assert_eq!(refreshed[1].identifier, "#7");
+}
+
+#[tokio::test]
+async fn fetch_state_with_non_numeric_id_is_misconfigured_not_a_panic() {
+    // No responder mounted — we expect to fail before any HTTP.
+    let server = MockServer::start().await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+    let err = tracker
+        .fetch_state(&[IssueId::new("not-a-number")])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Misconfigured(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn fetch_state_404_on_one_id_fails_the_whole_call() {
+    // Trait contract: adapters MUST NOT silently drop ids — return a
+    // structured error or every id with its state. A 404 here therefore
+    // bubbles up as a TrackerError.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            1,
+            "still here",
+            None,
+            "open",
+            &["status:todo"],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/2"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "Not Found",
+            "documentation_url": "https://docs.test/rest"
+        })))
+        .mount(&server)
+        .await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+
+    let err = tracker
+        .fetch_state(&[IssueId::new("1"), IssueId::new("2")])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Misconfigured(_)), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// fetch_terminal_recent — closed listing + state filter
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_terminal_recent_with_empty_filter_short_circuits_no_request() {
+    // No responder mounted: a short-circuit means we never hit the
+    // server. If the adapter changed to send a request, wiremock would
+    // 404 and the result would be a TrackerError instead of Ok(vec![]).
+    let server = MockServer::start().await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+    let out = tracker.fetch_terminal_recent(&[]).await.unwrap();
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn fetch_terminal_recent_lists_closed_and_filters_by_derived_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues"))
+        .and(query_param("state", "closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            // status:done — should pass the "done" terminal filter.
+            gh_issue_json(11, "Done one", None, "closed", &["status:done"], false),
+            // status:wontfix — derived state "wontfix", not in the
+            // operator's terminal list, must be dropped.
+            gh_issue_json(12, "Skipped", None, "closed", &["status:wontfix"], false),
+            // No status label, native "closed" — operator did NOT list
+            // "closed" as terminal so this must be dropped too.
+            gh_issue_json(13, "Naked close", None, "closed", &[], false),
+            // PR with a matching label — must be excluded regardless.
+            gh_issue_json(14, "Refactor PR", None, "closed", &["status:done"], true),
+        ])))
+        .mount(&server)
+        .await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+
+    let out = tracker
+        .fetch_terminal_recent(&[IssueState::new("Done")])
+        .await
+        .expect("fetch_terminal_recent");
+    let identifiers: Vec<String> = out.iter().map(|i| i.identifier.clone()).collect();
+    assert_eq!(identifiers, vec!["#11".to_string()]);
+    assert_eq!(out[0].state.as_str(), "done");
+}
+
+// ---------------------------------------------------------------------------
+// Failure-mode mapping — one test per row of the error table in
+// `github/adapter.rs`. Driven through `fetch_active` for parity with the
+// Linear suite; the error mapper is shared across all three trait
+// methods, so covering one entry point is enough.
+// ---------------------------------------------------------------------------
+
+async fn tracker_with_status(status: u16, body: Value) -> (MockServer, GitHubTracker) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&server)
+        .await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+    (server, tracker)
+}
+
+fn gh_error_body(message: &str) -> Value {
+    // Shape the GitHub API uses for non-2xx responses; octocrab decodes
+    // this into `Error::GitHub { source, .. }` which we then map.
+    json!({
+        "message": message,
+        "documentation_url": "https://docs.test/rest"
+    })
+}
+
+#[tokio::test]
+async fn http_401_maps_to_unauthorized() {
+    let (_server, tracker) = tracker_with_status(401, gh_error_body("bad creds")).await;
+    let err = tracker.fetch_active().await.unwrap_err();
+    assert!(matches!(err, TrackerError::Unauthorized(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn http_403_maps_to_unauthorized() {
+    let (_server, tracker) = tracker_with_status(403, gh_error_body("no scope")).await;
+    let err = tracker.fetch_active().await.unwrap_err();
+    assert!(matches!(err, TrackerError::Unauthorized(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn http_422_maps_to_misconfigured() {
+    // Other 4xx (here: validation failed) lands in Misconfigured per the
+    // table — operators usually need to fix the call shape, not retry.
+    let (_server, tracker) = tracker_with_status(422, gh_error_body("validation failed")).await;
+    let err = tracker.fetch_active().await.unwrap_err();
+    assert!(matches!(err, TrackerError::Misconfigured(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn http_500_maps_to_transport_so_reconcile_keeps_running() {
+    let (_server, tracker) = tracker_with_status(500, gh_error_body("boom")).await;
+    let err = tracker.fetch_active().await.unwrap_err();
+    assert!(matches!(err, TrackerError::Transport(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn http_503_maps_to_transport() {
+    let (_server, tracker) = tracker_with_status(503, gh_error_body("unavailable")).await;
+    let err = tracker.fetch_active().await.unwrap_err();
+    assert!(matches!(err, TrackerError::Transport(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn malformed_json_payload_maps_to_malformed() {
+    // 200 OK whose body is not parseable JSON. octocrab's page decoder
+    // tries `serde_json::from_slice` first; the failure surfaces as
+    // `Error::Serde`, which our mapper routes to `Malformed`.
+    //
+    // Note: a JSON *object* (rather than the expected array) takes a
+    // different code path inside octocrab — it tries to find a known
+    // pagination attribute (`items`, `workflow_runs`, …) and on miss
+    // raises `Error::Other`. That branch is not interesting for our
+    // mapping table; the variant we care about is the "wire isn't even
+    // JSON" case, which is what this test pins down.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json{"))
+        .mount(&server)
+        .await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+    let err = tracker.fetch_active().await.unwrap_err();
+    assert!(matches!(err, TrackerError::Malformed(_)), "got {err:?}");
 }
