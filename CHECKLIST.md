@@ -102,7 +102,7 @@ under their phase header and are added or refined as the project evolves.
       --session-id <uuid>` [AgentRunner trait]
 - [x] Subprocess tests with a fake binary in `tests/fixtures/`
       [CodexRunner, ClaudeRunner]
-- [ ] Stream-shape parity test: identical script → identical normalized
+- [x] Stream-shape parity test: identical script → identical normalized
       `AgentEvent` sequence (modulo backend-only events) [fake binary]
 
 ## Phase 5 — Orchestrator
