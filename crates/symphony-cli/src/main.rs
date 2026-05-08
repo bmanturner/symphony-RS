@@ -14,10 +14,6 @@
 mod cli;
 mod logging;
 mod run;
-// `sse` is wired into the `symphony run` lifecycle by the next
-// checklist item; until then the module is exercised only by its own
-// unit tests, so silence the dead-code warnings on its public surface.
-#[allow(dead_code)]
 mod sse;
 mod status;
 mod validate;

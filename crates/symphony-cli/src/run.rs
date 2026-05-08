@@ -71,6 +71,7 @@ use symphony_agent::mock::{MockAgentConfig, MockAgentRunner};
 use symphony_agent::tandem::{TandemRunner, TandemStrategy};
 use symphony_config::{AgentKind, LayeredLoader, TrackerKind, WorkflowConfig};
 use symphony_core::agent::{AgentEvent, AgentRunner, CompletionReason, StartSessionParams};
+use symphony_core::event_bus::EventBus;
 use symphony_core::poll_loop::{Dispatcher, PollLoop, PollLoopConfig};
 use symphony_core::state_machine::ReleaseReason;
 use symphony_core::tracker::Issue;
@@ -138,12 +139,53 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         // to retune it.
         drain_deadline: Duration::from_secs(30),
     };
-    let poll_loop = PollLoop::new(tracker, dispatcher, cfg);
+
+    // The event bus is shared between the orchestrator (the producer)
+    // and the optional SSE server (a fan-out consumer). Building it at
+    // the composition root lets both sides agree on replay sizing —
+    // [`StatusConfig::replay_buffer`] is the single knob.
+    let bus = EventBus::new(loaded.config.status.replay_buffer);
+    let poll_loop = PollLoop::with_event_bus(tracker, dispatcher, cfg, bus.clone());
 
     let cancel = CancellationToken::new();
     install_ctrl_c(cancel.clone());
 
+    // Spawn the SSE status server alongside the orchestrator when
+    // enabled. The task owns its own clone of the cancel token so the
+    // SIGINT path drains both halves on the same signal. We deliberately
+    // do *not* fail `symphony run` on a bind error: the orchestrator
+    // loop is the load-bearing surface, and an operator who hits a
+    // port-already-in-use should still be able to drive issues through.
+    // The error is logged loudly so the failure is visible.
+    let status_task = if loaded.config.status.enabled {
+        let bind = loaded.config.status.bind.clone();
+        let bus = bus.clone();
+        let cancel = cancel.clone();
+        Some(tokio::spawn(async move {
+            let state = crate::sse::SseState::new(bus, crate::sse::SseConfig::default());
+            if let Err(err) = crate::sse::bind_and_serve(&bind, state, cancel).await {
+                error!(bind = %bind, error = %err, "SSE status server failed");
+            }
+        }))
+    } else {
+        info!("status surface disabled by config; skipping SSE server");
+        None
+    };
+
     poll_loop.run(cancel).await;
+
+    // Wait for the SSE server to finish its graceful shutdown before
+    // returning. `axum::serve(...).with_graceful_shutdown` resolves
+    // when its shutdown signal fires *and* every in-flight request
+    // drops, so awaiting here turns "symphony run exited cleanly" into
+    // a true claim — no zombie listener, no half-closed sockets.
+    if let Some(handle) = status_task {
+        match handle.await {
+            Ok(()) => info!("SSE status server stopped cleanly"),
+            Err(err) => warn!(error = %err, "SSE status server task did not join cleanly"),
+        }
+    }
+
     info!("symphony run exited cleanly");
     Ok(())
 }

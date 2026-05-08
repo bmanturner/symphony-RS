@@ -191,7 +191,7 @@ keep one-task-per-iteration discipline.
       and serialises each `OrchestratorEvent` as one SSE `data:` frame.
       Bound concurrent subscribers; drop slow consumers with a
       `Lagged` event. [event bus, axum in budget, status config]
-- [ ] Wire the SSE server into `symphony run` lifecycle (start with the
+- [x] Wire the SSE server into `symphony run` lifecycle (start with the
       orchestrator, drain on SIGINT). `wiremock`-style integration test
       that connects a fake client and asserts a scripted event sequence
       arrives in order. [SSE handler]

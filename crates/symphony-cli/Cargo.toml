@@ -35,4 +35,5 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 tempfile.workspace = true

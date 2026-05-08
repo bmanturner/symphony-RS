@@ -11,11 +11,11 @@
 //! over HTTP, can crash and reconnect freely, and never touches the
 //! daemon's address space.
 //!
-//! This module owns just the *server* half of that boundary. Wiring it
-//! into [`crate::run::run`]'s lifecycle (start with the orchestrator,
-//! drain on SIGINT) is the next checklist item — keeping the surface
-//! split lets us land and test the request handler without entangling
-//! it in the binary's startup path.
+//! This module owns just the *server* half of that boundary.
+//! [`serve`] is the entry point [`crate::run::run`] calls to spawn the
+//! HTTP listener alongside the orchestrator; it shares its
+//! [`CancellationToken`] with the poll loop so SIGINT drains both
+//! halves on the same signal.
 //!
 //! # Wire format
 //!
@@ -68,8 +68,10 @@ use futures::Stream;
 use futures::StreamExt;
 use symphony_core::event_bus::EventBus;
 use symphony_core::events::OrchestratorEvent;
+use tokio::net::TcpListener;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tracing::{debug, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 /// Default upper bound on concurrent `GET /events` subscribers.
 ///
@@ -181,6 +183,46 @@ pub fn router(state: SseState) -> Router {
     Router::new()
         .route("/events", get(events_handler))
         .with_state(state)
+}
+
+/// Serve the SSE router on `listener` until `cancel` fires.
+///
+/// Pulled out of [`crate::run::run`] so the integration test can bind a
+/// random port (`127.0.0.1:0`), discover the assigned address via
+/// [`TcpListener::local_addr`], and drive a real HTTP client against
+/// the same code path the daemon uses.
+///
+/// Cancellation is cooperative: we hand `cancel.cancelled()` to axum's
+/// `with_graceful_shutdown`, which stops accepting new connections and
+/// waits for in-flight requests to drain. SSE streams currently in
+/// flight unblock through their own broadcast subscription — when the
+/// orchestrator stops emitting, the keep-alive timer is the only thing
+/// keeping them alive, and dropping the bus side closes the channels.
+pub async fn serve(
+    listener: TcpListener,
+    state: SseState,
+    cancel: CancellationToken,
+) -> std::io::Result<()> {
+    let local = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+    info!(bind = %local, "SSE status server listening");
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move { cancel.cancelled().await })
+        .await
+}
+
+/// Bind `bind` and call [`serve`]. Convenience wrapper for the
+/// composition root, which has a string from `WORKFLOW.md` rather than a
+/// pre-built listener.
+pub async fn bind_and_serve(
+    bind: &str,
+    state: SseState,
+    cancel: CancellationToken,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(bind).await?;
+    serve(listener, state, cancel).await
 }
 
 /// `GET /events` handler. Fast-fails with 503 when over cap; otherwise
@@ -359,13 +401,135 @@ mod tests {
     #[tokio::test]
     async fn router_rejects_when_over_cap() {
         // Smoke-check the router builds and that `try_acquire`
-        // returns the expected 503 path. We don't spin up an HTTP
-        // server here — the next checklist item adds the wiremock-
-        // style integration test in `symphony run` lifecycle.
+        // returns the expected 503 path.
         let bus = EventBus::new(4);
         let state = SseState::new(bus, SseConfig { max_subscribers: 1 });
         let _g = state.try_acquire().expect("slot");
         let _router = router(state.clone());
         assert!(state.try_acquire().is_none());
+    }
+
+    /// End-to-end HTTP test: bind a real listener, drive it via
+    /// [`serve`], connect a `reqwest` client, emit a scripted event
+    /// sequence on the bus, and assert each frame arrives in order.
+    ///
+    /// This is the wiremock-style integration test the Phase-8
+    /// checklist asks for: the server runs the same code path
+    /// `symphony run` will use, and the client parses the SSE wire
+    /// format byte-for-byte.
+    #[tokio::test]
+    async fn sse_server_streams_scripted_events_to_real_client() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let bus = EventBus::new(16);
+        let state = SseState::new(bus.clone(), SseConfig::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let cancel = CancellationToken::new();
+
+        let server = tokio::spawn(serve(listener, state, cancel.clone()));
+
+        // Open the SSE connection. We deliberately skip any SSE-client
+        // crate and read raw bytes — the daemon's TUI client is also
+        // hand-rolled (per the next checklist item), so this exercises
+        // the same parsing surface a production consumer will see.
+        let url = format!("http://{addr}/events");
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .expect("GET /events");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or("").to_string())
+                .unwrap_or_default(),
+            "text/event-stream"
+        );
+
+        // Wait for the server to register the subscriber before we
+        // start emitting — broadcast events sent before subscription
+        // are silently dropped by tokio::sync::broadcast, and a race
+        // here would manifest as a flaky test.
+        for _ in 0..50 {
+            if bus.subscriber_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            bus.subscriber_count() >= 1,
+            "subscriber should have attached"
+        );
+
+        // Emit a scripted sequence the test will assert on, in order.
+        let scripted: Vec<OrchestratorEvent> = vec![ev("ENG-1"), ev("ENG-2"), ev("ENG-3")];
+        for e in &scripted {
+            bus.emit(e.clone());
+        }
+
+        // Read chunks until we've parsed three `data: ` JSON lines, or
+        // a generous wall-clock timeout fires. A real consumer reads
+        // until either `\n\n` (frame boundary) or EOF; here we keep it
+        // simple and accumulate into a `String`.
+        let mut buf = String::new();
+        let mut resp = resp;
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            while data_lines(&buf).len() < scripted.len() {
+                let chunk = match resp.chunk().await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // server closed
+                    Err(e) => panic!("chunk read failed: {e}"),
+                };
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "timed out waiting for SSE frames; buf={buf:?}"
+        );
+
+        // Each `data:` line must parse as the matching OrchestratorEvent.
+        let lines = data_lines(&buf);
+        assert_eq!(lines.len(), scripted.len(), "frame count; raw={buf:?}");
+        for (i, line) in lines.iter().enumerate() {
+            let parsed: OrchestratorEvent =
+                serde_json::from_str(line).expect("data: payload is valid JSON");
+            // We compare via JSON round-trip: OrchestratorEvent doesn't
+            // derive PartialEq (it carries enum payloads with f64s), so
+            // structural equality lives on the wire.
+            let expected = serde_json::to_value(&scripted[i]).unwrap();
+            let got = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(got, expected, "frame {i} mismatch");
+        }
+
+        // Drop the response *before* cancelling — axum's graceful
+        // shutdown waits for in-flight requests to drop. Holding the
+        // response would deadlock the join below until the keep-alive
+        // timer wins.
+        drop(resp);
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task did not exit before deadline")
+            .expect("server task did not panic");
+        assert!(join.is_ok(), "server returned error: {join:?}");
+    }
+
+    /// Extract the JSON payload from each `data: ...` line in an
+    /// accumulated SSE buffer. Strips the `data: ` prefix and the
+    /// trailing newline; ignores `event:` and comment lines, which the
+    /// integration test asserts on separately if it cares.
+    fn data_lines(buf: &str) -> Vec<&str> {
+        buf.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .collect()
     }
 }
