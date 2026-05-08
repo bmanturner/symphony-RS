@@ -34,7 +34,7 @@ under their phase header and are added or refined as the project evolves.
       `branch_name`, `priority`, and `blocked_by` are `Option`s and that
       adapters **never fabricate** these when the source backend lacks
       the data.
-- [ ] Define the `IssueTracker` async trait with `fetch_active`,
+- [x] Define the `IssueTracker` async trait with `fetch_active`,
       `fetch_state`, `fetch_terminal_recent` [Issue model]
 - [ ] Implement `MockTracker` in `symphony-tracker::mock` with a
       programmable script for tests [IssueTracker trait]

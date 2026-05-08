@@ -12,5 +12,7 @@
 //! phases).
 
 pub mod tracker;
+pub mod tracker_trait;
 
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
+pub use tracker_trait::{IssueTracker, TrackerError, TrackerResult};
