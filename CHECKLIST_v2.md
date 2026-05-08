@@ -4,7 +4,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 0 — v2 Grounding
 
-- [ ] Rewrite existing quickstart/sample workflow fixtures to the target schema with roles, routing, polling, hooks, integration, PR, and QA sections.
+- [x] Rewrite existing quickstart/sample workflow fixtures to the target schema with roles, routing, polling, hooks, integration, PR, and QA sections.
 
 ## Phase 1 — Workflow Config Schema
 

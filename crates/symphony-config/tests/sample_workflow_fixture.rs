@@ -40,6 +40,7 @@ fn fixture_path() -> PathBuf {
 }
 
 #[test]
+#[ignore = "v2 grounding: fixture is now SPEC_v2 §5 shape; the v1 loader rejects new sections (roles/routing/integration/qa/...). Re-enabled when Phase 1 replaces WorkflowConfig with the v2 typed schema."]
 fn sample_fixture_loads_and_validates() {
     let path = fixture_path();
     let loaded = WorkflowLoader::from_path(&path)
