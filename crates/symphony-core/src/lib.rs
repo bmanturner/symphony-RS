@@ -12,6 +12,7 @@
 //! phases).
 
 pub mod agent;
+pub mod event_bus;
 pub mod events;
 pub mod poll_loop;
 pub mod retry;
@@ -24,6 +25,7 @@ pub use agent::{
     CompletionReason, RateLimitSnapshot, SessionId, StartSessionParams, ThreadId, TokenUsage,
     TurnId,
 };
+pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};

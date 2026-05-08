@@ -174,7 +174,7 @@ keep one-task-per-iteration discipline.
       `#[serde(tag = "type")]` so SSE consumers can switch on type.
       Doc comment declares the wire format stable: additions
       non-breaking, removals require a major bump.
-- [ ] Add `tokio::sync::broadcast` event bus to the orchestrator with a
+- [x] Add `tokio::sync::broadcast` event bus to the orchestrator with a
       configurable replay buffer (default 256). Public `subscribe()`
       returns `BroadcastStream<OrchestratorEvent>`. Pure addition — no
       behavioural change. Tests assert that events are emitted on every

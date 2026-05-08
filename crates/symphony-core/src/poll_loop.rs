@@ -60,7 +60,9 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::state_machine::{ReleaseReason, StateMachine};
+use crate::event_bus::EventBus;
+use crate::events::OrchestratorEvent;
+use crate::state_machine::{ClaimState, ReleaseReason, StateMachine};
 use crate::tracker::{Issue, IssueId};
 use crate::tracker_trait::{IssueTracker, TrackerError};
 
@@ -176,6 +178,10 @@ struct DispatchHandle {
     /// dispatcher returned when reaping the task. Set by the
     /// reconciliation pass; left `None` for a normal completion.
     override_reason: Option<ReleaseReason>,
+    /// Tracker identifier captured at claim time. Carried so reap-time
+    /// [`OrchestratorEvent::Released`] emissions can include it without
+    /// needing to refetch the issue.
+    identifier: String,
 }
 
 /// The orchestrator's poll loop.
@@ -195,6 +201,11 @@ pub struct PollLoop {
     /// and removed on reap. Lets reconciliation cancel a specific run
     /// and override its release reason.
     handles: HashMap<IssueId, DispatchHandle>,
+    /// Observability bus. Every claim, reconciliation, and release fans
+    /// out as an [`OrchestratorEvent`] for the Phase-8 status surface.
+    /// Pure addition: emission is best-effort and the orchestrator never
+    /// blocks on subscriber backlog.
+    bus: EventBus,
     /// Monotonic counter used to derive jitter without pulling in a
     /// random-number generator. See `jittered_sleep_for`.
     tick_seq: u64,
@@ -207,6 +218,19 @@ impl PollLoop {
         dispatcher: Arc<dyn Dispatcher>,
         config: PollLoopConfig,
     ) -> Self {
+        Self::with_event_bus(tracker, dispatcher, config, EventBus::default())
+    }
+
+    /// Construct a poll loop with a caller-supplied [`EventBus`]. Lets
+    /// the composition root (`symphony-cli`) wire one bus into both the
+    /// orchestrator and the SSE handler so they share replay buffer
+    /// sizing and subscriber accounting.
+    pub fn with_event_bus(
+        tracker: Arc<dyn IssueTracker>,
+        dispatcher: Arc<dyn Dispatcher>,
+        config: PollLoopConfig,
+        bus: EventBus,
+    ) -> Self {
         Self {
             tracker,
             dispatcher,
@@ -214,6 +238,7 @@ impl PollLoop {
             state: StateMachine::new(),
             in_flight: JoinSet::new(),
             handles: HashMap::new(),
+            bus,
             tick_seq: 0,
         }
     }
@@ -222,6 +247,19 @@ impl PollLoop {
     /// by tests that want to assert on the currently-running set.
     pub fn state(&self) -> &StateMachine {
         &self.state
+    }
+
+    /// Subscribe to the orchestrator's [`OrchestratorEvent`] stream.
+    /// Cheap: the underlying broadcast channel allocates one slot per
+    /// subscriber. See [`EventBus`] for backpressure semantics.
+    pub fn subscribe(&self) -> tokio_stream::wrappers::BroadcastStream<OrchestratorEvent> {
+        self.bus.subscribe()
+    }
+
+    /// Borrow the event bus directly. Useful at the composition root
+    /// where the SSE handler wants its own clone of the sender.
+    pub fn event_bus(&self) -> &EventBus {
+        &self.bus
     }
 
     /// Run a single tick: reap finished dispatches, fetch active issues,
@@ -258,6 +296,7 @@ impl PollLoop {
             .filter(|id| !active_ids.contains(*id))
             .cloned()
             .collect();
+        let mut dropped_this_tick: Vec<IssueId> = Vec::new();
         for id in &stale {
             if let Some(handle) = self.handles.get_mut(id)
                 && handle.override_reason.is_none()
@@ -265,8 +304,17 @@ impl PollLoop {
                 handle.override_reason = Some(ReleaseReason::NoLongerActive);
                 handle.cancel.cancel();
                 reconciled += 1;
+                dropped_this_tick.push(id.clone());
                 debug!(issue = %id, "reconciliation: issue left active set; cancelling dispatch");
             }
+        }
+        // Emit a single Reconciled summary per tick that actually
+        // marked anything stale. A no-op tick is silent on the bus —
+        // see `OrchestratorEvent::Reconciled` docs.
+        if !dropped_this_tick.is_empty() {
+            self.bus.emit(OrchestratorEvent::Reconciled {
+                dropped: dropped_this_tick,
+            });
         }
 
         let mut report = TickReport {
@@ -392,12 +440,21 @@ impl PollLoop {
         while let Some(joined) = self.in_flight.join_next().await {
             match joined {
                 Ok((id, dispatcher_reason)) => {
-                    let reason = self
-                        .handles
-                        .remove(&id)
+                    let handle = self.handles.remove(&id);
+                    let identifier = handle
+                        .as_ref()
+                        .map(|h| h.identifier.clone())
+                        .unwrap_or_default();
+                    let reason = handle
                         .and_then(|h| h.override_reason)
                         .unwrap_or(dispatcher_reason);
-                    let _ = self.state.release(id, reason);
+                    let _ = self.state.release(id.clone(), reason);
+                    self.bus.emit(OrchestratorEvent::Released {
+                        issue: id,
+                        identifier,
+                        reason,
+                        final_state: None,
+                    });
                 }
                 Err(err) if err.is_cancelled() => {
                     // We don't know which `id` this aborted task belonged
@@ -406,8 +463,14 @@ impl PollLoop {
                     // ones whose tasks haven't been reaped — and those
                     // are precisely the ones we just aborted. Releasing
                     // them as `Canceled` keeps the ledger accurate.
-                    if let Some(id) = pop_any(&mut self.handles) {
-                        let _ = self.state.release(id, ReleaseReason::Canceled);
+                    if let Some((id, handle)) = pop_any_entry(&mut self.handles) {
+                        let _ = self.state.release(id.clone(), ReleaseReason::Canceled);
+                        self.bus.emit(OrchestratorEvent::Released {
+                            issue: id,
+                            identifier: handle.identifier,
+                            reason: ReleaseReason::Canceled,
+                            final_state: None,
+                        });
                     }
                 }
                 Err(err) => warn!(error = %err, "dispatch task panicked during forced drain"),
@@ -418,8 +481,15 @@ impl PollLoop {
         // get released defensively so the ledger never lies.
         let leftover: Vec<IssueId> = self.handles.keys().cloned().collect();
         for id in leftover {
-            self.handles.remove(&id);
-            let _ = self.state.release(id, ReleaseReason::Canceled);
+            let handle = self.handles.remove(&id);
+            let identifier = handle.map(|h| h.identifier).unwrap_or_default();
+            let _ = self.state.release(id.clone(), ReleaseReason::Canceled);
+            self.bus.emit(OrchestratorEvent::Released {
+                issue: id,
+                identifier,
+                reason: ReleaseReason::Canceled,
+                final_state: None,
+            });
         }
     }
 
@@ -433,12 +503,21 @@ impl PollLoop {
                     // as `reap_finished` does — a reconciled run that
                     // races with shutdown should still record
                     // `NoLongerActive`, not the dispatcher's reason.
-                    let reason = self
-                        .handles
-                        .remove(&id)
+                    let handle = self.handles.remove(&id);
+                    let identifier = handle
+                        .as_ref()
+                        .map(|h| h.identifier.clone())
+                        .unwrap_or_default();
+                    let reason = handle
                         .and_then(|h| h.override_reason)
                         .unwrap_or(dispatcher_reason);
                     let _ = self.state.release(id.clone(), reason);
+                    self.bus.emit(OrchestratorEvent::Released {
+                        issue: id.clone(),
+                        identifier,
+                        reason,
+                        final_state: None,
+                    });
                     debug!(issue = %id, ?reason, "drained dispatch on shutdown");
                 }
                 Err(err) => warn!(error = %err, "dispatch task panicked during drain"),
@@ -460,12 +539,21 @@ impl PollLoop {
                     // present, the override wins so the ledger records
                     // *why* the run ended rather than just the
                     // proximate effect (cancellation).
-                    let reason = self
-                        .handles
-                        .remove(&id)
+                    let handle = self.handles.remove(&id);
+                    let identifier = handle
+                        .as_ref()
+                        .map(|h| h.identifier.clone())
+                        .unwrap_or_default();
+                    let reason = handle
                         .and_then(|h| h.override_reason)
                         .unwrap_or(dispatcher_reason);
                     if self.state.release(id.clone(), reason).is_ok() {
+                        self.bus.emit(OrchestratorEvent::Released {
+                            issue: id.clone(),
+                            identifier,
+                            reason,
+                            final_state: None,
+                        });
                         releases.push((id, reason));
                     } else {
                         // Releasing an absent issue is a logic bug —
@@ -484,6 +572,7 @@ impl PollLoop {
     fn spawn_dispatch(&mut self, issue: Issue, cancel: CancellationToken) {
         let dispatcher = Arc::clone(&self.dispatcher);
         let id = issue.id.clone();
+        let identifier = issue.identifier.clone();
         // Record the handle BEFORE spawning so a fast-finishing task
         // can never out-race us — `try_join_next` is only consulted
         // from `reap_finished` on the loop task itself.
@@ -492,8 +581,20 @@ impl PollLoop {
             DispatchHandle {
                 cancel: cancel.clone(),
                 override_reason: None,
+                identifier: identifier.clone(),
             },
         );
+        // Emit the StateChanged event for the absent → Running
+        // transition we just performed in `tick`. Done here (rather
+        // than inline at the claim site) so the handle is already
+        // registered when a fast subscriber observes the event and
+        // subsequently looks up our state.
+        self.bus.emit(OrchestratorEvent::StateChanged {
+            issue: id.clone(),
+            identifier,
+            previous: None,
+            current: ClaimState::Running,
+        });
         self.in_flight.spawn(async move {
             let reason = dispatcher.dispatch(issue, cancel).await;
             (id, reason)
@@ -507,10 +608,17 @@ impl PollLoop {
 /// instead we burn down the handle table in lockstep with the drain.
 /// Hash-iteration order is deliberately fine here; the loop is about
 /// releasing every remaining claim, not preserving order.
-fn pop_any<K: Clone + std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) -> Option<K> {
+/// Pop an arbitrary `(key, value)` entry from `map`. Used by the
+/// forced-abort drain path: aborted `JoinSet` entries surface as
+/// `JoinError`s with no user payload, so we can't look up the
+/// canonical handle by id — instead we burn down the handle table in
+/// lockstep with the drain. Returning the value too lets the
+/// [`OrchestratorEvent::Released`] emission carry the per-issue
+/// identifier captured at dispatch.
+fn pop_any_entry<K: Clone + std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) -> Option<(K, V)> {
     let key = map.keys().next().cloned()?;
-    map.remove(&key);
-    Some(key)
+    let value = map.remove(&key)?;
+    Some((key, value))
 }
 
 /// Compute the next sleep duration with `±jitter_ratio` half-width.
@@ -1101,5 +1209,238 @@ mod tests {
             started.elapsed()
         );
         tracker.replace(Vec::new());
+    }
+
+    // -----------------------------------------------------------------
+    // Event-bus emission tests.
+    //
+    // These pin that every state transition the poll loop performs
+    // shows up on the [`crate::event_bus::EventBus`]. Pure observability
+    // — none of these tests assert behaviour the loop didn't already
+    // exhibit before the bus existed.
+    // -----------------------------------------------------------------
+
+    use futures::StreamExt;
+
+    /// Drain whatever events are currently buffered on `rx` without
+    /// blocking. We poll with a `Duration::ZERO` timeout per item
+    /// because the broadcast stream signals "no more right now" by
+    /// pending — but a small `now_or_never`-style cooperative yield
+    /// loop is enough to surface every emission we care about for the
+    /// scripted scenarios below.
+    async fn drain_events(
+        rx: &mut tokio_stream::wrappers::BroadcastStream<OrchestratorEvent>,
+    ) -> Vec<OrchestratorEvent> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.next()).await {
+                Ok(Some(Ok(ev))) => out.push(ev),
+                Ok(Some(Err(_lagged))) => {} // ignore lag in tests
+                Ok(None) => break,
+                Err(_timeout) => break,
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn claim_emits_state_changed_event() {
+        let tracker = Arc::new(StaticTracker::new(issues(1)));
+        let dispatcher = Arc::new(InstantDispatcher(ReleaseReason::Completed));
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(1),
+            jitter_ratio: 0.0,
+            max_concurrent: 1,
+            drain_deadline: Duration::from_secs(1),
+        };
+        let mut loop_ = PollLoop::new(tracker, dispatcher as Arc<dyn Dispatcher>, cfg);
+        let mut rx = loop_.subscribe();
+        let cancel = CancellationToken::new();
+
+        loop_.tick(&cancel).await.unwrap();
+        // Give the spawned dispatch a chance to resolve so the
+        // reap_finished path emits Released too.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        loop_.tick(&cancel).await.unwrap();
+
+        let events = drain_events(&mut rx).await;
+        // We expect at minimum: StateChanged{None→Running} on dispatch,
+        // and Released{Completed} on reap.
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind()).collect();
+        assert!(
+            kinds.contains(&"state_changed"),
+            "expected state_changed in {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"released"),
+            "expected released in {kinds:?}"
+        );
+
+        let claimed = events
+            .iter()
+            .find(|e| matches!(e, OrchestratorEvent::StateChanged { .. }))
+            .expect("StateChanged event");
+        if let OrchestratorEvent::StateChanged {
+            previous, current, ..
+        } = claimed
+        {
+            assert!(previous.is_none(), "initial claim has no previous state");
+            assert_eq!(*current, ClaimState::Running);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_emits_a_single_reconciled_summary() {
+        let tracker = Arc::new(StaticTracker::new(issues(2)));
+        let dispatcher = Arc::new(CancellableDispatcher::new());
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(1),
+            jitter_ratio: 0.0,
+            max_concurrent: 10,
+            drain_deadline: Duration::from_secs(1),
+        };
+        let mut loop_ = PollLoop::new(
+            Arc::clone(&tracker) as Arc<dyn IssueTracker>,
+            Arc::clone(&dispatcher) as Arc<dyn Dispatcher>,
+            cfg,
+        );
+        let mut rx = loop_.subscribe();
+        let cancel = CancellationToken::new();
+
+        loop_.tick(&cancel).await.unwrap();
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Drop both from the active set: reconciliation should fire
+        // exactly one Reconciled summary listing both.
+        tracker.replace(Vec::new());
+        loop_.tick(&cancel).await.unwrap();
+
+        let events = drain_events(&mut rx).await;
+        let reconciled: Vec<&OrchestratorEvent> = events
+            .iter()
+            .filter(|e| matches!(e, OrchestratorEvent::Reconciled { .. }))
+            .collect();
+        assert_eq!(
+            reconciled.len(),
+            1,
+            "expected exactly one Reconciled summary, got {events:?}"
+        );
+        if let OrchestratorEvent::Reconciled { dropped } = reconciled[0] {
+            assert_eq!(dropped.len(), 2);
+        }
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn no_op_tick_emits_no_reconciled_event() {
+        // Steady state: same active set tick over tick. The bus must
+        // be silent on the reconciliation channel — `Reconciled` only
+        // fires when *something* was dropped.
+        let tracker = Arc::new(StaticTracker::new(issues(1)));
+        let dispatcher = Arc::new(CancellableDispatcher::new());
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(1),
+            jitter_ratio: 0.0,
+            max_concurrent: 5,
+            drain_deadline: Duration::from_secs(1),
+        };
+        let mut loop_ = PollLoop::new(tracker, Arc::clone(&dispatcher) as Arc<dyn Dispatcher>, cfg);
+        let mut rx = loop_.subscribe();
+        let cancel = CancellationToken::new();
+
+        loop_.tick(&cancel).await.unwrap();
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        loop_.tick(&cancel).await.unwrap();
+
+        let events = drain_events(&mut rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, OrchestratorEvent::Reconciled { .. })),
+            "expected no Reconciled events on steady state, got {events:?}"
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn released_event_carries_identifier_and_reason() {
+        let tracker = Arc::new(StaticTracker::new(issues(1)));
+        let dispatcher = Arc::new(InstantDispatcher(ReleaseReason::Completed));
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(1),
+            jitter_ratio: 0.0,
+            max_concurrent: 1,
+            drain_deadline: Duration::from_secs(1),
+        };
+        let mut loop_ = PollLoop::new(tracker, dispatcher as Arc<dyn Dispatcher>, cfg);
+        let mut rx = loop_.subscribe();
+        let cancel = CancellationToken::new();
+
+        loop_.tick(&cancel).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        loop_.tick(&cancel).await.unwrap();
+
+        let events = drain_events(&mut rx).await;
+        let released = events
+            .iter()
+            .find_map(|e| {
+                if let OrchestratorEvent::Released {
+                    identifier, reason, ..
+                } = e
+                {
+                    Some((identifier.clone(), *reason))
+                } else {
+                    None
+                }
+            })
+            .expect("Released event present");
+        assert_eq!(released.0, "ENG-0", "identifier carried through reap");
+        assert_eq!(released.1, ReleaseReason::Completed);
+    }
+
+    #[tokio::test]
+    async fn with_event_bus_constructor_threads_external_bus_through() {
+        // Composition-root use case: the SSE handler in `symphony-cli`
+        // wants its own clone of the bus. `PollLoop::with_event_bus`
+        // must use the supplied bus rather than build a fresh one.
+        let tracker = Arc::new(StaticTracker::new(issues(1)));
+        let dispatcher = Arc::new(InstantDispatcher(ReleaseReason::Completed));
+        let bus = EventBus::new(64);
+        let mut external_rx = bus.subscribe();
+        let mut loop_ = PollLoop::with_event_bus(
+            tracker,
+            dispatcher as Arc<dyn Dispatcher>,
+            PollLoopConfig {
+                interval: Duration::from_millis(1),
+                jitter_ratio: 0.0,
+                max_concurrent: 1,
+                drain_deadline: Duration::from_secs(1),
+            },
+            bus,
+        );
+        let cancel = CancellationToken::new();
+
+        loop_.tick(&cancel).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        loop_.tick(&cancel).await.unwrap();
+
+        let events = drain_events(&mut external_rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, OrchestratorEvent::StateChanged { .. })),
+            "external subscriber observed loop emissions: {events:?}"
+        );
     }
 }
