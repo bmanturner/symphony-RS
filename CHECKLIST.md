@@ -12,7 +12,7 @@ under their phase header and are added or refined as the project evolves.
 
 - [x] `cargo check --workspace` builds clean (resolve any latent crate
       version issues from bootstrap; lock `Cargo.lock`)
-- [ ] Wire `tracing-subscriber` in `symphony-cli` with env-filter and an
+- [x] Wire `tracing-subscriber` in `symphony-cli` with env-filter and an
       optional JSON formatter selectable by `SYMPHONY_LOG_FORMAT` [needs
       cargo check green]
 - [ ] Define a typed `WorkflowConfig` struct in `symphony-config` covering

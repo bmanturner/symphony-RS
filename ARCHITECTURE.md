@@ -159,6 +159,26 @@ other infers stay `Option<…>`, and adapters never fabricate them. A
 third adapter can be added without touching `symphony-core` by
 implementing the trait and the conformance suite.
 
+### 2026-05-08 — Logging env vars: `SYMPHONY_LOG` over `RUST_LOG`
+**Context.** The CLI needs an env-filter directive and a format toggle.
+`RUST_LOG` is the convention every Rust user knows, but it leaks into
+embedded libraries (e.g. `reqwest`) and forces users to carry global
+verbosity changes whenever they want Symphony-only debug output. The
+`SYMPHONY_*` namespace is the same namespace `figment` uses for layered
+config, so co-locating logging knobs there keeps a single mental model.
+
+**Decision.** `SYMPHONY_LOG` is the primary filter directive;
+`RUST_LOG` is read as a fallback only. `SYMPHONY_LOG_FORMAT` selects
+`pretty` (default, ANSI when stderr is a TTY) or `json` (one object per
+line). Unknown values warn and fall back to `pretty`. Malformed filter
+directives fall back to `info` rather than panicking — a typo in a
+deployed env var should never crash the daemon.
+
+**Consequence.** Operators get a Symphony-scoped knob without losing
+the `RUST_LOG` muscle memory. `logging::init` is idempotent (a
+re-install is a no-op) so test harnesses that pre-install a subscriber
+are not broken.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line
