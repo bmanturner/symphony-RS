@@ -108,9 +108,7 @@ pub fn default_consensus_scorer() -> ConsensusScorer {
                 // A side that actually invoked a test runner gets a
                 // small bump even before its output arrives — agents
                 // that *try* to verify are a weak positive signal.
-                AgentEvent::ToolUse { tool, .. }
-                    if tool.to_ascii_lowercase().contains("test") =>
-                {
+                AgentEvent::ToolUse { tool, .. } if tool.to_ascii_lowercase().contains("test") => {
                     score += 1;
                 }
                 _ => {}

@@ -125,7 +125,7 @@ under their phase header and are added or refined as the project evolves.
       subtasks via tool-use [TandemRunner]
 - [x] `consensus` strategy: both run, pick the output with greater
       test-pass delta [TandemRunner]
-- [ ] Telemetry: per-agent tokens, agreement rate, cost-per-turn
+- [x] Telemetry: per-agent tokens, agreement rate, cost-per-turn
 
 ## Phase 7 — CLI binary
 

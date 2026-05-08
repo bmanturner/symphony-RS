@@ -29,8 +29,10 @@
 mod consensus;
 mod draft_review;
 mod split_implement;
+mod telemetry;
 
 pub use consensus::{ConsensusScorer, default_consensus_scorer};
+pub use telemetry::{AgentTelemetry, CostModel, TandemTelemetry, aggregate_agent, compute};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
