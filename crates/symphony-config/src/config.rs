@@ -90,6 +90,18 @@ pub struct WorkflowConfig {
     /// operator with an open port on a public interface.
     #[serde(default)]
     pub status: StatusConfig,
+
+    /// Workflow-defined roles keyed by their (workflow-chosen) name.
+    /// SPEC v2 §5.4. Names like `platform_lead` or `qa` are
+    /// configurable; the `kind` discriminant ([`RoleKind`]) carries
+    /// the semantic identity that the kernel consumes.
+    ///
+    /// Empty by default so existing v1-shaped fixtures still load
+    /// while later phases incrementally enforce that
+    /// `kind: integration_owner` (and `kind: qa_gate` when QA is
+    /// required) are present.
+    #[serde(default)]
+    pub roles: BTreeMap<String, RoleConfig>,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -112,6 +124,7 @@ impl Default for WorkflowConfig {
             agent: AgentConfig::default(),
             codex: CodexConfig::default(),
             status: StatusConfig::default(),
+            roles: BTreeMap::new(),
         }
     }
 }
@@ -530,6 +543,111 @@ fn default_status_bind() -> String {
 
 fn default_status_replay_buffer() -> usize {
     256
+}
+
+// ---------------------------------------------------------------------------
+// roles (SPEC v2 §4.4 / §5.4)
+// ---------------------------------------------------------------------------
+
+/// Semantic role kind. The kernel branches on this discriminant; the
+/// workflow-chosen role *name* is just a label.
+///
+/// Only [`IntegrationOwner`] and [`QaGate`] are semantically special in
+/// core v2 — every other variant is configurable behaviour driven by
+/// workflow rules. `Custom` is a *role kind*, not an adapter extension
+/// point: it lets workflows declare a role that does not map onto any
+/// of the well-known kinds without forcing them through `Specialist`.
+///
+/// [`IntegrationOwner`]: RoleKind::IntegrationOwner
+/// [`QaGate`]: RoleKind::QaGate
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleKind {
+    /// May decompose, assign, merge child outputs, request QA, and
+    /// close parent work. Exactly one role of this kind is required
+    /// per workflow once Phase 1 validation lands.
+    IntegrationOwner,
+    /// May verify, reject, file blockers, and create follow-up issues.
+    /// Required when `qa.required: true`.
+    QaGate,
+    /// Implements scoped work and reports evidence.
+    Specialist,
+    /// Reviews design/security/performance/content without owning
+    /// implementation.
+    Reviewer,
+    /// Performs runtime/deployment/data tasks.
+    Operator,
+    /// Workflow-defined behaviour outside the well-known kinds. Not a
+    /// new adapter type — the kernel still treats it as a routable role.
+    Custom,
+}
+
+/// One entry in the `roles` map (SPEC v2 §5.4).
+///
+/// Most authority flags default to "unset" (`None`) rather than `false`
+/// so the kernel can distinguish "operator did not configure this" from
+/// "operator explicitly disabled it". Phase 5+ collapses these into
+/// effective authority by combining the role kind with the explicit
+/// flags; until then the typed struct just preserves what the YAML
+/// declares so the loader is honest about operator intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleConfig {
+    /// Semantic kind. The kernel reads this; the role's *name* (the
+    /// map key in [`WorkflowConfig::roles`]) is just a label.
+    pub kind: RoleKind,
+
+    /// Free-form description shown in operator surfaces (status, TUI,
+    /// validation errors). Optional.
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Name of the agent profile (key into `WorkflowConfig::agents`)
+    /// that runs work for this role. Optional at parse time so
+    /// fixtures can declare a role before its agent is wired up;
+    /// dispatch-time validation requires the reference to resolve.
+    #[serde(default)]
+    pub agent: Option<String>,
+
+    /// Hard cap on simultaneously running agents for this role. `None`
+    /// inherits the global `agent.max_concurrent_agents` cap.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+
+    /// `integration_owner` authority: may decompose broad work into
+    /// child issues. `None` defers to the role-kind default.
+    #[serde(default)]
+    pub can_decompose: Option<bool>,
+
+    /// `integration_owner` authority: may assign children to roles.
+    #[serde(default)]
+    pub can_assign: Option<bool>,
+
+    /// `integration_owner` authority: may request QA on a draft PR or
+    /// integration handoff.
+    #[serde(default)]
+    pub can_request_qa: Option<bool>,
+
+    /// `integration_owner` authority: may close the parent issue once
+    /// children, integration, and QA gates are all satisfied.
+    #[serde(default)]
+    pub can_close_parent: Option<bool>,
+
+    /// `qa_gate` authority: may file blocker work items against the
+    /// item under review.
+    #[serde(default)]
+    pub can_file_blockers: Option<bool>,
+
+    /// `qa_gate` authority: may file follow-up work items (per
+    /// `followups.default_policy`).
+    #[serde(default)]
+    pub can_file_followups: Option<bool>,
+
+    /// `qa_gate` policy: this role's pass is required before the
+    /// parent can be closed. Equivalent to `qa.required: true` scoped
+    /// to a single role definition.
+    #[serde(default)]
+    pub required_for_done: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -991,5 +1109,178 @@ status:
         cfg.tracker.kind = TrackerKind::Github;
         cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    // -----------------------------------------------------------------
+    // roles (SPEC v2 §5.4)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn roles_default_is_empty() {
+        let cfg = WorkflowConfig::default();
+        assert!(cfg.roles.is_empty());
+    }
+
+    #[test]
+    fn roles_yaml_parses_all_kinds() {
+        // Mirrors the SPEC §5.4 worked example: integration owner, QA
+        // gate, and a configurable specialist.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  platform_lead:
+    kind: integration_owner
+    description: Owns decomposition and integration.
+    agent: lead_agent
+    max_concurrent: 1
+    can_decompose: true
+    can_assign: true
+    can_request_qa: true
+    can_close_parent: true
+  qa:
+    kind: qa_gate
+    agent: qa_agent
+    max_concurrent: 2
+    can_file_blockers: true
+    can_file_followups: true
+    required_for_done: true
+  backend_engineer:
+    kind: specialist
+    agent: codex_fast
+  reviewer:
+    kind: reviewer
+  ops:
+    kind: operator
+  custom_role:
+    kind: custom
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.roles.len(), 6);
+
+        let lead = parsed.roles.get("platform_lead").expect("lead present");
+        assert_eq!(lead.kind, RoleKind::IntegrationOwner);
+        assert_eq!(lead.agent.as_deref(), Some("lead_agent"));
+        assert_eq!(lead.max_concurrent, Some(1));
+        assert_eq!(lead.can_decompose, Some(true));
+        assert_eq!(lead.can_close_parent, Some(true));
+        // QA-only flags stay None when unset, distinct from `Some(false)`.
+        assert_eq!(lead.can_file_blockers, None);
+
+        let qa = parsed.roles.get("qa").expect("qa present");
+        assert_eq!(qa.kind, RoleKind::QaGate);
+        assert_eq!(qa.required_for_done, Some(true));
+
+        assert_eq!(
+            parsed.roles.get("backend_engineer").map(|r| r.kind),
+            Some(RoleKind::Specialist)
+        );
+        assert_eq!(
+            parsed.roles.get("reviewer").map(|r| r.kind),
+            Some(RoleKind::Reviewer)
+        );
+        assert_eq!(
+            parsed.roles.get("ops").map(|r| r.kind),
+            Some(RoleKind::Operator)
+        );
+        assert_eq!(
+            parsed.roles.get("custom_role").map(|r| r.kind),
+            Some(RoleKind::Custom)
+        );
+    }
+
+    #[test]
+    fn role_kind_serialises_snake_case() {
+        // Each variant should round-trip through the snake_case YAML
+        // rendering operators write by hand.
+        for (variant, literal) in [
+            (RoleKind::IntegrationOwner, "integration_owner"),
+            (RoleKind::QaGate, "qa_gate"),
+            (RoleKind::Specialist, "specialist"),
+            (RoleKind::Reviewer, "reviewer"),
+            (RoleKind::Operator, "operator"),
+            (RoleKind::Custom, "custom"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: RoleKind = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn role_kind_rejects_unknown_value() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  bogus:
+    kind: wizard
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("wizard") || err.to_string().contains("unknown variant"),
+            "expected unknown-variant error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn role_unknown_field_is_rejected() {
+        // Typos like `descritpion` must surface, not silently default —
+        // they would otherwise hide a misconfigured authority flag.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  qa:
+    kind: qa_gate
+    descritpion: typo
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("descritpion") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn role_kind_is_required() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  qa:
+    description: missing kind
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("kind") || err.to_string().contains("missing field"),
+            "expected missing-field error for kind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn roles_yaml_roundtrip_preserves_entries() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  platform_lead:
+    kind: integration_owner
+    agent: lead_agent
+    max_concurrent: 1
+    can_decompose: true
+  qa:
+    kind: qa_gate
+    required_for_done: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.roles.len(), 2);
     }
 }

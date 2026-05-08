@@ -9,7 +9,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 1 — Workflow Config Schema
 
 - [x] Replace the current workflow config shape with `WorkflowConfig`; validate optional `schema_version` where only `1` is accepted and unknown keys are denied.
-- [ ] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`; `custom` is a role kind, not an adapter extension point.
+- [x] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`; `custom` is a role kind, not an adapter extension point.
 - [ ] Add typed `AgentProfileConfig` decoupled from role names.
 - [ ] Add `HermesAgentConfig` command/protocol shape and repackage existing tandem support as a composite strategy over configured agents; keep mock variants test-only.
 - [ ] Add typed `RoutingConfig` and `RoutingRule` with explicit `match_mode = first_match | priority` semantics.

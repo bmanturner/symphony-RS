@@ -20,7 +20,8 @@ pub mod loader;
 
 pub use config::{
     AgentConfig, AgentKind, CodexConfig, ConfigValidationError, HooksConfig, PollingConfig,
-    SUPPORTED_SCHEMA_VERSION, TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
+    RoleConfig, RoleKind, SUPPORTED_SCHEMA_VERSION, TrackerConfig, TrackerKind, WorkflowConfig,
+    WorkspaceConfig,
 };
 pub use layered::{LayeredLoadError, LayeredLoader};
 pub use loader::{LoadedWorkflow, WorkflowLoadError, WorkflowLoader};
