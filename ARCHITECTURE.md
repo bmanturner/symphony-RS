@@ -201,6 +201,28 @@ pass-through values are `serde_yaml::Value`); `PartialEq` is enough for
 the round-trip tests we need. Adding a new tracker or agent kind is a
 two-line change to the relevant enum plus an arm in `validate`.
 
+### 2026-05-08 — `octocrab` for the GitHub Issues adapter
+**Context.** SPEC §3.1 names a single tracker; our deviation ships
+GitHub Issues alongside Linear. GitHub's API has two surfaces we need
+— REST for mutations and GraphQL for batched polling — and we do not
+want two HTTP clients with two auth flows. Hand-rolling a GitHub client
+to stay outside the crate budget would force us to duplicate retry,
+pagination, rate-limit, and auth logic that octocrab already covers.
+
+**Decision.** Add `octocrab` (v0.50) to the workspace crate budget. The
+default `default-client` feature is kept so octocrab manages its own
+reqwest-with-rustls stack; we do not share the top-level `reqwest`
+client with it. Only `symphony-tracker` depends on octocrab —
+`symphony-core` and the orchestrator stay adapter-free, consistent with
+the layered architecture.
+
+**Consequence.** The GitHub adapter gets one typed surface for REST and
+GraphQL, with built-in pagination and rate-limit handling. octocrab
+internally pulls in hyper 0.14 + reqwest 0.11 alongside our top-level
+reqwest 0.12, which inflates the dep graph but is contained to the
+tracker crate. A future migration to a single shared HTTP client is
+recorded here as a known follow-up rather than a blocker.
+
 ### 2026-05-08 — Layered config: WORKFLOW.md > env > defaults
 **Context.** SPEC §5.4 says "Environment variables do not globally
 override YAML values" — the upstream model only honours env *when the

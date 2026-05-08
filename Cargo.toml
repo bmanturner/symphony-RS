@@ -51,6 +51,12 @@ gray_matter = "0.2"
 # graphql_client gives us typed Linear queries from .graphql files.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 graphql_client = { version = "0.14", features = ["reqwest-rustls"] }
+# octocrab is the established Rust GitHub client. We keep its default
+# features (notably `default-client`, which wires reqwest + rustls inside
+# octocrab) so the GitHub adapter has a single auth surface for both REST
+# mutations and the GraphQL polling path. Pulled in only by
+# `symphony-tracker` — `symphony-core` stays adapter-free.
+octocrab = "0.50"
 url = "2"
 
 # CLI / config: clap derive for the subcommand surface, figment for layered

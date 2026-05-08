@@ -45,7 +45,7 @@ under their phase header and are added or refined as the project evolves.
       `priority` / `blocked_by`. Runs against `MockTracker` immediately;
       gets re-run against each real adapter as it lands.
       [IssueTracker trait, MockTracker]
-- [ ] Add `octocrab` to the workspace crate budget via `cargo add -p
+- [x] Add `octocrab` to the workspace crate budget via `cargo add -p
       symphony-tracker octocrab` (or workspace-level if other crates need
       it later). Record the rationale as a one-paragraph ADR.
 - [ ] Generate Linear GraphQL bindings via `graphql_client` from a

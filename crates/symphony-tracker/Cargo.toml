@@ -18,6 +18,7 @@ reqwest.workspace = true
 graphql_client.workspace = true
 url.workspace = true
 secrecy.workspace = true
+octocrab.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
