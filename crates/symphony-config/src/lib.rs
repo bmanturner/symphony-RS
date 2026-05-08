@@ -21,8 +21,9 @@ pub mod loader;
 pub use config::{
     AgentBackend, AgentBackendProfile, AgentCompositeProfile, AgentConfig, AgentKind,
     AgentProfileConfig, AgentStrategy, CodexConfig, ConfigValidationError, HermesAgentConfig,
-    HooksConfig, PollingConfig, RoleConfig, RoleKind, SUPPORTED_SCHEMA_VERSION, TandemMode,
-    TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
+    HooksConfig, PollingConfig, RoleConfig, RoleKind, RoutingConfig, RoutingMatch,
+    RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION, TandemMode, TrackerConfig,
+    TrackerKind, WorkflowConfig, WorkspaceConfig,
 };
 pub use layered::{LayeredLoadError, LayeredLoader};
 pub use loader::{LoadedWorkflow, WorkflowLoadError, WorkflowLoader};

@@ -122,6 +122,14 @@ pub struct WorkflowConfig {
     /// `RoleConfig::agent` reference resolves to a key here.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentProfileConfig>,
+
+    /// Deterministic routing rules that map a normalised work item to a
+    /// role name (key into [`WorkflowConfig::roles`]). SPEC v2 §5.6.
+    /// Defaults to an empty rule set with no `default_role`; later
+    /// phases enforce that every `assign_role` and `default_role`
+    /// reference resolves to a configured role.
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -147,6 +155,7 @@ impl Default for WorkflowConfig {
             status: StatusConfig::default(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -978,6 +987,132 @@ pub struct AgentBackendProfile {
     /// the profile level.
     #[serde(default)]
     pub cost_budget_usd: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// routing (SPEC v2 §5.6)
+// ---------------------------------------------------------------------------
+
+/// Deterministic role-routing configuration.
+///
+/// The kernel evaluates [`RoutingConfig::rules`] against a normalised
+/// work item to pick a destination role. Determinism is the contract:
+/// the same input must pick the same role on every run.
+///
+/// `match_mode` decides how rules compose:
+/// - [`RoutingMatchMode::FirstMatch`] evaluates rules in *file order*
+///   and picks the first whose `when` clause matches; per SPEC v2 §5.6
+///   it ignores `priority` entirely.
+/// - [`RoutingMatchMode::Priority`] picks the matching rule with the
+///   highest numeric `priority`. Ties are validation errors (enforced
+///   in a later checklist iteration); the parsed struct only captures
+///   operator intent here.
+///
+/// `default_role` is the fallback when no rule matches. It is optional
+/// at parse time so partial fixtures can declare a routing block before
+/// roles are wired up; dispatch-time validation requires the reference
+/// to resolve into [`WorkflowConfig::roles`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingConfig {
+    /// Fallback role name (key into [`WorkflowConfig::roles`]) used when
+    /// no rule in `rules` matches. `None` means "no fallback configured"
+    /// — later phases treat this as a routing failure that surfaces in
+    /// operator surfaces rather than silently dropping work.
+    #[serde(default)]
+    pub default_role: Option<String>,
+
+    /// How to combine matching rules. Defaults to
+    /// [`RoutingMatchMode::FirstMatch`] so operators who omit the field
+    /// get the simpler, file-order semantics by default.
+    #[serde(default)]
+    pub match_mode: RoutingMatchMode,
+
+    /// Ordered rule list. Order matters for [`RoutingMatchMode::FirstMatch`];
+    /// for [`RoutingMatchMode::Priority`] order is informational only.
+    #[serde(default)]
+    pub rules: Vec<RoutingRule>,
+}
+
+/// How [`RoutingConfig::rules`] are combined when more than one matches.
+///
+/// SPEC v2 §5.6 defines exactly two modes; the enum is closed because
+/// adding a third mode would change the routing contract and should
+/// require an explicit schema decision rather than a silent extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMatchMode {
+    /// Evaluate rules in declaration order and return the first match.
+    /// `priority` fields on rules are ignored in this mode. Default
+    /// because file-order is the easiest behaviour for an operator to
+    /// reason about when reading a `WORKFLOW.md`.
+    #[default]
+    FirstMatch,
+    /// Pick the matching rule with the highest numeric `priority`. Rules
+    /// without an explicit `priority` are treated as priority `0` by
+    /// the kernel; ties between matching rules are a validation error.
+    Priority,
+}
+
+/// One entry in [`RoutingConfig::rules`].
+///
+/// `priority` is optional so the same rule shape works in both match
+/// modes: `first_match` ignores the field, `priority` mode reads it.
+/// `when` is the (open-ended but typed) predicate clause; `assign_role`
+/// names the destination role. Both `priority`-tie validation and
+/// `assign_role` reference resolution are deferred to later checklist
+/// items — this struct just preserves operator intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRule {
+    /// Numeric priority used by [`RoutingMatchMode::Priority`]. Ignored
+    /// by [`RoutingMatchMode::FirstMatch`]. `None` is treated as `0` by
+    /// the kernel; we keep it as `Option<u32>` so the parsed struct
+    /// distinguishes "operator omitted priority" from "operator wrote 0".
+    #[serde(default)]
+    pub priority: Option<u32>,
+
+    /// Predicate clause. A rule matches when *every* configured field
+    /// in this struct matches the work item; an empty clause matches
+    /// every work item, which is how operators express a catch-all
+    /// rule without relying on `default_role`.
+    #[serde(default)]
+    pub when: RoutingMatch,
+
+    /// Destination role name (key into [`WorkflowConfig::roles`]).
+    /// Required — a rule without a target is meaningless.
+    pub assign_role: String,
+}
+
+/// Predicate clause for a [`RoutingRule`] (SPEC v2 §5.6 `when:` block).
+///
+/// Each field is optional and additive: when multiple fields are set,
+/// *all* of them must match (AND-of-fields). Within a single list-typed
+/// field the semantics are "any of" (OR-of-elements) — `labels_any` is
+/// satisfied when the work item has *any* of the listed labels. The
+/// field set is intentionally narrow: SPEC v2 §5.6 only specifies
+/// `labels_any`, `paths_any`, and `issue_size`; new predicates require
+/// a schema decision rather than a silent extension.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingMatch {
+    /// Match when the work item carries any of these labels. Empty list
+    /// means "this predicate is not configured" and matches every item.
+    #[serde(default)]
+    pub labels_any: Vec<String>,
+
+    /// Match when any changed-path glob in the work item intersects any
+    /// of these patterns. Glob expansion happens in the routing engine,
+    /// not here; the typed config keeps the raw operator strings.
+    #[serde(default)]
+    pub paths_any: Vec<String>,
+
+    /// Match on coarse work-item size (e.g. `broad`, `narrow`). Carried
+    /// as `Option<String>` because the SPEC enumerates only `broad` in
+    /// the worked example and we don't want to lock the value set into
+    /// the schema until the routing engine lands.
+    #[serde(default)]
+    pub issue_size: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2063,5 +2198,196 @@ agents:
             .expect("composite present after round-trip");
         assert_eq!(pair.strategy, AgentStrategy::Tandem);
         assert_eq!(pair.mode, TandemMode::SplitImplement);
+    }
+
+    // -----------------------------------------------------------------
+    // routing (SPEC v2 §5.6)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn routing_default_is_empty_first_match() {
+        let cfg = WorkflowConfig::default();
+        assert_eq!(cfg.routing.match_mode, RoutingMatchMode::FirstMatch);
+        assert!(cfg.routing.default_role.is_none());
+        assert!(cfg.routing.rules.is_empty());
+    }
+
+    #[test]
+    fn routing_first_match_yaml_parses() {
+        // Mirrors the quickstart fixture's `match_mode: first_match`
+        // shape: rules without explicit `priority` are legal because
+        // first-match ignores the field.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+routing:
+  default_role: worker
+  match_mode: first_match
+  rules:
+    - when:
+        labels_any: [qa]
+      assign_role: qa
+    - when:
+        labels_any: [epic, broad]
+      assign_role: platform_lead
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.routing.match_mode, RoutingMatchMode::FirstMatch);
+        assert_eq!(parsed.routing.default_role.as_deref(), Some("worker"));
+        assert_eq!(parsed.routing.rules.len(), 2);
+
+        let first = &parsed.routing.rules[0];
+        assert_eq!(first.priority, None);
+        assert_eq!(first.when.labels_any, vec!["qa".to_string()]);
+        assert!(first.when.paths_any.is_empty());
+        assert_eq!(first.assign_role, "qa");
+
+        let second = &parsed.routing.rules[1];
+        assert_eq!(
+            second.when.labels_any,
+            vec!["epic".to_string(), "broad".to_string()]
+        );
+        assert_eq!(second.assign_role, "platform_lead");
+    }
+
+    #[test]
+    fn routing_priority_yaml_parses_with_when_predicates() {
+        // Mirrors SPEC §5.6's worked example: priority mode with
+        // labels_any, paths_any, and issue_size predicates.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+routing:
+  default_role: platform_lead
+  match_mode: priority
+  rules:
+    - priority: 100
+      when:
+        labels_any: [qa]
+      assign_role: qa
+    - priority: 50
+      when:
+        paths_any: ["lib/**", "test/**"]
+      assign_role: backend_engineer
+    - priority: 10
+      when:
+        issue_size: broad
+      assign_role: platform_lead
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.routing.match_mode, RoutingMatchMode::Priority);
+        assert_eq!(parsed.routing.rules.len(), 3);
+
+        assert_eq!(parsed.routing.rules[0].priority, Some(100));
+        assert_eq!(parsed.routing.rules[1].priority, Some(50));
+        assert_eq!(
+            parsed.routing.rules[1].when.paths_any,
+            vec!["lib/**".to_string(), "test/**".to_string()]
+        );
+        assert_eq!(
+            parsed.routing.rules[2].when.issue_size.as_deref(),
+            Some("broad")
+        );
+    }
+
+    #[test]
+    fn routing_match_mode_serialises_snake_case() {
+        for (variant, literal) in [
+            (RoutingMatchMode::FirstMatch, "first_match"),
+            (RoutingMatchMode::Priority, "priority"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: RoutingMatchMode = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn routing_rejects_unknown_match_mode() {
+        // SPEC v2 §5.6 enumerates exactly two modes; any third value
+        // must fail load loudly rather than silently degrading.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+routing:
+  match_mode: round_robin
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("round_robin")
+                || msg.contains("unknown variant")
+                || msg.contains("first_match"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn routing_rejects_unknown_when_key() {
+        // Unknown keys inside `when:` must be rejected so a typo like
+        // `lables_any` does not silently produce a no-op predicate.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+routing:
+  rules:
+    - when:
+        lables_any: [qa]
+      assign_role: qa
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lables_any") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn routing_rule_requires_assign_role() {
+        // `assign_role` is required — a rule without a destination is
+        // meaningless and should fail at parse time.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+routing:
+  rules:
+    - when:
+        labels_any: [qa]
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("assign_role") || msg.contains("missing field"),
+            "expected missing-field error for assign_role, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn routing_round_trips_through_yaml() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+routing:
+  default_role: platform_lead
+  match_mode: priority
+  rules:
+    - priority: 100
+      when:
+        labels_any: [qa]
+      assign_role: qa
+    - priority: 10
+      when:
+        issue_size: broad
+      assign_role: platform_lead
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
     }
 }

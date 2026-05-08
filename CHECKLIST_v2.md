@@ -12,7 +12,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`; `custom` is a role kind, not an adapter extension point.
 - [x] Add typed `AgentProfileConfig` decoupled from role names.
 - [x] Add `HermesAgentConfig` command/protocol shape and repackage existing tandem support as a composite strategy over configured agents; keep mock variants test-only.
-- [ ] Add typed `RoutingConfig` and `RoutingRule` with explicit `match_mode = first_match | priority` semantics.
+- [x] Add typed `RoutingConfig` and `RoutingRule` with explicit `match_mode = first_match | priority` semantics.
 - [ ] Add `PollingConfig`, `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, `FollowupConfig`, `HooksConfig`, and `ObservabilityConfig`.
 - [ ] Add `WorkspacePolicyConfig` and `BranchPolicyConfig` for worktree/shared-branch strategies.
 - [ ] Add validation errors: missing `kind: integration_owner`, missing `kind: qa_gate` when QA is required, unknown role/agent references, duplicate tracker state mappings, invalid max depth, invalid branch template, PR config without GitHub, and contradictory shared-branch policy.
