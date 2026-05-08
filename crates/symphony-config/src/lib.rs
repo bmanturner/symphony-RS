@@ -22,11 +22,11 @@ pub use config::{
     AgentBackend, AgentBackendProfile, AgentCompositeProfile, AgentConfig, AgentKind,
     AgentProfileConfig, AgentStrategy, BlockerPolicy, ChildIssuePolicy, CodexConfig,
     ConfigValidationError, ConflictPolicy, DecompositionConfig, DecompositionTriggers,
-    HermesAgentConfig, HooksConfig, IntegrationConfig, IntegrationRequirement, MergeStrategy,
-    PollingConfig, PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider, PullRequestConfig,
-    QaConfig, QaEvidenceRequired, RoleConfig, RoleKind, RoutingConfig, RoutingMatch,
-    RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION, TandemMode, TrackerConfig,
-    TrackerKind, WorkflowConfig, WorkspaceConfig,
+    FollowupConfig, HermesAgentConfig, HooksConfig, IntegrationConfig, IntegrationRequirement,
+    MergeStrategy, PollingConfig, PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider,
+    PullRequestConfig, QaConfig, QaEvidenceRequired, RoleConfig, RoleKind, RoutingConfig,
+    RoutingMatch, RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION, TandemMode,
+    TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
 };
 pub use layered::{LayeredLoadError, LayeredLoader};
 pub use loader::{LoadedWorkflow, WorkflowLoadError, WorkflowLoader};

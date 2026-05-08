@@ -164,6 +164,15 @@ pub struct WorkflowConfig {
     /// blocker-policy semantics.
     #[serde(default)]
     pub qa: QaConfig,
+
+    /// Follow-up issue policy. SPEC v2 §5.13. Defaults to
+    /// `enabled: false` with the safer
+    /// [`ChildIssuePolicy::ProposeForApproval`] default so a workflow
+    /// that omits the block does not silently let agents file new
+    /// tracker issues. When `enabled` flips to `true`, later phases
+    /// enforce that `approval_role` resolves to a configured role.
+    #[serde(default)]
+    pub followups: FollowupConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -194,6 +203,7 @@ impl Default for WorkflowConfig {
             integration: IntegrationConfig::default(),
             pull_requests: PullRequestConfig::default(),
             qa: QaConfig::default(),
+            followups: FollowupConfig::default(),
         }
     }
 }
@@ -1850,6 +1860,101 @@ impl Default for QaEvidenceRequired {
             visual_or_runtime_evidence_when_applicable: true,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// followups (SPEC v2 §5.13)
+// ---------------------------------------------------------------------------
+
+/// Follow-up issue policy.
+///
+/// A follow-up is newly discovered work that falls outside the current
+/// acceptance criteria. SPEC v2 §5.13 makes follow-up creation a
+/// first-class agent literacy: any role may identify follow-up work,
+/// and the workflow decides whether the issue is filed directly or
+/// queued for approval.
+///
+/// `default_policy` reuses [`ChildIssuePolicy`] — the same enum that
+/// gates `decomposition.child_issue_policy` (§5.7) — so an operator who
+/// learns one knob learns the other. Defaults are conservative:
+/// `enabled: false`, [`ChildIssuePolicy::ProposeForApproval`], a
+/// recognisable label pair (`follow-up` / `blocker`), and both reason
+/// and acceptance-criteria fields required so an agent cannot drop a
+/// vague "TODO" into the tracker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowupConfig {
+    /// Master switch. When `false` (the default), the runner ignores
+    /// follow-up requests in agent handoffs — they are dropped after
+    /// being recorded for observability but no tracker mutation occurs.
+    /// Operators must opt in by setting `enabled: true`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// What to do when an agent emits a follow-up: write the issue
+    /// straight through `TrackerMutations` or queue it for approval.
+    /// Shares [`ChildIssuePolicy`] with `decomposition.child_issue_policy`
+    /// (SPEC v2 §5.7 / §5.13). Defaults to
+    /// [`ChildIssuePolicy::ProposeForApproval`] — the safer path.
+    #[serde(default)]
+    pub default_policy: ChildIssuePolicy,
+
+    /// Role name (key into [`WorkflowConfig::roles`]) responsible for
+    /// approving follow-ups when `default_policy` is
+    /// [`ChildIssuePolicy::ProposeForApproval`]. Optional at parse
+    /// time so a partial fixture can declare an empty `followups:`
+    /// block; later phases enforce that the reference resolves to a
+    /// configured role whenever `enabled` is true.
+    #[serde(default)]
+    pub approval_role: Option<String>,
+
+    /// Tracker label applied to non-blocking follow-ups. Defaults to
+    /// `"follow-up"` per SPEC v2 §5.13. Empty string means "do not
+    /// label", which is preserved as operator intent.
+    #[serde(default = "default_followup_non_blocking_label")]
+    pub non_blocking_label: String,
+
+    /// Tracker label applied to blocking follow-ups (i.e. follow-ups
+    /// the agent flagged as blocking current acceptance). Defaults to
+    /// `"blocker"` per SPEC v2 §5.13.
+    #[serde(default = "default_followup_blocking_label")]
+    pub blocking_label: String,
+
+    /// When `true` (the default), every follow-up MUST include a
+    /// reason; the kernel rejects handoffs whose follow-up payloads
+    /// drop the field. SPEC v2 §5.13 requires the reason so triage
+    /// can decide whether to accept the follow-up.
+    #[serde(default = "default_true")]
+    pub require_reason: bool,
+
+    /// When `true` (the default), every follow-up MUST include
+    /// acceptance criteria. SPEC v2 §5.13 lists this alongside
+    /// `require_reason` so a follow-up enters the tracker with the
+    /// same minimum content guarantees as a normal child issue.
+    #[serde(default = "default_true")]
+    pub require_acceptance_criteria: bool,
+}
+
+impl Default for FollowupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_policy: ChildIssuePolicy::default(),
+            approval_role: None,
+            non_blocking_label: default_followup_non_blocking_label(),
+            blocking_label: default_followup_blocking_label(),
+            require_reason: true,
+            require_acceptance_criteria: true,
+        }
+    }
+}
+
+fn default_followup_non_blocking_label() -> String {
+    "follow-up".to_string()
+}
+
+fn default_followup_blocking_label() -> String {
+    "blocker".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -4070,5 +4175,158 @@ qa:
                 .visual_or_runtime_evidence_when_applicable
         );
         assert!(!parsed.qa.rerun_after_blockers_resolved);
+    }
+
+    #[test]
+    fn followups_block_defaults_when_omitted() {
+        // SPEC v2 §5.13 defaults: an omitted `followups:` block must
+        // produce safe defaults — disabled, propose-for-approval,
+        // recognisable label pair, and both reason/acceptance gates on.
+        let cfg = WorkflowConfig::default();
+        let f = &cfg.followups;
+        assert!(!f.enabled);
+        assert_eq!(f.default_policy, ChildIssuePolicy::ProposeForApproval);
+        assert!(f.approval_role.is_none());
+        assert_eq!(f.non_blocking_label, "follow-up");
+        assert_eq!(f.blocking_label, "blocker");
+        assert!(f.require_reason);
+        assert!(f.require_acceptance_criteria);
+    }
+
+    #[test]
+    fn followups_partial_block_inherits_documented_defaults() {
+        // An operator who writes only `enabled` and `approval_role`
+        // should still get propose-for-approval, the SPEC label pair,
+        // and both content gates on.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+followups:
+  enabled: true
+  approval_role: platform_lead
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let f = &parsed.followups;
+        assert!(f.enabled);
+        assert_eq!(f.approval_role.as_deref(), Some("platform_lead"));
+        assert_eq!(f.default_policy, ChildIssuePolicy::ProposeForApproval);
+        assert_eq!(f.non_blocking_label, "follow-up");
+        assert_eq!(f.blocking_label, "blocker");
+        assert!(f.require_reason);
+        assert!(f.require_acceptance_criteria);
+    }
+
+    #[test]
+    fn followups_full_block_parses_spec_example() {
+        // Mirrors the SPEC v2 §5.13 worked example verbatim.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+followups:
+  enabled: true
+  default_policy: create_directly
+  approval_role: platform_lead
+  non_blocking_label: follow-up
+  blocking_label: blocker
+  require_reason: true
+  require_acceptance_criteria: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let f = &parsed.followups;
+        assert!(f.enabled);
+        assert_eq!(f.default_policy, ChildIssuePolicy::CreateDirectly);
+        assert_eq!(f.approval_role.as_deref(), Some("platform_lead"));
+        assert_eq!(f.non_blocking_label, "follow-up");
+        assert_eq!(f.blocking_label, "blocker");
+        assert!(f.require_reason);
+        assert!(f.require_acceptance_criteria);
+    }
+
+    #[test]
+    fn followups_share_child_issue_policy_enum_with_decomposition() {
+        // SPEC v2 §5.13 explicitly shares the policy enum with §5.7.
+        // Asserting both fields hold the same variant after a round
+        // trip locks the shared-enum contract.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  child_issue_policy: create_directly
+followups:
+  default_policy: create_directly
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            parsed.decomposition.child_issue_policy,
+            parsed.followups.default_policy,
+        );
+        assert_eq!(
+            parsed.followups.default_policy,
+            ChildIssuePolicy::CreateDirectly
+        );
+    }
+
+    #[test]
+    fn followups_rejects_unknown_default_policy() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+followups:
+  default_policy: file_silently
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file_silently")
+                || msg.contains("unknown variant")
+                || msg.contains("create_directly"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn followups_rejects_unknown_top_level_key() {
+        // Typos like `aproval_role:` must surface so a misnamed key
+        // does not silently fall back to the default.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+followups:
+  aproval_role: platform_lead
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aproval_role") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn followups_round_trips_through_yaml() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+followups:
+  enabled: true
+  default_policy: create_directly
+  approval_role: release_captain
+  non_blocking_label: chore
+  blocking_label: hotfix
+  require_reason: false
+  require_acceptance_criteria: false
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+        let f = &parsed.followups;
+        assert!(f.enabled);
+        assert_eq!(f.default_policy, ChildIssuePolicy::CreateDirectly);
+        assert_eq!(f.approval_role.as_deref(), Some("release_captain"));
+        assert_eq!(f.non_blocking_label, "chore");
+        assert_eq!(f.blocking_label, "hotfix");
+        assert!(!f.require_reason);
+        assert!(!f.require_acceptance_criteria);
     }
 }
