@@ -15,8 +15,10 @@
 //! the runtime and feeds parsed config in.
 
 pub mod config;
+pub mod loader;
 
 pub use config::{
     AgentConfig, AgentKind, CodexConfig, ConfigValidationError, HooksConfig, PollingConfig,
     TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
 };
+pub use loader::{LoadedWorkflow, WorkflowLoadError, WorkflowLoader};

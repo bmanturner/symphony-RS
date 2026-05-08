@@ -15,3 +15,6 @@ thiserror.workspace = true
 secrecy.workspace = true
 tracing.workspace = true
 notify.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
