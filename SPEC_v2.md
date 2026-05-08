@@ -322,6 +322,7 @@ tracker:
   kind: github | linear
   repository: owner/repo
   project_slug: ENG
+  unknown_state_policy: error # error | ignore
   state_mapping:
     ignore: [Archived]
     intake: [Backlog, Todo]
@@ -335,6 +336,8 @@ tracker:
     done: [Done]
     cancelled: [Cancelled]
 ```
+
+`unknown_state_policy` controls how the kernel treats raw tracker states that do not appear in any `state_mapping` list. `error` (the default) makes them a validation error at config-load time; `ignore` silently maps them to the `ignore` class so unmapped states never block startup.
 
 Tracker adapters MUST support read operations. Workflows that create child issues, blockers, follow-ups, state transitions, comments, or PR links MUST use mutation-capable tracker adapters.
 
@@ -687,6 +690,11 @@ hooks:
 ```
 
 Keep the current hook lifecycle and extend it to receive `WorkspaceClaim` metadata through environment variables and/or a small JSON file. Hook failures are governed by the existing phase semantics: `after_create` and `before_run` failures block launch; `after_run` and `before_remove` are best-effort unless the workflow explicitly makes them blocking.
+
+Two intentional shape changes from the current implementation:
+
+- Each hook phase becomes a list of shell snippets rather than a single optional string. Snippets in a list run sequentially; the first non-zero exit aborts the phase. An empty list is equivalent to "no hook configured." Migrating an existing single-string hook is a one-line change to wrap it as `[<old string>]`.
+- `timeout_ms` defaults to `300000` (5 minutes), up from the current 60-second default. The longer default reflects v2 hooks routinely doing branch prep / worktree creation. The timeout still applies per snippet, not per phase.
 
 ## 6. Orchestration Flow
 

@@ -29,8 +29,8 @@ set -euo pipefail
 # ── Config ──────────────────────────────────────────────────────────────
 MAX_ITERATIONS="${1:-30}"
 MAX_COST_USD="${2:-50}"
-PROMPT_FILE="${PROMPT_FILE:-PROMPT.md}"
-SPEC_FILE="${SPEC_FILE:-SPEC.md}"
+PROMPT_FILE="${PROMPT_FILE:-PROMPT_v2.md}"
+SPEC_FILE="${SPEC_FILE:-SPEC_v2.md}"
 COMPLETION_TOKEN="${COMPLETION_TOKEN:-<promise>COMPLETE</promise>}"
 LOG_DIR="${LOG_DIR:-.ralph}"
 CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-4-7}"
