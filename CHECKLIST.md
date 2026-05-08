@@ -24,7 +24,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] Layer config sources with `figment`: defaults → env (`SYMPHONY_*`) →
       WORKFLOW.md; round-trip tests for valid / missing / malformed cases
       [WorkflowLoader]
-- [ ] Add `tests/fixtures/sample-workflow/WORKFLOW.md` for downstream
+- [x] Add `tests/fixtures/sample-workflow/WORKFLOW.md` for downstream
       tests and the `symphony validate` smoke test
 
 ## Phase 2 — IssueTracker abstraction + Linear + GitHub Issues
