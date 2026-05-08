@@ -102,6 +102,16 @@ pub struct WorkflowConfig {
     /// required) are present.
     #[serde(default)]
     pub roles: BTreeMap<String, RoleConfig>,
+
+    /// Workflow-defined agent profiles keyed by their (workflow-chosen)
+    /// name. SPEC v2 §4.5 / §5.5. Profiles are *decoupled from role
+    /// names*: a [`RoleConfig`] references a profile by name via
+    /// [`RoleConfig::agent`], so two roles can share one profile and
+    /// one role can be re-pointed at a different profile without
+    /// renaming. Empty by default; later phases enforce that every
+    /// `RoleConfig::agent` reference resolves to a key here.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentProfileConfig>,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -125,6 +135,7 @@ impl Default for WorkflowConfig {
             codex: CodexConfig::default(),
             status: StatusConfig::default(),
             roles: BTreeMap::new(),
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -648,6 +659,131 @@ pub struct RoleConfig {
     /// to a single role definition.
     #[serde(default)]
     pub required_for_done: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// agents (SPEC v2 §4.5 / §5.5)
+// ---------------------------------------------------------------------------
+
+/// Backend class for an [`AgentProfileConfig`]. SPEC v2 §5.5 limits
+/// product backends to `codex`, `claude`, and `hermes`; the test-only
+/// `mock` variant is preserved here so quickstart fixtures and unit
+/// tests can declare profiles without an external binary.
+///
+/// Composite/tandem behaviour is *not* a backend — SPEC §5.5 defines it
+/// as an `agents:` *strategy* that composes other profiles. The next
+/// checklist iteration introduces the composite shape as a sibling of
+/// this enum; until then, profiles always declare a concrete backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentBackend {
+    /// `codex app-server` over JSONL stdio.
+    Codex,
+    /// `claude -p --output-format stream-json` over stdio.
+    Claude,
+    /// Hermes Agent CLI in non-interactive mode. SPEC §5.5 reserves
+    /// the protocol shape for the next checklist iteration; the
+    /// variant exists now so a profile can declare `backend: hermes`
+    /// without churning later.
+    Hermes,
+    /// In-process scripted runner. Test/fixture only — not advertised
+    /// as a production backend.
+    Mock,
+}
+
+/// One entry in the `agents` map (SPEC v2 §5.5).
+///
+/// A profile bundles a backend with the runtime policy that should be
+/// applied when launching it. Names live in their own keyspace and are
+/// referenced from [`RoleConfig::agent`], so the same profile can be
+/// reused across roles and a role can be re-pointed at a different
+/// profile without renaming either.
+///
+/// Most policy fields are `Option`-typed and default to "inherit": the
+/// kernel composes a profile-level value over the global
+/// [`AgentConfig`]/[`CodexConfig`] defaults at dispatch time. This
+/// keeps profiles small and lets operators declare just the deltas
+/// they care about — the typed struct is intentionally a flat record
+/// of operator intent, not the resolved runtime view.
+///
+/// Fields that mirror the upstream Codex/Claude schema (`approval_policy`,
+/// `sandbox_policy`) are carried as opaque `serde_yaml::Value` for the
+/// same reason as [`CodexConfig`]: those value sets evolve outside our
+/// schema and the runtime validates them at dispatch preflight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileConfig {
+    /// Backend class to instantiate. Required — there is no sensible
+    /// default once a profile is declared.
+    pub backend: AgentBackend,
+
+    /// Free-form description shown in operator surfaces. Optional.
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Shell command launched via `bash -lc`. `None` defers to the
+    /// backend's default command (e.g. `codex app-server`).
+    #[serde(default)]
+    pub command: Option<String>,
+
+    /// Model identifier passed through to the backend. `None` uses the
+    /// backend's configured default.
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// System prompt or named profile fragment to prepend. `None`
+    /// inherits the role/workflow prompt only.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+
+    /// Tool/toolset names enabled for this profile. Empty list means
+    /// "no tools beyond backend defaults".
+    #[serde(default)]
+    pub tools: Vec<String>,
+
+    /// Extra environment variables exported into the agent process.
+    /// Values may contain `$VAR_NAME` placeholders; resolution
+    /// happens during workflow loading.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+
+    /// Memory policy hint (`none`, `session`, `persistent`, etc.).
+    /// Carried as an opaque string because the value set is owned by
+    /// the backend, not the schema.
+    #[serde(default)]
+    pub memory: Option<String>,
+
+    /// Backend approval policy. Pass-through; not validated here.
+    #[serde(default)]
+    pub approval_policy: Option<serde_yaml::Value>,
+
+    /// Backend sandbox policy. Pass-through; not validated here.
+    #[serde(default)]
+    pub sandbox_policy: Option<serde_yaml::Value>,
+
+    /// Hard cap on the number of agent turns within one session.
+    /// `None` inherits [`AgentConfig::max_turns`].
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+
+    /// Per-turn timeout in milliseconds. `None` inherits the backend
+    /// default (e.g. [`CodexConfig::turn_timeout_ms`]).
+    #[serde(default)]
+    pub turn_timeout_ms: Option<u64>,
+
+    /// Stall-detection window. `None` inherits the backend default.
+    #[serde(default)]
+    pub stall_timeout_ms: Option<u64>,
+
+    /// Token budget for the profile. `None` means unlimited at the
+    /// profile level (global budgets still apply).
+    #[serde(default)]
+    pub token_budget: Option<u64>,
+
+    /// Cost budget in USD for the profile. `None` means unlimited at
+    /// the profile level.
+    #[serde(default)]
+    pub cost_budget_usd: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,6 +1396,225 @@ roles:
             err.to_string().contains("kind") || err.to_string().contains("missing field"),
             "expected missing-field error for kind, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // agents (SPEC v2 §5.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn agents_default_is_empty() {
+        let cfg = WorkflowConfig::default();
+        assert!(cfg.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_yaml_parses_all_backends() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  lead_agent:
+    backend: codex
+    description: Integration owner backend.
+    command: codex app-server
+    model: o4
+    tools: [git, github, tracker]
+    memory: persistent
+    max_turns: 30
+    turn_timeout_ms: 1800000
+    token_budget: 1000000
+    cost_budget_usd: 12.5
+    env:
+      RUST_LOG: info
+  qa_agent:
+    backend: claude
+    command: claude -p --output-format stream-json
+    tools: [git, github]
+  hermes_agent:
+    backend: hermes
+  fixture_agent:
+    backend: mock
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.agents.len(), 4);
+
+        let lead = parsed.agents.get("lead_agent").expect("lead present");
+        assert_eq!(lead.backend, AgentBackend::Codex);
+        assert_eq!(lead.command.as_deref(), Some("codex app-server"));
+        assert_eq!(lead.model.as_deref(), Some("o4"));
+        assert_eq!(lead.tools, vec!["git", "github", "tracker"]);
+        assert_eq!(lead.memory.as_deref(), Some("persistent"));
+        assert_eq!(lead.max_turns, Some(30));
+        assert_eq!(lead.turn_timeout_ms, Some(1_800_000));
+        assert_eq!(lead.token_budget, Some(1_000_000));
+        assert_eq!(lead.cost_budget_usd, Some(12.5));
+        assert_eq!(lead.env.get("RUST_LOG").map(String::as_str), Some("info"));
+
+        assert_eq!(
+            parsed.agents.get("qa_agent").map(|a| a.backend),
+            Some(AgentBackend::Claude)
+        );
+        assert_eq!(
+            parsed.agents.get("hermes_agent").map(|a| a.backend),
+            Some(AgentBackend::Hermes)
+        );
+        assert_eq!(
+            parsed.agents.get("fixture_agent").map(|a| a.backend),
+            Some(AgentBackend::Mock)
+        );
+    }
+
+    #[test]
+    fn agent_backend_serialises_lowercase() {
+        for (variant, literal) in [
+            (AgentBackend::Codex, "codex"),
+            (AgentBackend::Claude, "claude"),
+            (AgentBackend::Hermes, "hermes"),
+            (AgentBackend::Mock, "mock"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: AgentBackend = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn agent_backend_rejects_unknown_value() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  bogus:
+    backend: gpt5
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("gpt5") || err.to_string().contains("unknown variant"),
+            "expected unknown-variant error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_unknown_field_is_rejected() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  lead_agent:
+    backend: codex
+    descritpion: typo
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("descritpion") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_backend_is_required() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  bare:
+    description: missing backend
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("backend") || err.to_string().contains("missing field"),
+            "expected missing-field error for backend, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agents_yaml_roundtrip_preserves_entries() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  lead_agent:
+    backend: codex
+    command: codex app-server
+    tools: [git, github]
+    env:
+      RUST_LOG: info
+  qa_agent:
+    backend: claude
+    max_turns: 12
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.agents.len(), 2);
+    }
+
+    #[test]
+    fn agent_profile_defaults_to_inherit() {
+        // A minimal profile leaves every policy field at None / empty so
+        // dispatch-time resolution can fall back to global defaults
+        // without needing to distinguish "operator wrote nothing" from
+        // "operator wrote the same default".
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  minimal:
+    backend: codex
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let p = parsed.agents.get("minimal").expect("present");
+        assert_eq!(p.backend, AgentBackend::Codex);
+        assert!(p.description.is_none());
+        assert!(p.command.is_none());
+        assert!(p.model.is_none());
+        assert!(p.system_prompt.is_none());
+        assert!(p.tools.is_empty());
+        assert!(p.env.is_empty());
+        assert!(p.memory.is_none());
+        assert!(p.approval_policy.is_none());
+        assert!(p.sandbox_policy.is_none());
+        assert!(p.max_turns.is_none());
+        assert!(p.turn_timeout_ms.is_none());
+        assert!(p.stall_timeout_ms.is_none());
+        assert!(p.token_budget.is_none());
+        assert!(p.cost_budget_usd.is_none());
+    }
+
+    #[test]
+    fn agents_keyspace_is_independent_of_role_names() {
+        // SPEC v2 §5.5: profiles live in their own keyspace. Two roles
+        // can reference one profile, and a profile name need not match
+        // any role name. The schema must accept that without coupling
+        // the two maps.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  platform_lead:
+    kind: integration_owner
+    agent: shared_codex
+  backend_engineer:
+    kind: specialist
+    agent: shared_codex
+agents:
+  shared_codex:
+    backend: codex
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.roles.len(), 2);
+        assert_eq!(parsed.agents.len(), 1);
+        for role in parsed.roles.values() {
+            assert_eq!(role.agent.as_deref(), Some("shared_codex"));
+        }
+        // The profile name is *not* a role name — that's the point.
+        assert!(!parsed.roles.contains_key("shared_codex"));
     }
 
     #[test]
