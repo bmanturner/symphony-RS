@@ -14,6 +14,7 @@
 mod cli;
 mod logging;
 mod run;
+mod status;
 mod validate;
 
 use std::process::ExitCode;
@@ -60,20 +61,29 @@ fn main() -> anyhow::Result<ExitCode> {
                 }
             }
         }
-        Some(Command::Status) | None => {
-            // `status` and the bare invocation land later in Phase 7.
-            // Until then we emit a tracing event so smoke tests can
-            // confirm the binary started, and exit non-zero so CI does
-            // not treat a stub invocation as success.
+        Some(Command::Status(args)) => {
+            // `status` performs a single tracker fetch, so it builds a
+            // small tokio runtime — the same shape as `run` but without
+            // the long-lived poll loop.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let outcome = runtime.block_on(status::run(&args.path));
+            let code = status::render(&outcome);
+            Ok(ExitCode::from(code as u8))
+        }
+        None => {
+            // No subcommand → print help and exit non-zero so callers
+            // never mistake a bare invocation for a successful no-op.
+            // The bare-invocation-defaults-to-`run` policy named in
+            // SPEC §10.3 lands when the orchestrator has a graceful
+            // shutdown story; the next checklist item adds it.
             tracing::info!(
                 target: "symphony::cli",
                 version = env!("CARGO_PKG_VERSION"),
-                "subcommand not yet implemented; only `validate` and `run` are wired in this iteration",
+                "no subcommand provided; printing help",
             );
-            eprintln!(
-                "symphony: only `validate` and `run` are implemented in this iteration; \
-                 see `symphony --help`",
-            );
+            eprintln!("symphony: missing subcommand; see `symphony --help`");
             Ok(ExitCode::from(64))
         }
     }

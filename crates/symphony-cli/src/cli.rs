@@ -54,9 +54,26 @@ pub enum Command {
     /// poll loop until SIGINT is received.
     Run(RunArgs),
 
-    /// Print a point-in-time snapshot of in-flight runs. Stubbed in
-    /// this iteration — composition lands later in Phase 7.
-    Status,
+    /// Print a point-in-time snapshot of the configured tracker's
+    /// active issues — i.e. what `symphony run` would dispatch on the
+    /// next poll tick. Distinct from Phase 8's `symphony watch` live
+    /// TUI: this command exits as soon as the tracker responds.
+    Status(StatusArgs),
+}
+
+/// Arguments for `symphony status`.
+///
+/// Mirrors `validate` and `run`: a single positional path so an operator
+/// can swap any of the three on the same command line. The tracker is
+/// determined entirely by `WORKFLOW.md` front matter (SPEC §5.4) — no
+/// CLI overrides.
+#[derive(Debug, clap::Args)]
+pub struct StatusArgs {
+    /// Path to the `WORKFLOW.md` file to read. Relative paths resolve
+    /// against the process's current working directory, matching the
+    /// rule [`symphony_config::LayeredLoader`] uses at runtime.
+    #[arg(value_name = "PATH", default_value = "WORKFLOW.md")]
+    pub path: PathBuf,
 }
 
 /// Arguments for `symphony run`.

@@ -162,7 +162,7 @@ fn install_ctrl_c(cancel: CancellationToken) {
 /// We deliberately do not implement `$VAR` expansion on the YAML field
 /// — figment's env layering is the documented expansion path (SPEC §5.4)
 /// and a second mechanism would just add ambiguity.
-fn build_tracker(cfg: &WorkflowConfig) -> Result<Arc<dyn IssueTracker>> {
+pub(crate) fn build_tracker(cfg: &WorkflowConfig) -> Result<Arc<dyn IssueTracker>> {
     match cfg.tracker.kind {
         TrackerKind::Linear => {
             let project_slug = cfg
