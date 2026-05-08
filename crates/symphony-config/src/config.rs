@@ -93,13 +93,15 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub hermes: HermesAgentConfig,
 
-    /// Out-of-process status surface (Phase 8). Controls whether the
-    /// daemon exposes `GET /events` as an SSE feed and where it binds.
-    /// Defaults are loopback-only and on, so a fresh `WORKFLOW.md`
-    /// "just works" with `symphony watch` without surprising the
-    /// operator with an open port on a public interface.
+    /// Operator-facing observability surfaces. SPEC v2 §5.14. Wraps
+    /// the structured-logs format, the in-process event bus toggle,
+    /// the Server-Sent Events (SSE) HTTP feed (formerly the top-level
+    /// `status:` block), and the TUI/dashboard switches.
+    ///
+    /// Defaults keep the daemon runnable out of the box: SSE bound to
+    /// loopback, event bus on, TUI on, dashboard off.
     #[serde(default)]
-    pub status: StatusConfig,
+    pub observability: ObservabilityConfig,
 
     /// Workflow-defined roles keyed by their (workflow-chosen) name.
     /// SPEC v2 §5.4. Names like `platform_lead` or `qa` are
@@ -195,7 +197,7 @@ impl Default for WorkflowConfig {
             agent: AgentConfig::default(),
             codex: CodexConfig::default(),
             hermes: HermesAgentConfig::default(),
-            status: StatusConfig::default(),
+            observability: ObservabilityConfig::default(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
             routing: RoutingConfig::default(),
@@ -660,12 +662,96 @@ fn default_hermes_stall_timeout_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// status (Phase 8 — SSE event surface)
+// observability (SPEC v2 §5.14)
 // ---------------------------------------------------------------------------
 
-/// Configuration for the out-of-process status surface.
+/// Operator-facing observability surfaces.
 ///
-/// The status surface is a narrow `axum` HTTP server inside the daemon
+/// SPEC v2 §5.14 collects the previously top-level `status:` block plus
+/// the structured-logs format, the in-process event bus toggle, and the
+/// TUI/dashboard switches under one section. The kernel itself remains
+/// headless; everything in this struct is optional out-of-process
+/// machinery layered over durable state and the event stream.
+///
+/// All sub-blocks default in a way that keeps the daemon runnable
+/// without explicit configuration: SSE bound to loopback, event bus on,
+/// TUI on, dashboard off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Structured-log shape. SPEC v2 §5.14.
+    #[serde(default)]
+    pub logs: LogsConfig,
+
+    /// Whether the in-process event bus is enabled. Disabling the bus
+    /// suppresses both the SSE server and any in-process subscriber;
+    /// it exists so headless deployments (e.g. CI smoke tests) can
+    /// trim the broadcast machinery without disabling individual
+    /// surfaces one by one. SPEC v2 §5.14.
+    #[serde(default = "default_true")]
+    pub event_bus: bool,
+
+    /// Server-Sent Events HTTP feed. Formerly the top-level
+    /// `status:` block; SPEC v2 §5.14 specifies the move under
+    /// `observability.sse` and preserves the `bind` / `replay_buffer`
+    /// validation. See [`SseConfig`].
+    #[serde(default)]
+    pub sse: SseConfig,
+
+    /// In-process TUI surface. SPEC v2 §5.14.
+    #[serde(default)]
+    pub tui: TuiConfig,
+
+    /// Optional web dashboard surface. SPEC v2 §5.14. Defaults
+    /// disabled so a stock workflow does not silently bind a port.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            logs: LogsConfig::default(),
+            event_bus: true,
+            sse: SseConfig::default(),
+            tui: TuiConfig::default(),
+            dashboard: DashboardConfig::default(),
+        }
+    }
+}
+
+/// Structured-log configuration block. Currently only the format
+/// discriminant is exposed; level, sink, and sampling stay implicit
+/// (driven by `RUST_LOG` and the tracing layer in the binary). SPEC v2
+/// §5.14.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsConfig {
+    /// Output format for structured logs.
+    #[serde(default)]
+    pub format: LogFormat,
+}
+
+/// Shape of structured-log output. Mirrors SPEC v2 §5.14 worked
+/// example: `json` for ingest, `pretty` for interactive runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Newline-delimited JSON. Default — matches the daemon's
+    /// production tracing layer and is the only format external log
+    /// shippers can ingest losslessly.
+    #[default]
+    Json,
+    /// Human-readable pretty-printed lines, intended for interactive
+    /// `symphony run` shells. Emits ANSI colour when the underlying
+    /// writer is a TTY.
+    Pretty,
+}
+
+/// Configuration for the out-of-process SSE surface (formerly
+/// `StatusConfig`).
+///
+/// The SSE surface is a narrow `axum` HTTP server inside the daemon
 /// that re-emits the orchestrator's broadcast bus over Server-Sent
 /// Events. `symphony watch` (and any third-party observer) connects to
 /// `GET /events` and receives one `OrchestratorEvent` per SSE frame.
@@ -676,13 +762,13 @@ fn default_hermes_stall_timeout_ms() -> u64 {
 /// front of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StatusConfig {
+pub struct SseConfig {
     /// Whether to start the SSE server alongside the orchestrator.
     /// `true` keeps `symphony watch` working out of the box; setting
     /// this to `false` skips the bind entirely (useful in CI, in
     /// systemd unit tests, or when running multiple daemons on the
     /// same host).
-    #[serde(default = "default_status_enabled")]
+    #[serde(default = "default_sse_enabled")]
     pub enabled: bool,
 
     /// Address to bind the SSE listener on. Defaults to
@@ -690,7 +776,7 @@ pub struct StatusConfig {
     /// reachable from the network. Anything `SocketAddr` accepts is
     /// valid; the runtime parses lazily on bind, so a malformed value
     /// surfaces at startup rather than at config-load time.
-    #[serde(default = "default_status_bind")]
+    #[serde(default = "default_sse_bind")]
     pub bind: String,
 
     /// Capacity of the `tokio::sync::broadcast` channel that fans
@@ -699,30 +785,62 @@ pub struct StatusConfig {
     /// falls behind by more than this many events sees a `Lagged`
     /// signal and is expected to reconnect. Default mirrors the
     /// orchestrator's own internal default (256).
-    #[serde(default = "default_status_replay_buffer")]
+    #[serde(default = "default_sse_replay_buffer")]
     pub replay_buffer: usize,
 }
 
-impl Default for StatusConfig {
+impl Default for SseConfig {
     fn default() -> Self {
         Self {
-            enabled: default_status_enabled(),
-            bind: default_status_bind(),
-            replay_buffer: default_status_replay_buffer(),
+            enabled: default_sse_enabled(),
+            bind: default_sse_bind(),
+            replay_buffer: default_sse_replay_buffer(),
         }
     }
 }
 
-fn default_status_enabled() -> bool {
+fn default_sse_enabled() -> bool {
     true
 }
 
-fn default_status_bind() -> String {
+fn default_sse_bind() -> String {
     "127.0.0.1:6280".to_string()
 }
 
-fn default_status_replay_buffer() -> usize {
+fn default_sse_replay_buffer() -> usize {
     256
+}
+
+/// Configuration for the in-process TUI surface. SPEC v2 §5.14
+/// promises only an `enabled` switch today; richer panel-level
+/// toggles can land alongside the Phase 12 TUI work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TuiConfig {
+    /// Whether the TUI binary may be started against this workflow.
+    /// Defaults to `true` so an operator running `symphony tui`
+    /// against a fresh `WORKFLOW.md` does not have to opt in.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Configuration for the optional web dashboard surface. SPEC v2
+/// §5.14. Dashboard implementation is post-Phase-12 but the schema
+/// reserves the slot so workflows do not need to be rewritten when
+/// the surface ships.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardConfig {
+    /// Defaults to `false`: the dashboard is opt-in so a stock
+    /// workflow does not silently bind a port or host static assets.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1999,14 +2117,15 @@ pub enum ConfigValidationError {
     #[error("tracker.fixtures is required when tracker.kind = mock")]
     MockMissingFixtures,
 
-    /// `status.replay_buffer` must be > 0; `tokio::sync::broadcast`
-    /// rejects zero-capacity channels at construction time.
-    #[error("status.replay_buffer must be > 0 (got {0})")]
-    StatusReplayBufferZero(usize),
+    /// `observability.sse.replay_buffer` must be > 0;
+    /// `tokio::sync::broadcast` rejects zero-capacity channels at
+    /// construction time.
+    #[error("observability.sse.replay_buffer must be > 0 (got {0})")]
+    ObservabilitySseReplayBufferZero(usize),
 
-    /// `status.bind` must be a parseable `SocketAddr`.
-    #[error("status.bind is not a valid socket address: {0}")]
-    StatusBindInvalid(String),
+    /// `observability.sse.bind` must be a parseable `SocketAddr`.
+    #[error("observability.sse.bind is not a valid socket address: {0}")]
+    ObservabilitySseBindInvalid(String),
 }
 
 impl WorkflowConfig {
@@ -2051,18 +2170,24 @@ impl WorkflowConfig {
                 }
             }
         }
-        if self.status.enabled {
-            if self.status.replay_buffer == 0 {
-                return Err(ConfigValidationError::StatusReplayBufferZero(
-                    self.status.replay_buffer,
+        if self.observability.sse.enabled {
+            if self.observability.sse.replay_buffer == 0 {
+                return Err(ConfigValidationError::ObservabilitySseReplayBufferZero(
+                    self.observability.sse.replay_buffer,
                 ));
             }
             // Parse-only; the runtime binds later. We surface the
             // failure at validate-time so `symphony validate` catches
             // it before the daemon is ever started.
-            if self.status.bind.parse::<std::net::SocketAddr>().is_err() {
-                return Err(ConfigValidationError::StatusBindInvalid(
-                    self.status.bind.clone(),
+            if self
+                .observability
+                .sse
+                .bind
+                .parse::<std::net::SocketAddr>()
+                .is_err()
+            {
+                return Err(ConfigValidationError::ObservabilitySseBindInvalid(
+                    self.observability.sse.bind.clone(),
                 ));
             }
         }
@@ -2169,9 +2294,13 @@ mod tests {
         assert_eq!(cfg.codex.turn_timeout_ms, 3_600_000);
         assert_eq!(cfg.codex.read_timeout_ms, 5_000);
         assert_eq!(cfg.codex.stall_timeout_ms, 300_000);
-        assert!(cfg.status.enabled);
-        assert_eq!(cfg.status.bind, "127.0.0.1:6280");
-        assert_eq!(cfg.status.replay_buffer, 256);
+        assert!(cfg.observability.sse.enabled);
+        assert_eq!(cfg.observability.sse.bind, "127.0.0.1:6280");
+        assert_eq!(cfg.observability.sse.replay_buffer, 256);
+        assert!(cfg.observability.event_bus);
+        assert!(cfg.observability.tui.enabled);
+        assert!(!cfg.observability.dashboard.enabled);
+        assert_eq!(cfg.observability.logs.format, LogFormat::Json);
     }
 
     #[test]
@@ -2389,19 +2518,31 @@ agent:
     }
 
     #[test]
-    fn yaml_roundtrip_preserves_status_overrides() {
+    fn yaml_roundtrip_preserves_observability_overrides() {
         let yaml = r#"
 tracker:
   project_slug: ENG
-status:
-  enabled: false
-  bind: 0.0.0.0:7000
-  replay_buffer: 1024
+observability:
+  logs:
+    format: pretty
+  event_bus: false
+  sse:
+    enabled: false
+    bind: 0.0.0.0:7000
+    replay_buffer: 1024
+  tui:
+    enabled: false
+  dashboard:
+    enabled: true
 "#;
         let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
-        assert!(!parsed.status.enabled);
-        assert_eq!(parsed.status.bind, "0.0.0.0:7000");
-        assert_eq!(parsed.status.replay_buffer, 1024);
+        assert_eq!(parsed.observability.logs.format, LogFormat::Pretty);
+        assert!(!parsed.observability.event_bus);
+        assert!(!parsed.observability.sse.enabled);
+        assert_eq!(parsed.observability.sse.bind, "0.0.0.0:7000");
+        assert_eq!(parsed.observability.sse.replay_buffer, 1024);
+        assert!(!parsed.observability.tui.enabled);
+        assert!(parsed.observability.dashboard.enabled);
 
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
@@ -2409,14 +2550,52 @@ status:
     }
 
     #[test]
-    fn status_unknown_nested_key_is_rejected() {
-        // Mirrors the polling test: typos inside the status section
-        // must not silently default — operators expect feedback.
+    fn observability_defaults_when_omitted() {
+        // SPEC v2 §5.14 promises that omitting the block keeps the
+        // daemon runnable. Defaults must mirror the documented
+        // worked example.
+        let yaml = "tracker:\n  project_slug: ENG\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.observability, ObservabilityConfig::default());
+        assert!(parsed.observability.sse.enabled);
+        assert_eq!(parsed.observability.sse.bind, "127.0.0.1:6280");
+        assert_eq!(parsed.observability.sse.replay_buffer, 256);
+        assert!(parsed.observability.event_bus);
+        assert!(parsed.observability.tui.enabled);
+        assert!(!parsed.observability.dashboard.enabled);
+        assert_eq!(parsed.observability.logs.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn legacy_top_level_status_block_is_rejected() {
+        // Migration guard: SPEC v2 §5.14 moves `status:` under
+        // `observability.sse`. A top-level `status:` block must fail
+        // loudly with an unknown-field error rather than silently
+        // dropping operator intent.
         let yaml = r#"
 tracker:
   project_slug: ENG
 status:
-  enabld: true
+  enabled: false
+  bind: 0.0.0.0:7000
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("status") || err.to_string().contains("unknown field"),
+            "expected unknown-field error for legacy `status:`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn observability_unknown_nested_key_is_rejected() {
+        // Mirrors the polling test: typos inside a known section
+        // must not silently default — operators expect feedback.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+observability:
+  sse:
+    enabld: true
 "#;
         let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
         assert!(
@@ -2426,26 +2605,42 @@ status:
     }
 
     #[test]
-    fn validate_rejects_zero_replay_buffer_when_status_enabled() {
-        let mut cfg = WorkflowConfig::default();
-        cfg.tracker.project_slug = Some("ENG".into());
-        cfg.status.replay_buffer = 0;
-        assert_eq!(
-            cfg.validate(),
-            Err(ConfigValidationError::StatusReplayBufferZero(0))
+    fn observability_unknown_top_section_is_rejected() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+observability:
+  metrics:
+    enabled: true
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("metrics") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
         );
     }
 
     #[test]
-    fn validate_ignores_zero_replay_buffer_when_status_disabled() {
-        // A disabled status surface never constructs the broadcast
-        // channel, so a zero buffer is harmless. Surfacing it as an
-        // error would force operators to delete the (otherwise
-        // illustrative) value just to start the daemon with status off.
+    fn validate_rejects_zero_replay_buffer_when_sse_enabled() {
         let mut cfg = WorkflowConfig::default();
         cfg.tracker.project_slug = Some("ENG".into());
-        cfg.status.enabled = false;
-        cfg.status.replay_buffer = 0;
+        cfg.observability.sse.replay_buffer = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::ObservabilitySseReplayBufferZero(0))
+        );
+    }
+
+    #[test]
+    fn validate_ignores_zero_replay_buffer_when_sse_disabled() {
+        // A disabled SSE surface never constructs the broadcast
+        // channel, so a zero buffer is harmless. Surfacing it as an
+        // error would force operators to delete the (otherwise
+        // illustrative) value just to start the daemon with SSE off.
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.observability.sse.enabled = false;
+        cfg.observability.sse.replay_buffer = 0;
         assert_eq!(cfg.validate(), Ok(()));
     }
 
@@ -2453,10 +2648,10 @@ status:
     fn validate_rejects_unparseable_bind() {
         let mut cfg = WorkflowConfig::default();
         cfg.tracker.project_slug = Some("ENG".into());
-        cfg.status.bind = "not-a-socket".into();
+        cfg.observability.sse.bind = "not-a-socket".into();
         assert_eq!(
             cfg.validate(),
-            Err(ConfigValidationError::StatusBindInvalid(
+            Err(ConfigValidationError::ObservabilitySseBindInvalid(
                 "not-a-socket".into()
             ))
         );

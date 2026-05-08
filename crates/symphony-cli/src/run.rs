@@ -143,8 +143,9 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // The event bus is shared between the orchestrator (the producer)
     // and the optional SSE server (a fan-out consumer). Building it at
     // the composition root lets both sides agree on replay sizing —
-    // [`StatusConfig::replay_buffer`] is the single knob.
-    let bus = EventBus::new(loaded.config.status.replay_buffer);
+    // `observability.sse.replay_buffer` (SPEC v2 §5.14) is the single
+    // knob.
+    let bus = EventBus::new(loaded.config.observability.sse.replay_buffer);
     let poll_loop = PollLoop::with_event_bus(tracker, dispatcher, cfg, bus.clone());
 
     let cancel = CancellationToken::new();
@@ -157,8 +158,8 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // loop is the load-bearing surface, and an operator who hits a
     // port-already-in-use should still be able to drive issues through.
     // The error is logged loudly so the failure is visible.
-    let status_task = if loaded.config.status.enabled {
-        let bind = loaded.config.status.bind.clone();
+    let status_task = if loaded.config.observability.sse.enabled {
+        let bind = loaded.config.observability.sse.bind.clone();
         let bus = bus.clone();
         let cancel = cancel.clone();
         Some(tokio::spawn(async move {
