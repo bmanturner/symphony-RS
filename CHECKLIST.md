@@ -133,7 +133,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] `symphony run` subcommand composing real adapters
 - [x] `symphony status` snapshot output (point-in-time; distinct from
       Phase 8's `symphony watch` live TUI)
-- [ ] Graceful SIGINT shutdown that drains in-flight turns
+- [x] Graceful SIGINT shutdown that drains in-flight turns
 - [ ] README "Quickstart" section ending with a first dispatched mock
       issue
 

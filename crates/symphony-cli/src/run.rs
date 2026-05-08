@@ -42,10 +42,21 @@
 //! ## SIGINT behaviour
 //!
 //! This module wires `tokio::signal::ctrl_c` to a
-//! [`CancellationToken`]; [`PollLoop::run`] already drains in-flight
-//! dispatches when the token fires. The dedicated "graceful SIGINT"
-//! checklist item adds explicit drain-deadline + smoke tests on top of
-//! this scaffold; do not push that work down here.
+//! [`CancellationToken`]. [`PollLoop::run`] then:
+//!
+//! 1. Stops accepting new dispatches.
+//! 2. Fires every per-issue child cancel token so in-flight agent
+//!    sessions tear down cooperatively.
+//! 3. Drains the in-flight join set, but only up to
+//!    `PollLoopConfig::drain_deadline`. Any task still running past
+//!    the deadline is `JoinSet::abort_all()`'d and its claim is
+//!    released as `Canceled`, so a wedged subprocess can never hang
+//!    the daemon's exit.
+//!
+//! A second SIGINT is not handled specially — operators who need
+//! "force-kill on second Ctrl-C" semantics get them from the shell
+//! (tokio's default Ctrl-C handler aborts the process on the second
+//! signal). Tightening the drain deadline is the in-process knob.
 
 use std::env;
 use std::sync::Arc;
@@ -117,6 +128,12 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         // needs to tune it.
         jitter_ratio: 0.1,
         max_concurrent: loaded.config.agent.max_concurrent_agents as usize,
+        // SPEC §16 doesn't pin a value here; 30 s mirrors the default
+        // poll interval and is comfortably longer than any
+        // cooperative agent tear-down we've observed in tests.
+        // Surface as a typed config knob if a deployment ever needs
+        // to retune it.
+        drain_deadline: Duration::from_secs(30),
     };
     let poll_loop = PollLoop::new(tracker, dispatcher, cfg);
 
@@ -133,9 +150,8 @@ pub async fn run(args: &RunArgs) -> Result<()> {
 /// Idempotent: a second SIGINT is observed only because this function
 /// returns immediately — operators wanting "force-kill on second
 /// SIGINT" semantics get them from the shell (Ctrl-C twice in tokio's
-/// default handler triggers a process abort). We deliberately do *not*
-/// register a second handler here so the next checklist item ("graceful
-/// SIGINT shutdown that drains in-flight turns") owns that policy.
+/// default handler triggers a process abort). The cooperative drain
+/// deadline lives on [`PollLoopConfig::drain_deadline`].
 fn install_ctrl_c(cancel: CancellationToken) {
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {

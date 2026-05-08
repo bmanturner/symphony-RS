@@ -383,6 +383,32 @@ first-party tokio crate so the version-skew risk is minimal. No
 behavioural change to existing code; the token is plumbed only through
 new code paths added during Phase 5.
 
+### 2026-05-08 — Bounded SIGINT drain via `PollLoopConfig::drain_deadline`
+**Context.** Pure cooperative cancellation has a failure mode: a wedged
+agent backend (subprocess that ignores its cancel token, retry loop
+stuck on a network call, `start_session` future blocked on a slow
+spawn) keeps `JoinSet::join_next` returning `Some(_)` forever, so
+`PollLoop::run` never returns and SIGINT never produces a clean exit.
+The architecture tenet "drain in-flight on SIGINT" is correct for the
+happy path but underspecified for the bad one.
+
+**Decision.** Add a `drain_deadline: Duration` field to
+`PollLoopConfig`. `PollLoop::run` wraps the cooperative drain in a
+`tokio::time::timeout(drain_deadline, ...)`. If the timeout fires (or
+`drain_deadline` is `Duration::ZERO`), the loop calls
+`JoinSet::abort_all()`, drains the aborted handles, and releases the
+remaining ledger entries with `ReleaseReason::Canceled`. The CLI
+hardcodes 30 s; surfacing it as a `WORKFLOW.md` knob is a follow-up
+task that lands when a deployment actually needs to retune it.
+
+**Consequence.** Daemon exit is bounded at `drain_deadline + tracker
+tick remainder` even with a misbehaving backend. Aborted runs are
+released as `Canceled` (not a new dedicated variant) on the theory
+that "SIGINT cancelled the run" describes both cooperative and forced
+shutdowns; if observability needs to distinguish them later, that's a
+new release reason — not a wire-format break, since the existing
+variants stay valid.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line

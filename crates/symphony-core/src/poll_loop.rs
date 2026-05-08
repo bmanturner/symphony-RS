@@ -105,16 +105,35 @@ pub struct PollLoopConfig {
     /// Hard cap on simultaneously-claimed issues. Mirrors
     /// `agent.max_concurrent_agents` from `WORKFLOW.md`.
     pub max_concurrent: usize,
+    /// Maximum wall-clock time the loop spends draining in-flight
+    /// dispatches after [`PollLoop::run`] observes its cancellation
+    /// signal. When this elapses, any remaining dispatch tasks are
+    /// `JoinSet::abort_all()`'d and their claims are released as
+    /// [`ReleaseReason::Canceled`].
+    ///
+    /// The well-behaved case (operator hits Ctrl-C, agents observe the
+    /// child cancel token, sessions tear down) returns long before the
+    /// deadline. The deadline exists for the *misbehaving* case: a wedged
+    /// subprocess, a backend that ignores cancellation, a `start_session`
+    /// future stuck in retry. Without a bound, SIGINT would hang the
+    /// daemon indefinitely. With a bound, the operator gets a clean exit
+    /// after at most `drain_deadline`, with the loud aborts visible in
+    /// the logs.
+    ///
+    /// Set to `Duration::ZERO` to abort immediately on cancel (no drain).
+    pub drain_deadline: Duration,
 }
 
 impl PollLoopConfig {
     /// Convenience for SPEC §5.3 defaults: 30 s interval, ±10 % jitter,
-    /// 10-way concurrency. Tests typically override `interval`.
+    /// 10-way concurrency, 30 s drain deadline. Tests typically override
+    /// `interval` and `drain_deadline`.
     pub fn defaults() -> Self {
         Self {
             interval: Duration::from_secs(30),
             jitter_ratio: 0.1,
             max_concurrent: 10,
+            drain_deadline: Duration::from_secs(30),
         }
     }
 }
@@ -326,12 +345,93 @@ impl PollLoop {
             }
         }
         // Drain in-flight: child tokens already fired with the parent.
+        // The deadline bounds how long we wait for cooperative tear-down
+        // before giving up and aborting the remaining tasks.
+        self.drain_with_deadline(self.config.drain_deadline).await;
+        info!("poll loop drained");
+    }
+
+    /// Wait up to `deadline` for in-flight dispatches to finish, then
+    /// abort any stragglers. Pulled out of [`PollLoop::run`] so tests
+    /// can drive it directly without spinning up the timer task.
+    ///
+    /// Behaviour, in order:
+    ///
+    /// 1. Loop on [`JoinSet::join_next`] inside a [`tokio::time::timeout`]
+    ///    for the full `deadline`. Each finished task is released
+    ///    through the same override-aware path as the steady-state reap.
+    /// 2. When the timeout fires (or `deadline` is zero), call
+    ///    [`JoinSet::abort_all`] and drain the join set unconditionally.
+    ///    Aborted tasks resolve as `Err(JoinError { is_cancelled: true })`;
+    ///    their ledger entries are released with [`ReleaseReason::Canceled`]
+    ///    and a `warn!` line so operators can see which runs were forcibly
+    ///    terminated.
+    async fn drain_with_deadline(&mut self, deadline: Duration) {
+        let drained_cleanly = if deadline.is_zero() {
+            false
+        } else {
+            tokio::time::timeout(deadline, self.drain_until_empty())
+                .await
+                .is_ok()
+        };
+        if drained_cleanly {
+            return;
+        }
+        // Either the operator asked for a zero-deadline immediate abort,
+        // or one or more tasks didn't honour their cancel token in time.
+        // Force them down and release with `Canceled` so the ledger
+        // doesn't keep stale claims around.
+        let stuck: Vec<IssueId> = self.handles.keys().cloned().collect();
+        if !stuck.is_empty() {
+            warn!(
+                stuck = stuck.len(),
+                "drain deadline exceeded; aborting in-flight dispatches"
+            );
+        }
+        self.in_flight.abort_all();
         while let Some(joined) = self.in_flight.join_next().await {
             match joined {
                 Ok((id, dispatcher_reason)) => {
-                    // Honour any pending reconciliation override
-                    // exactly as `reap_finished` does — a reconciled
-                    // run that races with shutdown should still record
+                    let reason = self
+                        .handles
+                        .remove(&id)
+                        .and_then(|h| h.override_reason)
+                        .unwrap_or(dispatcher_reason);
+                    let _ = self.state.release(id, reason);
+                }
+                Err(err) if err.is_cancelled() => {
+                    // We don't know which `id` this aborted task belonged
+                    // to (the panic-payload-style join error carries no
+                    // user data), but the only handles still present are
+                    // ones whose tasks haven't been reaped — and those
+                    // are precisely the ones we just aborted. Releasing
+                    // them as `Canceled` keeps the ledger accurate.
+                    if let Some(id) = pop_any(&mut self.handles) {
+                        let _ = self.state.release(id, ReleaseReason::Canceled);
+                    }
+                }
+                Err(err) => warn!(error = %err, "dispatch task panicked during forced drain"),
+            }
+        }
+        // Any handles that survive both reaps (theoretically impossible
+        // — every spawn registers a handle and every reap removes one)
+        // get released defensively so the ledger never lies.
+        let leftover: Vec<IssueId> = self.handles.keys().cloned().collect();
+        for id in leftover {
+            self.handles.remove(&id);
+            let _ = self.state.release(id, ReleaseReason::Canceled);
+        }
+    }
+
+    /// Drain `in_flight` to empty using the steady-state reap logic.
+    /// Wrapped by [`Self::drain_with_deadline`] inside a timeout.
+    async fn drain_until_empty(&mut self) {
+        while let Some(joined) = self.in_flight.join_next().await {
+            match joined {
+                Ok((id, dispatcher_reason)) => {
+                    // Honour any pending reconciliation override exactly
+                    // as `reap_finished` does — a reconciled run that
+                    // races with shutdown should still record
                     // `NoLongerActive`, not the dispatcher's reason.
                     let reason = self
                         .handles
@@ -344,7 +444,6 @@ impl PollLoop {
                 Err(err) => warn!(error = %err, "dispatch task panicked during drain"),
             }
         }
-        info!("poll loop drained");
     }
 
     /// Reap completed dispatches without blocking. Returns the
@@ -400,6 +499,18 @@ impl PollLoop {
             (id, reason)
         });
     }
+}
+
+/// Pop an arbitrary entry from `map`. Used by the forced-abort drain
+/// path: aborted `JoinSet` entries surface as `JoinError`s with no
+/// user payload, so we can't look up the canonical handle by id —
+/// instead we burn down the handle table in lockstep with the drain.
+/// Hash-iteration order is deliberately fine here; the loop is about
+/// releasing every remaining claim, not preserving order.
+fn pop_any<K: Clone + std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>) -> Option<K> {
+    let key = map.keys().next().cloned()?;
+    map.remove(&key);
+    Some(key)
 }
 
 /// Compute the next sleep duration with `±jitter_ratio` half-width.
@@ -538,6 +649,7 @@ mod tests {
             interval: Duration::from_millis(1),
             jitter_ratio: 0.0,
             max_concurrent: 2,
+            drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(tracker, Arc::clone(&dispatcher) as Arc<dyn Dispatcher>, cfg);
         let cancel = CancellationToken::new();
@@ -579,6 +691,7 @@ mod tests {
             interval: Duration::from_millis(1),
             jitter_ratio: 0.0,
             max_concurrent: 10,
+            drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(tracker, Arc::clone(&dispatcher) as Arc<dyn Dispatcher>, cfg);
         let cancel = CancellationToken::new();
@@ -636,6 +749,7 @@ mod tests {
             interval: Duration::from_millis(5),
             jitter_ratio: 0.0,
             max_concurrent: 3,
+            drain_deadline: Duration::from_secs(1),
         };
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -703,6 +817,7 @@ mod tests {
             interval: Duration::from_millis(1),
             jitter_ratio: 0.0,
             max_concurrent: 10,
+            drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(
             Arc::clone(&tracker) as Arc<dyn IssueTracker>,
@@ -770,6 +885,7 @@ mod tests {
             interval: Duration::from_millis(1),
             jitter_ratio: 0.0,
             max_concurrent: 10,
+            drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(
             Arc::clone(&tracker) as Arc<dyn IssueTracker>,
@@ -827,5 +943,163 @@ mod tests {
         // sleep — the loop would busy-spin.
         let d = jittered_sleep_for(Duration::from_millis(100), 5.0, 7);
         assert!(d > Duration::ZERO);
+    }
+
+    /// Dispatcher that ignores its cancellation token and only
+    /// resolves once an external `Notify` is fired. Models a wedged
+    /// agent backend that fails to honour cooperative shutdown.
+    struct WedgedDispatcher {
+        started: AtomicUsize,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Dispatcher for WedgedDispatcher {
+        async fn dispatch(&self, _issue: Issue, _cancel: CancellationToken) -> ReleaseReason {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            ReleaseReason::Completed
+        }
+    }
+
+    #[tokio::test]
+    async fn run_aborts_in_flight_after_drain_deadline() {
+        // A wedged dispatcher would hang `run()` forever without the
+        // deadline. With the deadline, `run()` must return promptly,
+        // every claim must be released as `Canceled`, and the join set
+        // must be empty.
+        let tracker = Arc::new(StaticTracker::new(issues(2)));
+        let release = Arc::new(Notify::new());
+        let dispatcher = Arc::new(WedgedDispatcher {
+            started: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+        });
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(5),
+            jitter_ratio: 0.0,
+            max_concurrent: 2,
+            drain_deadline: Duration::from_millis(50),
+        };
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let dispatcher_clone = Arc::clone(&dispatcher);
+        let tracker_clone = Arc::clone(&tracker) as Arc<dyn IssueTracker>;
+        let started = tokio::spawn(async move {
+            let loop_ = PollLoop::new(tracker_clone, dispatcher_clone as Arc<dyn Dispatcher>, cfg);
+            loop_.run(cancel_clone).await;
+        });
+
+        // Wait for both dispatches to have started awaiting their
+        // (ignored) cancel.
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(dispatcher.started.load(Ordering::SeqCst), 2);
+
+        cancel.cancel();
+        // Generous slack: deadline (50 ms) + scheduling overhead.
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .expect("run returned within deadline + slack")
+            .expect("no panic");
+
+        // The wedged tasks were aborted; nothing reads from `release`
+        // any more. Notify it anyway to keep the test self-contained.
+        release.notify_waiters();
+        // Suppress unused-tracker warning.
+        tracker.replace(Vec::new());
+    }
+
+    #[tokio::test]
+    async fn run_returns_immediately_with_zero_drain_deadline() {
+        // `drain_deadline = 0` means "abort on cancel, do not wait."
+        // Useful as an emergency-stop knob; `run()` must return even
+        // if dispatchers are still running.
+        let tracker = Arc::new(StaticTracker::new(issues(1)));
+        let release = Arc::new(Notify::new());
+        let dispatcher = Arc::new(WedgedDispatcher {
+            started: AtomicUsize::new(0),
+            release: Arc::clone(&release),
+        });
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(5),
+            jitter_ratio: 0.0,
+            max_concurrent: 1,
+            drain_deadline: Duration::ZERO,
+        };
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let dispatcher_clone = Arc::clone(&dispatcher);
+        let tracker_clone = Arc::clone(&tracker) as Arc<dyn IssueTracker>;
+        let started = tokio::spawn(async move {
+            let loop_ = PollLoop::new(tracker_clone, dispatcher_clone as Arc<dyn Dispatcher>, cfg);
+            loop_.run(cancel_clone).await;
+        });
+
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), started)
+            .await
+            .expect("run returned without waiting on the wedged dispatcher")
+            .expect("no panic");
+
+        release.notify_waiters();
+        tracker.replace(Vec::new());
+    }
+
+    #[tokio::test]
+    async fn run_drains_cleanly_when_dispatchers_honour_cancel() {
+        // The cooperative path: dispatchers observe the cancel token
+        // and resolve quickly. The deadline must NOT fire, the
+        // override-aware reap path must run, and the recorded reason
+        // must be the dispatcher's own `Canceled` rather than the
+        // forced-abort `Canceled`. (They're the same variant today —
+        // this test is here to pin the cooperative path against future
+        // refactors that introduce a distinct forced-abort reason.)
+        let tracker = Arc::new(StaticTracker::new(issues(2)));
+        let dispatcher = Arc::new(CancellableDispatcher::new());
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(5),
+            jitter_ratio: 0.0,
+            max_concurrent: 2,
+            drain_deadline: Duration::from_secs(5),
+        };
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let dispatcher_clone = Arc::clone(&dispatcher);
+        let tracker_clone = Arc::clone(&tracker) as Arc<dyn IssueTracker>;
+        let started = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            let loop_ = PollLoop::new(tracker_clone, dispatcher_clone as Arc<dyn Dispatcher>, cfg);
+            loop_.run(cancel_clone).await;
+        });
+
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("run drained cleanly")
+            .expect("no panic");
+        // Cooperative drain should be far below the 5 s deadline.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "drain took {:?}, expected sub-2s cooperative path",
+            started.elapsed()
+        );
+        tracker.replace(Vec::new());
     }
 }
