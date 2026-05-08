@@ -38,18 +38,18 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-/// Default per-hook timeout (SPEC §9.4: `60_000 ms`). Hooks that exceed it
-/// are killed and reported as a [`WorkspaceError::Hook`]. Wrapped as a
-/// `const` so the default lands in one place and `serde` can default the
-/// deserialised field to it.
-pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
+/// Default per-snippet hook timeout (SPEC v2 §5.17: 5 minutes). The
+/// longer default reflects that v2 hooks routinely do branch prep or
+/// worktree creation. Hooks that exceed it are killed and reported as
+/// a [`WorkspaceError::Hook`]. The timeout applies per snippet, not per
+/// phase.
+pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 300_000;
 
 fn default_hook_timeout_ms() -> u64 {
     DEFAULT_HOOK_TIMEOUT_MS
 }
 
-/// Optional shell scripts that fire at well-defined points in the
-/// workspace lifecycle. SPEC §9.4 names four of them:
+/// Lifecycle shell hooks. SPEC v2 §5.17 names four phases:
 ///
 /// | Hook            | Fires on                       | Failure semantics             |
 /// |-----------------|--------------------------------|-------------------------------|
@@ -58,45 +58,47 @@ fn default_hook_timeout_ms() -> u64 {
 /// | `after_run`     | orchestrator post-spawn        | logged + ignored              |
 /// | `before_remove` | the `release` before rmdir     | logged + ignored              |
 ///
-/// Each script is executed via `sh -lc <script>` with the workspace
-/// directory as `cwd`. The `Option<String>` shape — rather than
-/// `Vec<String>` of arg-vectors — matches the SPEC's intent that hooks
-/// are arbitrary shell snippets the operator chooses, not a structured
-/// command we want to interpret.
+/// Each phase is a *list of shell snippets*. Snippets in a list run
+/// sequentially under `sh -lc <snippet>` with the workspace directory
+/// as `cwd`; the first non-zero exit aborts the phase. An empty list is
+/// equivalent to "no hook configured" — the call returns immediately.
+/// `timeout_ms` applies per snippet, not per phase, so a phase composed
+/// of several quick steps stays bounded without each step needing to
+/// pad its own timeout.
 ///
-/// Default is "no hooks configured": every field `None`, timeout 60s.
+/// Default: every list empty, timeout 5 minutes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceHooks {
     /// Fires once, the first time `ensure` materialises the directory.
-    /// Failure aborts `ensure` and the just-created directory is removed
-    /// so a retry sees a clean slate (matches the SPEC's "fatal to
-    /// workspace creation" wording — a half-initialised workspace would
-    /// silently break on the next ensure).
+    /// A non-zero exit from any snippet aborts `ensure` and the just-
+    /// created directory is removed so a retry sees a clean slate.
     #[serde(default)]
-    pub after_create: Option<String>,
+    pub after_create: Vec<String>,
 
-    /// Fires before every agent dispatch. Returns a fatal error to the
-    /// caller (the orchestrator), which is expected to keep the issue
-    /// claimed but not start the turn.
+    /// Fires before every agent dispatch. A non-zero exit from any
+    /// snippet returns a fatal error to the caller (the orchestrator),
+    /// which is expected to keep the issue claimed but not start the
+    /// turn.
     #[serde(default)]
-    pub before_run: Option<String>,
+    pub before_run: Vec<String>,
 
-    /// Fires after every agent dispatch. Failures are logged and
-    /// swallowed — this hook is for observability/cleanup, not control
-    /// flow. It cannot block or fail a run that already happened.
+    /// Fires after every agent dispatch. Snippet failures are logged
+    /// and swallowed — this phase is for observability/cleanup, not
+    /// control flow. It cannot block or fail a run that already
+    /// happened. Subsequent snippets still run after a failing one.
     #[serde(default)]
-    pub after_run: Option<String>,
+    pub after_run: Vec<String>,
 
-    /// Fires before `release` removes the workspace. Failures are logged
-    /// and swallowed; the rmdir proceeds. Useful for archival snapshots
-    /// that must not block teardown.
+    /// Fires before `release` removes the workspace. Snippet failures
+    /// are logged and swallowed; the rmdir proceeds. Useful for
+    /// archival snapshots that must not block teardown. Subsequent
+    /// snippets still run after a failing one.
     #[serde(default)]
-    pub before_remove: Option<String>,
+    pub before_remove: Vec<String>,
 
-    /// Per-hook timeout in milliseconds; defaults to
-    /// [`DEFAULT_HOOK_TIMEOUT_MS`]. Applied uniformly to all four hooks
-    /// because SPEC §9.4 only specifies a single `hooks.timeout_ms`.
+    /// Per-snippet timeout in milliseconds; defaults to
+    /// [`DEFAULT_HOOK_TIMEOUT_MS`].
     #[serde(default = "default_hook_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -109,10 +111,10 @@ impl Default for WorkspaceHooks {
     /// field.
     fn default() -> Self {
         Self {
-            after_create: None,
-            before_run: None,
-            after_run: None,
-            before_remove: None,
+            after_create: Vec::new(),
+            before_run: Vec::new(),
+            after_run: Vec::new(),
+            before_remove: Vec::new(),
             timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
         }
     }
@@ -344,8 +346,43 @@ impl LocalFsWorkspace {
     /// `name` is the SPEC hook name (`"after_create"` etc.) — used only
     /// for log lines and the error message; control flow is identical
     /// for every hook.
-    async fn run_hook(&self, name: &'static str, script: &str, cwd: &Path) -> WorkspaceResult<()> {
-        debug!(hook = name, cwd = %cwd.display(), "running workspace hook");
+    /// Run every snippet in `scripts` sequentially under the same `cwd`.
+    /// Returns `Ok(())` if every snippet succeeded; on the first non-zero
+    /// exit (or timeout) returns the error and skips the rest. Empty
+    /// `scripts` is a cheap no-op so callers do not need to pre-check.
+    async fn run_hooks_fail_fast(
+        &self,
+        name: &'static str,
+        scripts: &[String],
+        cwd: &Path,
+    ) -> WorkspaceResult<()> {
+        for (idx, script) in scripts.iter().enumerate() {
+            self.run_hook(name, idx, script, cwd).await?;
+        }
+        Ok(())
+    }
+
+    /// Run every snippet in `scripts` sequentially, logging-and-swallowing
+    /// any failures so a flaky archival or observability snippet cannot
+    /// block teardown / pin a workspace. Subsequent snippets still run
+    /// after a failure — this matches the SPEC v2 §5.17 best-effort
+    /// semantics for `after_run` and `before_remove`.
+    async fn run_hooks_best_effort(&self, name: &'static str, scripts: &[String], cwd: &Path) {
+        for (idx, script) in scripts.iter().enumerate() {
+            if let Err(e) = self.run_hook(name, idx, script, cwd).await {
+                warn!(error = %e, hook = name, index = idx, "hook snippet failed (ignored)");
+            }
+        }
+    }
+
+    async fn run_hook(
+        &self,
+        name: &'static str,
+        index: usize,
+        script: &str,
+        cwd: &Path,
+    ) -> WorkspaceResult<()> {
+        debug!(hook = name, index, cwd = %cwd.display(), "running workspace hook");
         // SPEC §9.4: `sh -lc <script>` is a conforming POSIX default.
         // We do not opt into `bash` so the binary stays portable to
         // minimal containers that ship only `sh`.
@@ -362,11 +399,13 @@ impl LocalFsWorkspace {
         let output = match timeout(deadline, cmd.output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => {
-                return Err(WorkspaceError::Hook(format!("{name}: spawn failed: {e}")));
+                return Err(WorkspaceError::Hook(format!(
+                    "{name}[{index}]: spawn failed: {e}"
+                )));
             }
             Err(_) => {
                 return Err(WorkspaceError::Hook(format!(
-                    "{name}: timed out after {}ms",
+                    "{name}[{index}]: timed out after {}ms",
                     self.hooks.timeout_ms
                 )));
             }
@@ -378,7 +417,7 @@ impl LocalFsWorkspace {
             // diagnostic instead of a separate error.
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(WorkspaceError::Hook(format!(
-                "{name}: exited {}: {}",
+                "{name}[{index}]: exited {}: {}",
                 output.status,
                 stderr.trim()
             )));
@@ -427,13 +466,16 @@ impl WorkspaceManager for LocalFsWorkspace {
         self.assert_contained(&path)?;
 
         // Fire `after_create` only on the call that materialised the
-        // directory. SPEC §9.4 makes a failure here fatal; we also
-        // remove the just-created directory so a retry sees a fresh
-        // slate (otherwise the dir exists but never ran `after_create`,
-        // and the next ensure would skip the hook entirely).
+        // directory. SPEC v2 §5.17 makes a non-zero snippet fatal; we
+        // also remove the just-created directory so a retry sees a
+        // fresh slate (otherwise the dir exists but never finished
+        // `after_create`, and the next ensure would skip the phase
+        // entirely).
         if !existed
-            && let Some(script) = &self.hooks.after_create
-            && let Err(e) = self.run_hook("after_create", script, &path).await
+            && !self.hooks.after_create.is_empty()
+            && let Err(e) = self
+                .run_hooks_fail_fast("after_create", &self.hooks.after_create, &path)
+                .await
         {
             let _ = fs::remove_dir_all(&path).await;
             return Err(e);
@@ -446,9 +488,9 @@ impl WorkspaceManager for LocalFsWorkspace {
     }
 
     async fn before_run(&self, identifier: &str) -> WorkspaceResult<()> {
-        let Some(script) = &self.hooks.before_run else {
+        if self.hooks.before_run.is_empty() {
             return Ok(());
-        };
+        }
         let safe = Self::safe_component(identifier)?;
         let path = self.root.join(safe);
         // We do not re-create the directory here: `before_run` runs
@@ -463,13 +505,14 @@ impl WorkspaceManager for LocalFsWorkspace {
                 path.display()
             )));
         }
-        self.run_hook("before_run", script, &path).await
+        self.run_hooks_fail_fast("before_run", &self.hooks.before_run, &path)
+            .await
     }
 
     async fn after_run(&self, identifier: &str) {
-        let Some(script) = &self.hooks.after_run else {
+        if self.hooks.after_run.is_empty() {
             return;
-        };
+        }
         // Validation failure here is a bug, but `after_run` is best-
         // effort — log and return rather than panic. The orchestrator
         // does not get to know.
@@ -488,10 +531,10 @@ impl WorkspaceManager for LocalFsWorkspace {
             );
             return;
         }
-        if let Err(e) = self.run_hook("after_run", script, &path).await {
-            // SPEC §9.4: failures logged and ignored.
-            warn!(error = %e, "after_run hook failed (ignored)");
-        }
+        // SPEC v2 §5.17: failures logged and ignored, but later snippets
+        // still run.
+        self.run_hooks_best_effort("after_run", &self.hooks.after_run, &path)
+            .await;
     }
 
     async fn release(&self, identifier: &str) -> WorkspaceResult<()> {
@@ -504,13 +547,11 @@ impl WorkspaceManager for LocalFsWorkspace {
 
         // Fire `before_remove` only when the directory exists — running
         // a teardown hook against a non-existent workspace would just
-        // produce confusing log noise.
-        if let Some(script) = &self.hooks.before_remove
-            && path.is_dir()
-            && let Err(e) = self.run_hook("before_remove", script, &path).await
-        {
-            // SPEC §9.4: failures logged and ignored, rmdir proceeds.
-            warn!(error = %e, "before_remove hook failed (ignored)");
+        // produce confusing log noise. Failures are logged and ignored;
+        // the rmdir proceeds (SPEC v2 §5.17).
+        if !self.hooks.before_remove.is_empty() && path.is_dir() {
+            self.run_hooks_best_effort("before_remove", &self.hooks.before_remove, &path)
+                .await;
         }
 
         match fs::remove_dir_all(&path).await {
@@ -809,7 +850,7 @@ mod tests {
     async fn after_create_hook_fires_in_workspace_cwd() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            after_create: Some("touch ./created.marker".into()),
+            after_create: vec!["touch ./created.marker".into()],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -825,7 +866,7 @@ mod tests {
     async fn after_create_failure_aborts_ensure_and_removes_dir() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            after_create: Some("exit 7".into()),
+            after_create: vec!["exit 7".into()],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -847,9 +888,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // Increment a counter so we can prove exactly-one fire.
         let hooks = WorkspaceHooks {
-            after_create: Some(
+            after_create: vec![
                 "n=$(cat ./count 2>/dev/null || echo 0); echo $((n+1)) > ./count".into(),
-            ),
+            ],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -868,7 +909,7 @@ mod tests {
     async fn hook_timeout_is_fatal_with_clear_error() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            after_create: Some("sleep 5".into()),
+            after_create: vec!["sleep 5".into()],
             timeout_ms: 100,
             ..Default::default()
         };
@@ -891,7 +932,7 @@ mod tests {
     async fn before_run_failure_is_fatal() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            before_run: Some("exit 1".into()),
+            before_run: vec!["exit 1".into()],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -919,7 +960,7 @@ mod tests {
     async fn before_run_without_ensure_errors() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            before_run: Some("true".into()),
+            before_run: vec!["true".into()],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -936,7 +977,7 @@ mod tests {
     async fn after_run_failure_is_swallowed() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            after_run: Some("exit 99".into()),
+            after_run: vec!["exit 99".into()],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -952,7 +993,7 @@ mod tests {
     async fn before_remove_failure_is_swallowed_and_dir_is_removed() {
         let tmp = TempDir::new().unwrap();
         let hooks = WorkspaceHooks {
-            before_remove: Some("exit 1".into()),
+            before_remove: vec!["exit 1".into()],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -975,10 +1016,10 @@ mod tests {
         let hooks = WorkspaceHooks {
             // Drop a marker into an *external* directory so we can
             // observe execution after the workspace has been removed.
-            before_remove: Some(format!(
+            before_remove: vec![format!(
                 "touch {}/before-remove.marker",
                 archive_dir.path().display()
-            )),
+            )],
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
@@ -991,6 +1032,98 @@ mod tests {
         mgr.ensure("ENG-1").await.unwrap();
         mgr.release("ENG-1").await.unwrap();
         assert!(archive_dir.path().join("before-remove.marker").exists());
+    }
+
+    /// SPEC v2 §5.17: snippets in a fail-fast phase run sequentially in
+    /// declaration order, and a non-zero exit aborts the phase before
+    /// later snippets run. Asserted by appending each snippet's index to
+    /// a marker file and inspecting the contents after the failure.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_create_snippets_run_sequentially_and_stop_on_failure() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            after_create: vec![
+                "echo a >> ./trace".into(),
+                "echo b >> ./trace; exit 5".into(),
+                "echo c >> ./trace".into(),
+            ],
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        let err = mgr.ensure("ENG-1").await.unwrap_err();
+        match &err {
+            WorkspaceError::Hook(msg) => {
+                assert!(
+                    msg.contains("after_create[1]"),
+                    "expected snippet index in error, got {msg:?}"
+                );
+            }
+            other => panic!("expected Hook, got {other:?}"),
+        }
+        // Directory is rolled back along with the trace file, so we
+        // cannot inspect the file directly. The error message above is
+        // the structural witness that snippet 1 (not 0 or 2) failed.
+        assert!(!tmp.path().join("ENG-1").exists());
+    }
+
+    /// SPEC v2 §5.17: an empty list is equivalent to "no hook
+    /// configured" — the lifecycle method must be a cheap no-op,
+    /// distinguishable from "hook ran with no snippets" only by the
+    /// absence of any subprocess.
+    #[tokio::test]
+    async fn empty_hook_list_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::with_hooks(
+            tmp.path(),
+            WorkspaceHooks {
+                after_create: vec![],
+                before_run: vec![],
+                after_run: vec![],
+                before_remove: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        mgr.ensure("ENG-1").await.unwrap();
+        mgr.before_run("ENG-1").await.unwrap();
+        mgr.after_run("ENG-1").await;
+        mgr.release("ENG-1").await.unwrap();
+    }
+
+    /// SPEC v2 §5.17: best-effort phases (`after_run`, `before_remove`)
+    /// run every snippet even when an earlier one fails. Failures are
+    /// logged and ignored; later snippets' side effects must still be
+    /// observable.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_run_continues_past_failing_snippet() {
+        let tmp = TempDir::new().unwrap();
+        let evidence = TempDir::new().unwrap();
+        let marker = evidence.path().join("ran.marker");
+        let hooks = WorkspaceHooks {
+            after_run: vec!["exit 1".into(), format!("touch {}", marker.display())],
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        mgr.ensure("ENG-1").await.unwrap();
+        mgr.after_run("ENG-1").await;
+        assert!(
+            marker.exists(),
+            "best-effort phase must keep running after a failing snippet"
+        );
+    }
+
+    /// Default timeout is the SPEC v2 §5.17 value (5 minutes), not the
+    /// historical 60s. Pinned so a future drift forces this test to
+    /// update alongside the constant.
+    #[test]
+    fn default_hook_timeout_is_five_minutes() {
+        assert_eq!(WorkspaceHooks::default().timeout_ms, 300_000);
+        assert_eq!(DEFAULT_HOOK_TIMEOUT_MS, 300_000);
     }
 
     // ----- property tests --------------------------------------------------

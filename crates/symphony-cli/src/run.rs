@@ -349,6 +349,9 @@ fn build_workspace(cfg: &WorkflowConfig) -> Result<Arc<dyn WorkspaceManager>> {
     std::fs::create_dir_all(&root)
         .with_context(|| format!("creating workspace root {}", root.display()))?;
 
+    // SPEC v2 §5.17: each phase is a list of shell snippets executed
+    // sequentially. The two crates intentionally share field names so
+    // this stays a structural mirror, not a translation step.
     let hooks = symphony_workspace::WorkspaceHooks {
         after_create: cfg.hooks.after_create.clone(),
         before_run: cfg.hooks.before_run.clone(),

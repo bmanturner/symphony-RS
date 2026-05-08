@@ -381,33 +381,38 @@ pub struct WorkspaceConfig {
 
 /// Shell hook scripts fired around the workspace lifecycle.
 ///
-/// Each script is the raw `bash -lc` body (multi-line strings are
-/// natural in YAML). The runtime is responsible for composing the
-/// command, not for parsing it.
+/// SPEC v2 §5.17: each phase is a list of shell snippets. Snippets in a
+/// list run sequentially under `sh -lc <snippet>` with the workspace as
+/// `cwd`; the first non-zero exit aborts the phase. An empty list is
+/// equivalent to "no hook configured." `timeout_ms` applies per snippet,
+/// not per phase, so a long-running phase composed of several quick
+/// snippets stays bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HooksConfig {
     /// Runs once when the workspace directory is newly created. A
-    /// non-zero exit aborts workspace creation.
+    /// non-zero exit from any snippet aborts workspace creation.
     #[serde(default)]
-    pub after_create: Option<String>,
+    pub after_create: Vec<String>,
 
-    /// Runs before each agent attempt, after workspace prep. Failure
-    /// aborts the attempt.
+    /// Runs before each agent attempt, after workspace prep. A non-zero
+    /// exit from any snippet aborts the attempt.
     #[serde(default)]
-    pub before_run: Option<String>,
+    pub before_run: Vec<String>,
 
-    /// Runs after each agent attempt regardless of outcome. Failure is
-    /// logged and ignored.
+    /// Runs after each agent attempt regardless of outcome. Failures
+    /// are logged and ignored.
     #[serde(default)]
-    pub after_run: Option<String>,
+    pub after_run: Vec<String>,
 
-    /// Runs before workspace deletion if the directory exists. Failure
-    /// is logged and ignored; cleanup still proceeds.
+    /// Runs before workspace deletion if the directory exists. Failures
+    /// are logged and ignored; cleanup still proceeds.
     #[serde(default)]
-    pub before_remove: Option<String>,
+    pub before_remove: Vec<String>,
 
-    /// Wall-clock timeout applied to every hook in this section.
+    /// Per-snippet wall-clock timeout. SPEC v2 §5.17 raised the default
+    /// from 60s to 5 minutes because v2 hooks routinely do branch prep
+    /// or worktree creation.
     #[serde(default = "default_hook_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -415,17 +420,17 @@ pub struct HooksConfig {
 impl Default for HooksConfig {
     fn default() -> Self {
         Self {
-            after_create: None,
-            before_run: None,
-            after_run: None,
-            before_remove: None,
+            after_create: Vec::new(),
+            before_run: Vec::new(),
+            after_run: Vec::new(),
+            before_remove: Vec::new(),
             timeout_ms: default_hook_timeout_ms(),
         }
     }
 }
 
 fn default_hook_timeout_ms() -> u64 {
-    60_000
+    300_000
 }
 
 // ---------------------------------------------------------------------------
@@ -2284,7 +2289,11 @@ mod tests {
         assert_eq!(cfg.polling.interval_ms, 30_000);
         assert_eq!(cfg.polling.jitter_ms, 5_000);
         assert!(cfg.polling.startup_reconcile_recent_terminal);
-        assert_eq!(cfg.hooks.timeout_ms, 60_000);
+        assert_eq!(cfg.hooks.timeout_ms, 300_000);
+        assert!(cfg.hooks.after_create.is_empty());
+        assert!(cfg.hooks.before_run.is_empty());
+        assert!(cfg.hooks.after_run.is_empty());
+        assert!(cfg.hooks.before_remove.is_empty());
         assert_eq!(cfg.agent.kind, AgentKind::Codex);
         assert_eq!(cfg.agent.max_concurrent_agents, 10);
         assert_eq!(cfg.agent.max_turns, 20);
@@ -4523,5 +4532,60 @@ followups:
         assert_eq!(f.blocking_label, "hotfix");
         assert!(!f.require_reason);
         assert!(!f.require_acceptance_criteria);
+    }
+
+    /// SPEC v2 §5.17: each hook phase is a list of shell snippets, the
+    /// timeout default is 5 minutes, and an empty list means "no hook
+    /// configured". This pins the parsed shape from YAML.
+    #[test]
+    fn hooks_v2_list_form_round_trips() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+hooks:
+  timeout_ms: 120000
+  after_create:
+    - git config user.email "symphony@example.com"
+    - git config user.name "Symphony"
+  before_run:
+    - git status --short
+  after_run: []
+  before_remove: []
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let h = &parsed.hooks;
+        assert_eq!(h.timeout_ms, 120_000);
+        assert_eq!(
+            h.after_create,
+            vec![
+                "git config user.email \"symphony@example.com\"".to_string(),
+                "git config user.name \"Symphony\"".to_string(),
+            ]
+        );
+        assert_eq!(h.before_run, vec!["git status --short".to_string()]);
+        assert!(h.after_run.is_empty());
+        assert!(h.before_remove.is_empty());
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    /// The legacy v1 single-string form must be rejected — there is no
+    /// silent migration. Operators wrap their snippet as `[<old>]`.
+    #[test]
+    fn hooks_v1_single_string_is_rejected() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+hooks:
+  after_create: "git status"
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("after_create") || msg.contains("sequence") || msg.contains("expected"),
+            "expected sequence-shape error, got: {msg}"
+        );
     }
 }
