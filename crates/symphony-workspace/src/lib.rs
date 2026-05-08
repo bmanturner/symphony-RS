@@ -29,9 +29,94 @@
 //!    construction a path inside the workspace root.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::fs;
+use tokio::process::Command;
+use tokio::time::timeout;
+use tracing::{debug, warn};
+
+/// Default per-hook timeout (SPEC §9.4: `60_000 ms`). Hooks that exceed it
+/// are killed and reported as a [`WorkspaceError::Hook`]. Wrapped as a
+/// `const` so the default lands in one place and `serde` can default the
+/// deserialised field to it.
+pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
+
+fn default_hook_timeout_ms() -> u64 {
+    DEFAULT_HOOK_TIMEOUT_MS
+}
+
+/// Optional shell scripts that fire at well-defined points in the
+/// workspace lifecycle. SPEC §9.4 names four of them:
+///
+/// | Hook            | Fires on                       | Failure semantics             |
+/// |-----------------|--------------------------------|-------------------------------|
+/// | `after_create`  | the `ensure` that created dir  | fatal — `ensure` returns Err  |
+/// | `before_run`    | orchestrator pre-spawn         | fatal — caller skips the run  |
+/// | `after_run`     | orchestrator post-spawn        | logged + ignored              |
+/// | `before_remove` | the `release` before rmdir     | logged + ignored              |
+///
+/// Each script is executed via `sh -lc <script>` with the workspace
+/// directory as `cwd`. The `Option<String>` shape — rather than
+/// `Vec<String>` of arg-vectors — matches the SPEC's intent that hooks
+/// are arbitrary shell snippets the operator chooses, not a structured
+/// command we want to interpret.
+///
+/// Default is "no hooks configured": every field `None`, timeout 60s.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceHooks {
+    /// Fires once, the first time `ensure` materialises the directory.
+    /// Failure aborts `ensure` and the just-created directory is removed
+    /// so a retry sees a clean slate (matches the SPEC's "fatal to
+    /// workspace creation" wording — a half-initialised workspace would
+    /// silently break on the next ensure).
+    #[serde(default)]
+    pub after_create: Option<String>,
+
+    /// Fires before every agent dispatch. Returns a fatal error to the
+    /// caller (the orchestrator), which is expected to keep the issue
+    /// claimed but not start the turn.
+    #[serde(default)]
+    pub before_run: Option<String>,
+
+    /// Fires after every agent dispatch. Failures are logged and
+    /// swallowed — this hook is for observability/cleanup, not control
+    /// flow. It cannot block or fail a run that already happened.
+    #[serde(default)]
+    pub after_run: Option<String>,
+
+    /// Fires before `release` removes the workspace. Failures are logged
+    /// and swallowed; the rmdir proceeds. Useful for archival snapshots
+    /// that must not block teardown.
+    #[serde(default)]
+    pub before_remove: Option<String>,
+
+    /// Per-hook timeout in milliseconds; defaults to
+    /// [`DEFAULT_HOOK_TIMEOUT_MS`]. Applied uniformly to all four hooks
+    /// because SPEC §9.4 only specifies a single `hooks.timeout_ms`.
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for WorkspaceHooks {
+    /// Empty hooks with the SPEC-default timeout. Hand-rolled rather
+    /// than `#[derive(Default)]` because deriving would zero `timeout_ms`,
+    /// which would silently make every hook time out instantly the
+    /// moment a caller used `..Default::default()` to set just one
+    /// field.
+    fn default() -> Self {
+        Self {
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            before_remove: None,
+            timeout_ms: DEFAULT_HOOK_TIMEOUT_MS,
+        }
+    }
+}
 
 /// Replace every character that is not in `[A-Za-z0-9._-]` with `_`.
 ///
@@ -124,14 +209,35 @@ pub trait WorkspaceManager: Send + Sync {
     /// Ensure a workspace exists for `identifier` and return its handle.
     ///
     /// Idempotent: calling twice with the same identifier returns the
-    /// same path; only the first call sets `created_now = true`.
+    /// same path; only the first call sets `created_now = true`. When
+    /// `created_now` is true, implementations also fire the configured
+    /// `after_create` hook before returning; a hook failure is fatal and
+    /// the partially-created directory is rolled back.
     async fn ensure(&self, identifier: &str) -> WorkspaceResult<Workspace>;
+
+    /// Fire the `before_run` hook against `identifier`'s workspace.
+    ///
+    /// Called by the orchestrator immediately before spawning an agent
+    /// process. A hook error is propagated and the orchestrator must
+    /// abort the dispatch (SPEC §9.4: fatal to the run attempt). When no
+    /// `before_run` hook is configured this is a cheap no-op.
+    async fn before_run(&self, identifier: &str) -> WorkspaceResult<()>;
+
+    /// Fire the `after_run` hook against `identifier`'s workspace.
+    ///
+    /// Called by the orchestrator after an agent process exits, whether
+    /// it succeeded or failed. Per SPEC §9.4 this hook's failures are
+    /// logged and ignored — it returns `()`, not `Result`, to make the
+    /// "cannot fail the run" guarantee structural rather than a comment.
+    async fn after_run(&self, identifier: &str);
 
     /// Remove the workspace for `identifier` if it exists.
     ///
     /// Used by SPEC §8.6 startup terminal cleanup and §16 release paths.
     /// Missing directories are not an error — the operation is a "make
-    /// it not exist" assertion, not a strict delete.
+    /// it not exist" assertion, not a strict delete. Fires the
+    /// `before_remove` hook before rmdir; that hook's failures are
+    /// logged and ignored (SPEC §9.4).
     async fn release(&self, identifier: &str) -> WorkspaceResult<()>;
 }
 
@@ -147,15 +253,26 @@ pub trait WorkspaceManager: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LocalFsWorkspace {
     root: PathBuf,
+    hooks: WorkspaceHooks,
 }
 
 impl LocalFsWorkspace {
-    /// Construct a manager rooted at `root`. The directory must exist
-    /// before this constructor returns successfully — symphony does not
-    /// create the workspace root itself, because the operator's choice
-    /// of root is a deployment concern (mount point, volume, etc.) and
-    /// silently creating it would mask configuration mistakes.
+    /// Construct a manager rooted at `root` with no hooks configured.
+    /// The directory must exist before this constructor returns
+    /// successfully — symphony does not create the workspace root
+    /// itself, because the operator's choice of root is a deployment
+    /// concern (mount point, volume, etc.) and silently creating it
+    /// would mask configuration mistakes.
     pub fn new(root: impl AsRef<Path>) -> WorkspaceResult<Self> {
+        Self::with_hooks(root, WorkspaceHooks::default())
+    }
+
+    /// Construct a manager with explicit hooks. Same root requirements
+    /// as [`Self::new`]. The hooks are stored verbatim; their scripts
+    /// are not validated until they fire (SPEC §9.4 keeps the contract
+    /// "execute via shell at the right moment", not "parse and lint at
+    /// startup").
+    pub fn with_hooks(root: impl AsRef<Path>, hooks: WorkspaceHooks) -> WorkspaceResult<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
             return Err(WorkspaceError::InvalidRoot(format!(
@@ -163,12 +280,15 @@ impl LocalFsWorkspace {
                 root.display()
             )));
         }
-        // Canonicalize so that downstream containment checks (next
-        // checklist item) compare absolute paths, and so symbolic links
-        // in the root cannot smuggle issue paths outside it.
+        // Canonicalize so that downstream containment checks compare
+        // absolute paths, and so symbolic links in the root cannot
+        // smuggle issue paths outside it.
         let canonical = std::fs::canonicalize(root)
             .map_err(|e| WorkspaceError::InvalidRoot(format!("canonicalize: {e}")))?;
-        Ok(Self { root: canonical })
+        Ok(Self {
+            root: canonical,
+            hooks,
+        })
     }
 
     /// Return the absolute, canonicalized root.
@@ -214,6 +334,58 @@ impl LocalFsWorkspace {
     /// `self.root` (which is itself canonical, set in [`Self::new`])
     /// catches that race. On mismatch we surface an [`InvalidRoot`]
     /// rather than silently falling through.
+    /// Run a single hook script with the workspace as `cwd`, applying the
+    /// configured timeout. Returns `Ok(())` if the script exits 0 within
+    /// the deadline; otherwise a [`WorkspaceError::Hook`] whose message
+    /// includes the hook name, exit status (or "timeout"), and a tail of
+    /// the captured stderr to help the operator diagnose without
+    /// shelling in.
+    ///
+    /// `name` is the SPEC hook name (`"after_create"` etc.) — used only
+    /// for log lines and the error message; control flow is identical
+    /// for every hook.
+    async fn run_hook(&self, name: &'static str, script: &str, cwd: &Path) -> WorkspaceResult<()> {
+        debug!(hook = name, cwd = %cwd.display(), "running workspace hook");
+        // SPEC §9.4: `sh -lc <script>` is a conforming POSIX default.
+        // We do not opt into `bash` so the binary stays portable to
+        // minimal containers that ship only `sh`.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc").arg(script).current_dir(cwd);
+        // Capture stdout/stderr so a failure can be reported with
+        // context. Inheriting them would interleave hook output with
+        // the daemon's tracing logs — confusing for operators tailing
+        // journald.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let deadline = Duration::from_millis(self.hooks.timeout_ms);
+        let output = match timeout(deadline, cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return Err(WorkspaceError::Hook(format!("{name}: spawn failed: {e}")));
+            }
+            Err(_) => {
+                return Err(WorkspaceError::Hook(format!(
+                    "{name}: timed out after {}ms",
+                    self.hooks.timeout_ms
+                )));
+            }
+        };
+
+        if !output.status.success() {
+            // `String::from_utf8_lossy` so a non-UTF-8 stderr (rare but
+            // possible on some shells/locales) still produces a usable
+            // diagnostic instead of a separate error.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorkspaceError::Hook(format!(
+                "{name}: exited {}: {}",
+                output.status,
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     fn assert_contained(&self, path: &Path) -> WorkspaceResult<()> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| WorkspaceError::Io(format!("canonicalize {}: {e}", path.display())))?;
@@ -254,10 +426,72 @@ impl WorkspaceManager for LocalFsWorkspace {
         // between construction and ensure.
         self.assert_contained(&path)?;
 
+        // Fire `after_create` only on the call that materialised the
+        // directory. SPEC §9.4 makes a failure here fatal; we also
+        // remove the just-created directory so a retry sees a fresh
+        // slate (otherwise the dir exists but never ran `after_create`,
+        // and the next ensure would skip the hook entirely).
+        if !existed
+            && let Some(script) = &self.hooks.after_create
+            && let Err(e) = self.run_hook("after_create", script, &path).await
+        {
+            let _ = fs::remove_dir_all(&path).await;
+            return Err(e);
+        }
+
         Ok(Workspace {
             path,
             created_now: !existed,
         })
+    }
+
+    async fn before_run(&self, identifier: &str) -> WorkspaceResult<()> {
+        let Some(script) = &self.hooks.before_run else {
+            return Ok(());
+        };
+        let safe = Self::safe_component(identifier)?;
+        let path = self.root.join(safe);
+        // We do not re-create the directory here: `before_run` runs
+        // *after* `ensure`, and asking the orchestrator to call it on a
+        // missing workspace is a programming error worth surfacing.
+        if !fs::try_exists(&path)
+            .await
+            .map_err(|e| WorkspaceError::Io(format!("stat {}: {e}", path.display())))?
+        {
+            return Err(WorkspaceError::Hook(format!(
+                "before_run: workspace {} does not exist (call ensure first)",
+                path.display()
+            )));
+        }
+        self.run_hook("before_run", script, &path).await
+    }
+
+    async fn after_run(&self, identifier: &str) {
+        let Some(script) = &self.hooks.after_run else {
+            return;
+        };
+        // Validation failure here is a bug, but `after_run` is best-
+        // effort — log and return rather than panic. The orchestrator
+        // does not get to know.
+        let safe = match Self::safe_component(identifier) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "after_run skipped: invalid identifier");
+                return;
+            }
+        };
+        let path = self.root.join(safe);
+        if !path.is_dir() {
+            warn!(
+                path = %path.display(),
+                "after_run skipped: workspace does not exist",
+            );
+            return;
+        }
+        if let Err(e) = self.run_hook("after_run", script, &path).await {
+            // SPEC §9.4: failures logged and ignored.
+            warn!(error = %e, "after_run hook failed (ignored)");
+        }
     }
 
     async fn release(&self, identifier: &str) -> WorkspaceResult<()> {
@@ -267,6 +501,18 @@ impl WorkspaceManager for LocalFsWorkspace {
         // `root/..` or `root/.`.
         let safe = Self::safe_component(identifier)?;
         let path = self.root.join(safe);
+
+        // Fire `before_remove` only when the directory exists — running
+        // a teardown hook against a non-existent workspace would just
+        // produce confusing log noise.
+        if let Some(script) = &self.hooks.before_remove
+            && path.is_dir()
+            && let Err(e) = self.run_hook("before_remove", script, &path).await
+        {
+            // SPEC §9.4: failures logged and ignored, rmdir proceeds.
+            warn!(error = %e, "before_remove hook failed (ignored)");
+        }
+
         match fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
             // Missing is fine — release is an assertion of absence, not a
@@ -550,6 +796,201 @@ mod tests {
         assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
         // Critically: the parent of root must still exist.
         assert!(tmp.path().exists());
+    }
+
+    // ----- lifecycle hooks (SPEC §9.4) -----------------------------------
+
+    /// `after_create` fires inside `ensure`, with the workspace as `cwd`.
+    /// We assert "ran with cwd = workspace" by having the hook drop a
+    /// marker file inside `.` and then checking its existence on disk;
+    /// this also doubles as a positive proof the script ran at all.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_create_hook_fires_in_workspace_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            after_create: Some("touch ./created.marker".into()),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        let ws = mgr.ensure("ENG-1").await.unwrap();
+        assert!(ws.path.join("created.marker").exists());
+    }
+
+    /// SPEC §9.4: `after_create` failure is fatal and the workspace must
+    /// be rolled back so the next ensure can retry from scratch.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_create_failure_aborts_ensure_and_removes_dir() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            after_create: Some("exit 7".into()),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        let err = mgr.ensure("ENG-1").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Hook(_)), "got {err:?}");
+        assert!(
+            !tmp.path().join("ENG-1").exists(),
+            "directory must be rolled back on hook failure",
+        );
+    }
+
+    /// `after_create` only fires the *first* time `ensure` materialises
+    /// the directory; reuse must not re-fire it. Otherwise a per-issue
+    /// "git clone" hook would run twice.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_create_does_not_fire_on_reuse() {
+        let tmp = TempDir::new().unwrap();
+        // Increment a counter so we can prove exactly-one fire.
+        let hooks = WorkspaceHooks {
+            after_create: Some(
+                "n=$(cat ./count 2>/dev/null || echo 0); echo $((n+1)) > ./count".into(),
+            ),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        mgr.ensure("ENG-1").await.unwrap();
+        mgr.ensure("ENG-1").await.unwrap();
+        let count = std::fs::read_to_string(tmp.path().join("ENG-1/count")).unwrap();
+        assert_eq!(count.trim(), "1", "after_create must fire exactly once");
+    }
+
+    /// A hook that exceeds `timeout_ms` is killed and reported as a
+    /// `Hook` error. The error message names the timeout so an operator
+    /// tailing logs can distinguish it from a non-zero exit.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn hook_timeout_is_fatal_with_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            after_create: Some("sleep 5".into()),
+            timeout_ms: 100,
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        let err = mgr.ensure("ENG-1").await.unwrap_err();
+        match err {
+            WorkspaceError::Hook(msg) => assert!(
+                msg.contains("timed out"),
+                "expected timeout in message, got {msg:?}",
+            ),
+            other => panic!("expected Hook(timeout), got {other:?}"),
+        }
+    }
+
+    /// `before_run` failure is fatal to the dispatch attempt: the
+    /// orchestrator must surface the error and not run the agent.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn before_run_failure_is_fatal() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            before_run: Some("exit 1".into()),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        mgr.ensure("ENG-1").await.unwrap();
+        let err = mgr.before_run("ENG-1").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Hook(_)), "got {err:?}");
+    }
+
+    /// `before_run` is a no-op when no hook is configured. The trait
+    /// must always be callable so the orchestrator can stay structurally
+    /// the same regardless of operator config.
+    #[tokio::test]
+    async fn before_run_with_no_hook_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+        mgr.ensure("ENG-1").await.unwrap();
+        mgr.before_run("ENG-1").await.unwrap();
+    }
+
+    /// Calling `before_run` before `ensure` is a programming error —
+    /// surface it loudly rather than silently fabricating a workspace.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn before_run_without_ensure_errors() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            before_run: Some("true".into()),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        let err = mgr.before_run("ENG-1").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Hook(_)), "got {err:?}");
+    }
+
+    /// SPEC §9.4: `after_run` failures are logged and swallowed. The
+    /// trait signature returns `()`, so this test is mostly a witness
+    /// that calling it on a failing hook neither panics nor leaks.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn after_run_failure_is_swallowed() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            after_run: Some("exit 99".into()),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+        mgr.ensure("ENG-1").await.unwrap();
+        mgr.after_run("ENG-1").await; // returns `()`, must not panic
+    }
+
+    /// SPEC §9.4: `before_remove` failures are logged and ignored, and
+    /// the directory must still be removed. Otherwise a flaky archival
+    /// hook would pin stale workspaces forever.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn before_remove_failure_is_swallowed_and_dir_is_removed() {
+        let tmp = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            before_remove: Some("exit 1".into()),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        let ws = mgr.ensure("ENG-1").await.unwrap();
+        assert!(ws.path.is_dir());
+        mgr.release("ENG-1").await.unwrap();
+        assert!(!ws.path.exists(), "release must rmdir even when hook fails");
+    }
+
+    /// `before_remove` runs with the workspace as `cwd` (so an archival
+    /// hook can `tar` the directory before it's deleted) and is skipped
+    /// when the workspace does not exist (avoids spurious shell errors
+    /// during the §8.6 startup sweep).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn before_remove_runs_in_workspace_and_skips_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        let archive_dir = TempDir::new().unwrap();
+        let hooks = WorkspaceHooks {
+            // Drop a marker into an *external* directory so we can
+            // observe execution after the workspace has been removed.
+            before_remove: Some(format!(
+                "touch {}/before-remove.marker",
+                archive_dir.path().display()
+            )),
+            ..Default::default()
+        };
+        let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
+
+        // Releasing a never-created workspace must not invoke the hook.
+        mgr.release("ghost").await.unwrap();
+        assert!(!archive_dir.path().join("before-remove.marker").exists());
+
+        // After ensure → release the hook fires exactly once.
+        mgr.ensure("ENG-1").await.unwrap();
+        mgr.release("ENG-1").await.unwrap();
+        assert!(archive_dir.path().join("before-remove.marker").exists());
     }
 
     // ----- property tests --------------------------------------------------
