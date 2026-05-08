@@ -854,8 +854,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("nested/symphony");
         let cfg = WorkflowConfig {
-            workspace: symphony_config::WorkspaceConfig {
+            workspace: symphony_config::WorkspacePolicyConfig {
                 root: Some(nested.clone()),
+                ..symphony_config::WorkspacePolicyConfig::default()
             },
             ..WorkflowConfig::default()
         };

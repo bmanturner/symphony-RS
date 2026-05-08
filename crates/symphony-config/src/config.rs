@@ -61,9 +61,23 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub polling: PollingConfig,
 
-    /// Per-issue workspace root and isolation rules. SPEC §5.3.3.
+    /// Per-issue workspace root, named strategies, and runner-side
+    /// invariants (cwd containment, untracked-file policy). SPEC v2
+    /// §5.8. Renamed from `WorkspaceConfig` so the v2 structural shape
+    /// — a strategy registry plus policy flags — has its own type
+    /// distinct from the v1 "just a `root` path" stub.
     #[serde(default)]
-    pub workspace: WorkspaceConfig,
+    pub workspace: WorkspacePolicyConfig,
+
+    /// Branch templates and tree-cleanliness policy that govern how
+    /// child/integration branches are named and when an agent is
+    /// allowed to start. SPEC v2 §5.9. Defaults to the documented
+    /// `symphony/{{identifier}}` /
+    /// `symphony/integration/{{identifier}}` templates with
+    /// same-branch children disallowed and clean-tree-required on,
+    /// matching the SPEC's "safer setting wins" stance.
+    #[serde(default)]
+    pub branching: BranchPolicyConfig,
 
     /// Optional shell hooks fired around each workspace lifecycle event.
     /// SPEC §5.3.4.
@@ -192,7 +206,8 @@ impl Default for WorkflowConfig {
             schema_version: SUPPORTED_SCHEMA_VERSION,
             tracker: TrackerConfig::default(),
             polling: PollingConfig::default(),
-            workspace: WorkspaceConfig::default(),
+            workspace: WorkspacePolicyConfig::default(),
+            branching: BranchPolicyConfig::default(),
             hooks: HooksConfig::default(),
             agent: AgentConfig::default(),
             codex: CodexConfig::default(),
@@ -364,15 +379,252 @@ fn default_startup_reconcile_recent_terminal() -> bool {
 // workspace
 // ---------------------------------------------------------------------------
 
-/// Per-issue workspace root.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Per-issue workspace policy (SPEC v2 §5.8).
+///
+/// Where v1 only carried a single `root` path, v2 turns this block
+/// into a registry: a `default_strategy` name plus a map of named
+/// [`WorkspaceStrategyConfig`] entries that the kernel resolves when
+/// it builds a `WorkspaceClaim`. Two runner-side invariants travel
+/// alongside the registry — `require_cwd_in_workspace` and
+/// `forbid_untracked_outside_workspace` — because SPEC v2 §6 / §3
+/// makes verifying actual cwd a non-negotiable safety feature, not a
+/// per-strategy nuance.
+///
+/// Defaults are deliberately *empty-but-strict*: no strategies are
+/// registered, no `default_strategy` is set, but both safety flags
+/// are on. A workflow that omits the block keeps v1's "just use
+/// `root`" feel for now while later phases enforce that
+/// `default_strategy` resolves to a configured key once strategies
+/// are in use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WorkspaceConfig {
+pub struct WorkspacePolicyConfig {
     /// Root directory for per-issue workspaces. `~` and `$VAR`
     /// expansion happen during loading. `None` resolves at runtime to
-    /// `<system-temp>/symphony_workspaces` per SPEC §5.3.3.
+    /// `<system-temp>/symphony_workspaces` per SPEC §5.3.3 / §5.8.
     #[serde(default)]
     pub root: Option<PathBuf>,
+
+    /// Name of the default strategy entry (key into
+    /// [`WorkspacePolicyConfig::strategies`]) used when a work item
+    /// does not specify one explicitly. Optional at parse time so
+    /// partial fixtures can declare the block without yet enumerating
+    /// strategies; later phases enforce that, when non-`None`, the
+    /// value resolves to a configured strategy.
+    #[serde(default)]
+    pub default_strategy: Option<String>,
+
+    /// Named workspace strategies keyed by their workflow-chosen
+    /// name. Empty by default. Each entry's [`WorkspaceStrategyConfig`]
+    /// declares whether the kernel should create a fresh git worktree,
+    /// reuse an existing one, or share a branch with the integration
+    /// owner.
+    #[serde(default)]
+    pub strategies: BTreeMap<String, WorkspaceStrategyConfig>,
+
+    /// When `true` (the default), the runner verifies that the
+    /// process cwd equals the resolved workspace path immediately
+    /// before launching an agent. SPEC v2 §6 makes this verification
+    /// a non-negotiable safety gate; turning it off is an explicit
+    /// operator override.
+    #[serde(default = "default_true")]
+    pub require_cwd_in_workspace: bool,
+
+    /// When `true` (the default), the runner refuses to launch a
+    /// mutation-capable agent if the workspace's git tree contains
+    /// untracked files outside the configured workspace path.
+    /// Pairs with [`BranchPolicyConfig::require_clean_tree_before_run`]
+    /// to keep branch state honest.
+    #[serde(default = "default_true")]
+    pub forbid_untracked_outside_workspace: bool,
+}
+
+impl Default for WorkspacePolicyConfig {
+    fn default() -> Self {
+        Self {
+            root: None,
+            default_strategy: None,
+            strategies: BTreeMap::new(),
+            require_cwd_in_workspace: true,
+            forbid_untracked_outside_workspace: true,
+        }
+    }
+}
+
+/// One named entry in [`WorkspacePolicyConfig::strategies`].
+///
+/// The shape is a flat record because SPEC v2 §5.8 documents
+/// strategies as YAML maps with a `kind` discriminant and shape-
+/// dependent siblings (`base`/`branch_template` for `git_worktree`,
+/// `path`/`require_branch` for `existing_worktree`). Keeping the
+/// struct flat with optional siblings preserves `deny_unknown_fields`
+/// at the YAML level; later validation phases enforce that the
+/// fields present match the declared `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceStrategyConfig {
+    /// Which strategy variant this entry implements.
+    #[serde(default)]
+    pub kind: WorkspaceStrategyKind,
+
+    /// Base ref for [`WorkspaceStrategyKind::GitWorktree`]. `None`
+    /// means "fall back to [`BranchPolicyConfig::default_base`]".
+    /// Ignored by [`WorkspaceStrategyKind::ExistingWorktree`] and
+    /// [`WorkspaceStrategyKind::SharedBranch`].
+    #[serde(default)]
+    pub base: Option<String>,
+
+    /// Branch-name template for [`WorkspaceStrategyKind::GitWorktree`].
+    /// `None` means "fall back to
+    /// [`BranchPolicyConfig::child_branch_template`]". Ignored by
+    /// other kinds. Variable rendering is the strict
+    /// `{{path.to.value}}` form; unknown variables MUST fail render
+    /// rather than silently producing literal `{{...}}` segments.
+    #[serde(default)]
+    pub branch_template: Option<String>,
+
+    /// Cleanup policy for the worktree directory. Defaults to
+    /// [`WorkspaceCleanupPolicy::RetainUntilDone`] — the SPEC v2
+    /// §5.8 documented default — so workspaces stick around until a
+    /// terminal state lets the kernel reclaim them.
+    #[serde(default)]
+    pub cleanup: WorkspaceCleanupPolicy,
+
+    /// Filesystem path for [`WorkspaceStrategyKind::ExistingWorktree`].
+    /// `~` and `$VAR` expansion happen during loading. Ignored by
+    /// [`WorkspaceStrategyKind::GitWorktree`] (where the path is
+    /// derived from `root` and the issue identifier) and by
+    /// [`WorkspaceStrategyKind::SharedBranch`].
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+
+    /// Required branch/ref for
+    /// [`WorkspaceStrategyKind::ExistingWorktree`] or
+    /// [`WorkspaceStrategyKind::SharedBranch`]. When set, the runner
+    /// verifies the actual git ref matches before launching a
+    /// mutation-capable agent (SPEC v2 §6).
+    #[serde(default)]
+    pub require_branch: Option<String>,
+}
+
+/// Discriminator for [`WorkspaceStrategyConfig`] (SPEC v2 §5.8 `kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStrategyKind {
+    /// Create a fresh git worktree per work item under
+    /// [`WorkspacePolicyConfig::root`], on a branch derived from
+    /// `branch_template`. Default — the documented "isolated per
+    /// issue" baseline that SPEC v2 §2.6 recommends.
+    #[default]
+    GitWorktree,
+    /// Reuse a worktree that already exists at `path`, optionally
+    /// asserting it is checked out on `require_branch`. Used for
+    /// shared integration setups where the integration owner
+    /// maintains a long-lived worktree.
+    ExistingWorktree,
+    /// Multiple work items share one branch and one worktree
+    /// (typically an integration owner's). Only legal when
+    /// [`BranchPolicyConfig::allow_same_branch_for_children`] is
+    /// `true`; later phases enforce that pairing.
+    SharedBranch,
+}
+
+/// Cleanup policy applied to a worktree once its work item reaches a
+/// terminal state (SPEC v2 §5.8 `cleanup`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceCleanupPolicy {
+    /// Keep the worktree on disk until the work item reaches a
+    /// terminal class, then reclaim it. Default per SPEC v2 §5.8 —
+    /// preserves debugging artefacts while in-flight without
+    /// hoarding directories indefinitely.
+    #[default]
+    RetainUntilDone,
+    /// Remove the worktree as soon as the run completes. Use when
+    /// disk pressure outweighs post-mortem convenience.
+    RemoveAfterRun,
+    /// Never remove the worktree. The operator owns cleanup. Use
+    /// for shared integration worktrees that live across many work
+    /// items.
+    RetainAlways,
+}
+
+// ---------------------------------------------------------------------------
+// branching (SPEC v2 §5.9)
+// ---------------------------------------------------------------------------
+
+/// Branch templates and tree-cleanliness policy.
+///
+/// SPEC v2 §5.9 describes how the orchestrator names branches for
+/// child specialist work and the canonical integration branch, plus
+/// the safety stance on running with a dirty tree. The default is
+/// the safer one: same-branch children are *off*, clean-tree is
+/// *required*. Operators who want shared-branch execution must opt
+/// in explicitly here *and* select a shared workspace strategy in
+/// [`WorkspacePolicyConfig::strategies`]; if those disagree,
+/// validation rejects the config rather than guessing (SPEC v2 §5.9:
+/// "the safer setting wins by rejecting the config").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchPolicyConfig {
+    /// Default base ref for newly created child branches when a
+    /// strategy does not override it. Defaults to `"main"` per the
+    /// SPEC v2 §5.9 worked example.
+    #[serde(default = "default_branch_base")]
+    pub default_base: String,
+
+    /// Template applied when minting a child specialist's branch
+    /// name. Defaults to `"symphony/{{identifier}}"`. Variable
+    /// rendering is the strict `{{path.to.value}}` form; unknown
+    /// variables MUST fail render.
+    #[serde(default = "default_child_branch_template")]
+    pub child_branch_template: String,
+
+    /// Template applied when minting the canonical integration
+    /// branch name. Defaults to
+    /// `"symphony/integration/{{identifier}}"`. Same rendering rules
+    /// as `child_branch_template`.
+    #[serde(default = "default_integration_branch_template")]
+    pub integration_branch_template: String,
+
+    /// When `true`, child specialists may execute on the same branch
+    /// as the integration owner instead of getting their own. Only
+    /// legal when paired with a shared workspace strategy in
+    /// [`WorkspacePolicyConfig::strategies`]. Defaults to `false`,
+    /// matching SPEC v2 §5.9's safer-default stance.
+    #[serde(default)]
+    pub allow_same_branch_for_children: bool,
+
+    /// When `true` (the default), the runner refuses to launch a
+    /// mutation-capable agent against a dirty tree. Pairs with
+    /// [`WorkspacePolicyConfig::forbid_untracked_outside_workspace`]
+    /// to keep branch state honest before each agent attempt.
+    #[serde(default = "default_true")]
+    pub require_clean_tree_before_run: bool,
+}
+
+impl Default for BranchPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default_base: default_branch_base(),
+            child_branch_template: default_child_branch_template(),
+            integration_branch_template: default_integration_branch_template(),
+            allow_same_branch_for_children: false,
+            require_clean_tree_before_run: true,
+        }
+    }
+}
+
+fn default_branch_base() -> String {
+    "main".to_string()
+}
+
+fn default_child_branch_template() -> String {
+    "symphony/{{identifier}}".to_string()
+}
+
+fn default_integration_branch_template() -> String {
+    "symphony/integration/{{identifier}}".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,6 +2562,195 @@ mod tests {
         assert!(cfg.observability.tui.enabled);
         assert!(!cfg.observability.dashboard.enabled);
         assert_eq!(cfg.observability.logs.format, LogFormat::Json);
+        assert!(cfg.workspace.root.is_none());
+        assert!(cfg.workspace.default_strategy.is_none());
+        assert!(cfg.workspace.strategies.is_empty());
+        assert!(cfg.workspace.require_cwd_in_workspace);
+        assert!(cfg.workspace.forbid_untracked_outside_workspace);
+        assert_eq!(cfg.branching.default_base, "main");
+        assert_eq!(
+            cfg.branching.child_branch_template,
+            "symphony/{{identifier}}"
+        );
+        assert_eq!(
+            cfg.branching.integration_branch_template,
+            "symphony/integration/{{identifier}}"
+        );
+        assert!(!cfg.branching.allow_same_branch_for_children);
+        assert!(cfg.branching.require_clean_tree_before_run);
+    }
+
+    #[test]
+    fn workspace_policy_parses_strategy_registry() {
+        // Mirrors the SPEC v2 §5.8 worked example: a `git_worktree`
+        // default plus a shared `existing_worktree` integration entry.
+        let yaml = r#"
+workspace:
+  root: .symphony/workspaces
+  default_strategy: issue_worktree
+  strategies:
+    issue_worktree:
+      kind: git_worktree
+      base: main
+      branch_template: symphony/{{identifier}}
+      cleanup: retain_until_done
+    shared_integration:
+      kind: existing_worktree
+      path: ../project-integration
+      require_branch: symphony/integration/{{parent_identifier}}
+  require_cwd_in_workspace: true
+  forbid_untracked_outside_workspace: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            parsed.workspace.root.as_deref(),
+            Some(std::path::Path::new(".symphony/workspaces"))
+        );
+        assert_eq!(
+            parsed.workspace.default_strategy.as_deref(),
+            Some("issue_worktree")
+        );
+        let issue = parsed.workspace.strategies.get("issue_worktree").unwrap();
+        assert_eq!(issue.kind, WorkspaceStrategyKind::GitWorktree);
+        assert_eq!(issue.base.as_deref(), Some("main"));
+        assert_eq!(
+            issue.branch_template.as_deref(),
+            Some("symphony/{{identifier}}")
+        );
+        assert_eq!(issue.cleanup, WorkspaceCleanupPolicy::RetainUntilDone);
+        let shared = parsed
+            .workspace
+            .strategies
+            .get("shared_integration")
+            .unwrap();
+        assert_eq!(shared.kind, WorkspaceStrategyKind::ExistingWorktree);
+        assert_eq!(
+            shared.path.as_deref(),
+            Some(std::path::Path::new("../project-integration"))
+        );
+        assert_eq!(
+            shared.require_branch.as_deref(),
+            Some("symphony/integration/{{parent_identifier}}")
+        );
+        assert!(parsed.workspace.require_cwd_in_workspace);
+        assert!(parsed.workspace.forbid_untracked_outside_workspace);
+    }
+
+    #[test]
+    fn workspace_policy_unknown_nested_key_is_rejected() {
+        let yaml = r#"
+workspace:
+  strategies:
+    issue:
+      kind: git_worktree
+      brnch_template: symphony/{{identifier}}
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("brnch_template") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn workspace_strategy_kind_enum_round_trips() {
+        for kind in [
+            WorkspaceStrategyKind::GitWorktree,
+            WorkspaceStrategyKind::ExistingWorktree,
+            WorkspaceStrategyKind::SharedBranch,
+        ] {
+            let yaml = serde_yaml::to_string(&kind).unwrap();
+            let back: WorkspaceStrategyKind = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
+    fn workspace_cleanup_policy_round_trips() {
+        for policy in [
+            WorkspaceCleanupPolicy::RetainUntilDone,
+            WorkspaceCleanupPolicy::RemoveAfterRun,
+            WorkspaceCleanupPolicy::RetainAlways,
+        ] {
+            let yaml = serde_yaml::to_string(&policy).unwrap();
+            let back: WorkspaceCleanupPolicy = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(back, policy);
+        }
+    }
+
+    #[test]
+    fn branching_parses_spec_5_9_example() {
+        let yaml = r#"
+branching:
+  default_base: main
+  child_branch_template: symphony/{{identifier}}
+  integration_branch_template: symphony/integration/{{identifier}}
+  allow_same_branch_for_children: false
+  require_clean_tree_before_run: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.branching.default_base, "main");
+        assert_eq!(
+            parsed.branching.child_branch_template,
+            "symphony/{{identifier}}"
+        );
+        assert_eq!(
+            parsed.branching.integration_branch_template,
+            "symphony/integration/{{identifier}}"
+        );
+        assert!(!parsed.branching.allow_same_branch_for_children);
+        assert!(parsed.branching.require_clean_tree_before_run);
+    }
+
+    #[test]
+    fn branching_unknown_nested_key_is_rejected() {
+        let yaml = r#"
+branching:
+  defautl_base: main
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("defautl_base") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn branching_partial_override_keeps_defaults() {
+        let yaml = r#"
+branching:
+  allow_same_branch_for_children: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert!(parsed.branching.allow_same_branch_for_children);
+        assert_eq!(parsed.branching.default_base, "main");
+        assert_eq!(
+            parsed.branching.child_branch_template,
+            "symphony/{{identifier}}"
+        );
+        assert!(parsed.branching.require_clean_tree_before_run);
+    }
+
+    #[test]
+    fn workspace_and_branching_round_trip_through_yaml() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.workspace.default_strategy = Some("issue_worktree".into());
+        cfg.workspace.strategies.insert(
+            "issue_worktree".into(),
+            WorkspaceStrategyConfig {
+                kind: WorkspaceStrategyKind::GitWorktree,
+                base: Some("main".into()),
+                branch_template: Some("symphony/{{identifier}}".into()),
+                cleanup: WorkspaceCleanupPolicy::RetainUntilDone,
+                path: None,
+                require_branch: None,
+            },
+        );
+        cfg.branching.allow_same_branch_for_children = true;
+        let yaml = serde_yaml::to_string(&cfg).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&yaml).expect("re-parses");
+        assert_eq!(cfg, reparsed);
     }
 
     #[test]
