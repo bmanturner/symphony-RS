@@ -87,7 +87,7 @@ under their phase header and are added or refined as the project evolves.
 
 - [x] `WorkspaceManager` trait + `LocalFsWorkspace` implementation
 - [x] Sanitization rule (`[A-Za-z0-9._-]` → `_`) with property tests
-- [ ] Containment check rejecting `..`, absolute, and Unicode-look-alike
+- [x] Containment check rejecting `..`, absolute, and Unicode-look-alike
       attacks [sanitization]
 - [ ] Lifecycle hooks (`before_run`, `after_create`, `after_release`)
       with hook-failure tests [containment]

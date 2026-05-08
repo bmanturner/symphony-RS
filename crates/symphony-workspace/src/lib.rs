@@ -175,15 +175,65 @@ impl LocalFsWorkspace {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Sanitize `identifier` and validate the result is a usable single
+    /// path component. Sanitisation already maps every character outside
+    /// `[A-Za-z0-9._-]` to `_`, so Unicode look-alike attacks (fullwidth
+    /// solidus `／`, modifier letters, RTL overrides, etc.) collapse to
+    /// `_` before we ever look at them. What survives sanitisation are
+    /// the *purely-allowlisted* hostile inputs:
+    ///
+    /// - the empty string (no on-disk name at all),
+    /// - `"."` (the workspace root itself),
+    /// - `".."` (the parent of the workspace root — SPEC §9.5 Invariant 2
+    ///   explicitly forbids this).
+    ///
+    /// Each is rejected with [`WorkspaceError::InvalidRoot`] because they
+    /// indicate a misconfigured tracker or a truly malicious identifier;
+    /// either way the orchestrator cannot proceed.
+    fn safe_component(identifier: &str) -> WorkspaceResult<String> {
+        let safe = sanitize_identifier(identifier);
+        match safe.as_str() {
+            "" => Err(WorkspaceError::InvalidRoot(
+                "identifier sanitised to empty string".into(),
+            )),
+            "." | ".." => Err(WorkspaceError::InvalidRoot(format!(
+                "identifier sanitised to reserved component {safe:?}"
+            ))),
+            _ => Ok(safe),
+        }
+    }
+
+    /// Belt-and-suspenders containment check (SPEC §9.5 Invariant 2).
+    ///
+    /// `safe_component` already prevents the only inputs that could
+    /// escape `root` via path semantics, but a symlink planted under
+    /// `root` between manager construction and `ensure` could still
+    /// redirect the materialised directory elsewhere. Canonicalising
+    /// *after* creation and asserting the canonical path is a child of
+    /// `self.root` (which is itself canonical, set in [`Self::new`])
+    /// catches that race. On mismatch we surface an [`InvalidRoot`]
+    /// rather than silently falling through.
+    fn assert_contained(&self, path: &Path) -> WorkspaceResult<()> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| WorkspaceError::Io(format!("canonicalize {}: {e}", path.display())))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(WorkspaceError::InvalidRoot(format!(
+                "workspace path {} escaped root {}",
+                canonical.display(),
+                self.root.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl WorkspaceManager for LocalFsWorkspace {
     async fn ensure(&self, identifier: &str) -> WorkspaceResult<Workspace> {
-        // Sanitise per SPEC §4.2 before joining. Containment validation
-        // (path must canonicalise inside `self.root`, no `..` smuggling)
-        // is the next checklist item.
-        let safe = sanitize_identifier(identifier);
+        // Sanitise per SPEC §4.2, then reject the three "all-allowlisted
+        // but still hostile" survivors (empty, `.`, `..`) before joining.
+        let safe = Self::safe_component(identifier)?;
         let path = self.root.join(&safe);
 
         // `try_exists` distinguishes "does not exist" from "I cannot
@@ -199,6 +249,11 @@ impl WorkspaceManager for LocalFsWorkspace {
                 .map_err(|e| WorkspaceError::Io(format!("mkdir {}: {e}", path.display())))?;
         }
 
+        // SPEC §9.5 Invariant 2: canonicalise after creation and confirm
+        // we landed inside the canonical root. Catches a symlink planted
+        // between construction and ensure.
+        self.assert_contained(&path)?;
+
         Ok(Workspace {
             path,
             created_now: !existed,
@@ -206,9 +261,12 @@ impl WorkspaceManager for LocalFsWorkspace {
     }
 
     async fn release(&self, identifier: &str) -> WorkspaceResult<()> {
-        // Apply the same sanitisation as `ensure` so a release call uses
-        // the same on-disk path the ensure call materialised.
-        let path = self.root.join(sanitize_identifier(identifier));
+        // Apply the same sanitisation+validation as `ensure` so a release
+        // call computes the same on-disk path. Reserved components are
+        // rejected here too — there is nothing legitimate to release at
+        // `root/..` or `root/.`.
+        let safe = Self::safe_component(identifier)?;
+        let path = self.root.join(safe);
         match fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
             // Missing is fine — release is an assertion of absence, not a
@@ -385,6 +443,113 @@ mod tests {
 
         mgr.release("ORG/repo#7").await.unwrap();
         assert!(!ws.path.exists(), "release must remove what ensure created");
+    }
+
+    /// `..` is in the sanitiser's allowlist (because `.` is — `0.1.2`
+    /// has to survive intact), so the containment layer must catch it
+    /// explicitly. The orchestrator must never end up with a workspace
+    /// path that resolves to the parent of `root`.
+    #[tokio::test]
+    async fn ensure_rejects_dot_dot_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let err = mgr.ensure("..").await.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::InvalidRoot(_)),
+            "expected InvalidRoot, got {err:?}"
+        );
+    }
+
+    /// `.` sanitises to itself and would point at `root` itself if
+    /// joined naively. Reject so that an agent never runs *in* the
+    /// workspace root (which is shared across issues).
+    #[tokio::test]
+    async fn ensure_rejects_dot_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let err = mgr.ensure(".").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Empty input has no on-disk representation and almost certainly
+    /// indicates a bug upstream (a tracker returning a blank identifier).
+    /// Surface it loudly rather than materialising the workspace root.
+    #[tokio::test]
+    async fn ensure_rejects_empty_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let err = mgr.ensure("").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Unicode look-alike attacks rely on a non-ASCII codepoint that
+    /// *renders* like a separator (fullwidth solidus `／`, division
+    /// slash `∕`) tricking a naive joiner into spawning a path component
+    /// elsewhere. The sanitiser collapses every non-allowlisted codepoint
+    /// to `_` *before* the join, so the resulting path is always a
+    /// single direct child of `root`. This test pins that property for
+    /// the specific homoglyphs an attacker is most likely to try.
+    #[tokio::test]
+    async fn ensure_neutralises_unicode_separator_lookalikes() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        // Fullwidth solidus, division slash, fraction slash, and an
+        // RTL override embedded mid-identifier.
+        for hostile in ["a／b", "a∕b", "a⁄b", "a\u{202E}b"] {
+            let ws = mgr.ensure(hostile).await.unwrap();
+            assert_eq!(
+                ws.path.parent().unwrap(),
+                mgr.root(),
+                "homoglyph {hostile:?} should land directly under root",
+            );
+            let component = ws.path.file_name().unwrap().to_str().unwrap();
+            assert!(!component.contains('/'));
+            assert!(!component.contains('\\'));
+        }
+    }
+
+    /// Symlink planted under `root` post-construction must not redirect
+    /// the materialised workspace outside `root`. The containment check
+    /// canonicalises after `mkdir` and rejects the escape. This is
+    /// SPEC §9.5 Invariant 2 in action.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ensure_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        // After the manager is constructed, plant `root/escape` →
+        // outside. A subsequent `ensure("escape")` will find the path
+        // already exists (the symlink), skip mkdir, then canonicalise
+        // through the symlink and detect the containment violation.
+        symlink(outside.path(), mgr.root().join("escape")).unwrap();
+
+        let err = mgr.ensure("escape").await.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::InvalidRoot(_)),
+            "expected InvalidRoot from symlink escape, got {err:?}"
+        );
+    }
+
+    /// `release` mirrors `ensure`'s validation: the same hostile inputs
+    /// are rejected, so a misbehaving caller cannot use `release("..")`
+    /// to nuke the workspace root's parent.
+    #[tokio::test]
+    async fn release_rejects_dot_dot_identifier() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let err = mgr.release("..").await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+        // Critically: the parent of root must still exist.
+        assert!(tmp.path().exists());
     }
 
     // ----- property tests --------------------------------------------------
