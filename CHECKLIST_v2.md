@@ -13,7 +13,15 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add typed `AgentProfileConfig` decoupled from role names.
 - [x] Add `HermesAgentConfig` command/protocol shape and repackage existing tandem support as a composite strategy over configured agents; keep mock variants test-only.
 - [x] Add typed `RoutingConfig` and `RoutingRule` with explicit `match_mode = first_match | priority` semantics.
-- [ ] Add `PollingConfig`, `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, `FollowupConfig`, `HooksConfig`, and `ObservabilityConfig`.
+- [ ] Add `PollingConfig`, `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, `FollowupConfig`, `HooksConfig`, and `ObservabilityConfig`. (Decomposed below.)
+  - [x] Extend `PollingConfig` with `jitter_ms` and `startup_reconcile_recent_terminal` per SPEC v2 §5.2.
+  - [ ] Add typed `DecompositionConfig` (SPEC v2 §5.7) with `triggers` substructure and `child_issue_policy` enum.
+  - [ ] Add typed `IntegrationConfig` (SPEC v2 §5.10) with `merge_strategy`, `conflict_policy`, and `required_for` enums.
+  - [ ] Add typed `PullRequestConfig` (SPEC v2 §5.11) with `open_stage`, `mark_ready_stage`, and `initial_state` enums and templated title/body.
+  - [ ] Add typed `QaConfig` (SPEC v2 §5.12) with `blocker_policy` enum, `waiver_roles`, and `evidence_required` substructure.
+  - [ ] Add typed `FollowupConfig` (SPEC v2 §5.13) sharing the policy enum with decomposition.
+  - [ ] Add typed `ObservabilityConfig` (SPEC v2 §5.14) and migrate `StatusConfig` under `observability.sse`, preserving the existing `bind`/`replay_buffer` validation.
+  - [ ] Reshape `HooksConfig` to v2 list-of-commands form (SPEC v2 §5.17) and update `symphony-workspace` and `symphony-cli` consumers to iterate.
 - [ ] Add `WorkspacePolicyConfig` and `BranchPolicyConfig` for worktree/shared-branch strategies.
 - [ ] Add validation errors: missing `kind: integration_owner`, missing `kind: qa_gate` when QA is required, unknown role/agent references, duplicate tracker state mappings, invalid max depth, invalid branch template, PR config without GitHub, and contradictory shared-branch policy.
 - [ ] Add round-trip tests for a full v2 workflow fixture.

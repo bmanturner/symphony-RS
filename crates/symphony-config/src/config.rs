@@ -266,7 +266,7 @@ fn default_terminal_states() -> Vec<String> {
 // polling
 // ---------------------------------------------------------------------------
 
-/// Tick cadence for the orchestrator.
+/// Tick cadence for the orchestrator (SPEC v2 §5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PollingConfig {
@@ -274,18 +274,40 @@ pub struct PollingConfig {
     /// orchestrator adds jitter on top.
     #[serde(default = "default_poll_interval_ms")]
     pub interval_ms: u64,
+
+    /// Maximum random jitter (in ms) added to each poll interval to
+    /// prevent thundering-herd behaviour when multiple kernels run
+    /// against the same tracker. `0` disables jitter. Default: `5000`.
+    #[serde(default = "default_poll_jitter_ms")]
+    pub jitter_ms: u64,
+
+    /// On startup, fetch recently terminal issues alongside active ones
+    /// so stale leases/workspaces can be reconciled after tracker-side
+    /// state changes. SPEC v2 §5.2 / §3 startup recovery. Default: `true`.
+    #[serde(default = "default_startup_reconcile_recent_terminal")]
+    pub startup_reconcile_recent_terminal: bool,
 }
 
 impl Default for PollingConfig {
     fn default() -> Self {
         Self {
             interval_ms: default_poll_interval_ms(),
+            jitter_ms: default_poll_jitter_ms(),
+            startup_reconcile_recent_terminal: default_startup_reconcile_recent_terminal(),
         }
     }
 }
 
 fn default_poll_interval_ms() -> u64 {
     30_000
+}
+
+fn default_poll_jitter_ms() -> u64 {
+    5_000
+}
+
+fn default_startup_reconcile_recent_terminal() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1315,6 +1337,8 @@ mod tests {
             vec!["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
         );
         assert_eq!(cfg.polling.interval_ms, 30_000);
+        assert_eq!(cfg.polling.jitter_ms, 5_000);
+        assert!(cfg.polling.startup_reconcile_recent_terminal);
         assert_eq!(cfg.hooks.timeout_ms, 60_000);
         assert_eq!(cfg.agent.kind, AgentKind::Codex);
         assert_eq!(cfg.agent.max_concurrent_agents, 10);
@@ -1412,6 +1436,56 @@ polling:
         assert_eq!(
             cfg.validate(),
             Err(ConfigValidationError::PollingIntervalZero(0))
+        );
+    }
+
+    #[test]
+    fn polling_v2_fields_default_when_omitted() {
+        // Operators who omit the new SPEC v2 §5.2 fields still get the
+        // documented defaults so an existing v1-shaped fixture loads
+        // without surprise.
+        let yaml = "tracker:\n  project_slug: ENG\npolling:\n  interval_ms: 1000\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.polling.interval_ms, 1_000);
+        assert_eq!(parsed.polling.jitter_ms, 5_000);
+        assert!(parsed.polling.startup_reconcile_recent_terminal);
+    }
+
+    #[test]
+    fn polling_v2_fields_roundtrip() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+polling:
+  interval_ms: 15000
+  jitter_ms: 0
+  startup_reconcile_recent_terminal: false
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.polling.interval_ms, 15_000);
+        assert_eq!(parsed.polling.jitter_ms, 0);
+        assert!(!parsed.polling.startup_reconcile_recent_terminal);
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn polling_unknown_nested_key_is_rejected() {
+        // Typos in the polling section must surface, not silently
+        // default — the rest of the schema enforces this and operators
+        // should expect the same here.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+polling:
+  jiter_ms: 100
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("jiter_ms") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
         );
     }
 
