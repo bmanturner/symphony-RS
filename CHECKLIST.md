@@ -54,13 +54,31 @@ under their phase header and are added or refined as the project evolves.
       integration tests covering happy path, 4xx, 5xx, malformed
       responses; passes the conformance suite. [Linear bindings,
       conformance suite]
-- [ ] Implement `GitHubTracker` using `octocrab` (REST for mutations,
-      GraphQL for batched polling). Maps issue number → `identifier`,
-      derives `branch_name` from linked-PR head ref when present, parses
-      `blocked_by` from "blocked by #N" / "depends on #N" body refs.
-      `wiremock` integration tests covering the same scenarios as Linear;
-      passes the conformance suite. [octocrab in budget, conformance
-      suite]
+- [x] **GitHubTracker (a)** — `GitHubConfig` + `GitHubTracker` skeleton
+      built on `octocrab` with a configurable `base_uri` (so wiremock can
+      stand in for `api.github.com`). Implement `fetch_active` paginating
+      `GET /repos/{owner}/{repo}/issues?state=open` with state derived from
+      a configurable `status:` label prefix (fallback to native open).
+      Issue → `Issue` mapping leaves `branch_name = None` and
+      `blocked_by = []` for now — those land in (c) and (d). Pure unit
+      tests on the normalization helpers + a happy-path wiremock test.
+      [octocrab in budget]
+- [ ] **GitHubTracker (b)** — `fetch_state(&[IssueId])` (per-number GET
+      preserving caller order) and `fetch_terminal_recent(&[IssueState])`
+      (paginated `state=closed` + label-derived state filtering).
+      Wiremock tests covering 4xx (auth + other), 5xx, malformed JSON.
+      [GitHubTracker (a)]
+- [ ] **GitHubTracker (c)** — parse `blocked_by` from issue body
+      "blocked by #N" / "depends on #N" refs (no server-side resolution
+      yet; `BlockerRef.id` stays `None`, only `identifier` is filled).
+      Add `github_canonical_scenario()` mirroring the Linear fixture but
+      using GitHub-style identifiers; full conformance suite passes
+      against the wiremock-backed adapter. [GitHubTracker (b)]
+- [ ] **GitHubTracker (d)** — derive `branch_name` from linked-PR head
+      ref by querying `GET /repos/{owner}/{repo}/issues/{n}/timeline` for
+      cross-referenced PR events; take the most-recently-opened PR's
+      `head.ref`. Extend `github_canonical_scenario()` to cover this and
+      re-run the conformance suite. [GitHubTracker (c)]
 - [ ] Reconciliation queries: state refresh by id, terminal cleanup —
       implemented for both adapters and exercised via the conformance
       suite. [LinearTracker, GitHubTracker]

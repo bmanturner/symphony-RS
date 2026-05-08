@@ -2930,6 +2930,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "graphql_client",
+ "http 1.4.0",
  "octocrab",
  "reqwest 0.12.28",
  "rstest",

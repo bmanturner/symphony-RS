@@ -29,3 +29,6 @@ pub mod conformance;
 
 pub mod linear;
 pub use linear::{LinearConfig, LinearTracker};
+
+pub mod github;
+pub use github::{GitHubConfig, GitHubTracker};
