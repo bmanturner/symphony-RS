@@ -75,6 +75,15 @@ figment = { version = "0.10", features = ["env", "yaml", "toml"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 
+# Status Surface (Phase 8): axum hosts the orchestrator's SSE endpoint,
+# ratatui + crossterm drive the out-of-process `symphony watch` TUI. Each
+# is the established Rust-ecosystem choice in its niche; rationale lives
+# in the ARCHITECTURE.md § Decisions ADR for this trio. Pulled in by
+# `symphony-cli` only — `symphony-core` stays presentation-free.
+axum = "0.8"
+ratatui = "0.30"
+crossterm = "0.29"
+
 # Errors / IDs: anyhow at process boundaries, thiserror inside library
 # crates, uuid v4 for per-run identifiers.
 anyhow = "1"

@@ -179,7 +179,7 @@ keep one-task-per-iteration discipline.
       returns `BroadcastStream<OrchestratorEvent>`. Pure addition — no
       behavioural change. Tests assert that events are emitted on every
       state transition. [OrchestratorEvent, Phase 5 state machine]
-- [ ] Add `axum`, `ratatui`, `crossterm` to the workspace crate budget
+- [x] Add `axum`, `ratatui`, `crossterm` to the workspace crate budget
       via `cargo add --workspace`. One-paragraph ADR documenting why
       these three over hand-rolled alternatives.
 - [ ] Add `status` section to `WorkflowConfig`: `enabled` (bool, default

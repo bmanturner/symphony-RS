@@ -361,6 +361,43 @@ production deps enter the budget: `ratatui`, `crossterm`, `axum`. The
 broadcast bus is a pure addition to the orchestrator (replay buffer
 default 256, configurable) — no behavioural change.
 
+### 2026-05-08 — `axum` + `ratatui` + `crossterm` for the Status Surface
+**Context.** Phase 8 ships an SSE event server in `symphony-cli` and an
+out-of-process `symphony watch` TUI. Each layer has a hand-rolled
+alternative: write SSE on top of `tokio::net::TcpListener` + raw HTTP/1.1
+parsing, draw the TUI by emitting ANSI escapes directly to stdout, and
+read keystrokes with platform termios calls. The SPEC §2.2 "no rich web
+UI" constraint rules out heavier frameworks but does not demand we
+re-implement HTTP framing, terminal capability negotiation, or
+event-loop bookkeeping for a feature that exists to *help operators*
+debug the daemon — re-implementations there spend weeks of engineering
+to recreate hazards (HTTP framing bugs, Windows console quirks, resize
+races) that the ecosystem has already solved.
+
+**Decision.** Add three crates to the budget, all consumed only by
+`symphony-cli` (so `symphony-core` and the orchestrator stay
+presentation-free): `axum` (v0.8) for the SSE server because it is the
+default-tier `tokio` HTTP framework with first-class `Sse` and
+backpressure-aware streaming, `ratatui` (v0.30) as the established
+maintained fork of `tui-rs` with widgets, `TestBackend` for snapshot
+tests, and a stable `Frame` API, and `crossterm` (v0.29) as ratatui's
+recommended cross-platform backend (Linux/macOS/Windows raw mode,
+alternate-screen, and resize events) so the TUI is portable without us
+writing per-platform terminal code. SSE on the wire stays hand-rolled —
+no extra `eventsource-client` dep — because parsing `data: <json>\n\n`
+frames is a 30-line job with no failure modes worth importing a crate
+for.
+
+**Consequence.** Three production deps enter the budget; each is the
+default-tier ecosystem choice in its niche, so the version-skew and
+maintenance risk is minimal. `axum` transitively pulls in `tower` and
+`hyper`, which are already in the dep graph via `octocrab`/`reqwest`,
+so the marginal compile cost is small. `ratatui` + `crossterm` are
+test-only insofar as the watch subcommand is opt-in — the daemon path
+never touches them. A future migration to a different HTTP server or
+terminal backend is contained to `symphony-cli`; the wire format
+(`OrchestratorEvent` JSON over SSE) is the stable contract regardless.
+
 ### 2026-05-08 — `tokio-util` for cooperative cancellation
 **Context.** The architecture tenets require every async fn that touches
 I/O to take a cancellation handle. The poll loop in Phase 5 fans out
