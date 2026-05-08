@@ -72,12 +72,17 @@ shopt -s nullglob
 EXISTING_ITERS=( "$LOG_DIR"/iter-*.jsonl )
 shopt -u nullglob
 HIGHEST=0
-for f in "${EXISTING_ITERS[@]}"; do
-  n="${f##*/iter-}"; n="${n%.jsonl}"
-  # 10# forces decimal — leading-zero strings would otherwise be read as octal.
-  n=$((10#$n))
-  (( n > HIGHEST )) && HIGHEST=$n
-done
+# Length-guard the iteration: macOS bash 3.2 treats an empty array
+# expansion as unbound under `set -u` even though `${#arr[@]}` returns 0
+# cleanly. The check makes this work on both 3.2 and modern bash.
+if (( ${#EXISTING_ITERS[@]} > 0 )); then
+  for f in "${EXISTING_ITERS[@]}"; do
+    n="${f##*/iter-}"; n="${n%.jsonl}"
+    # 10# forces decimal — leading-zero strings would otherwise be read as octal.
+    n=$((10#$n))
+    (( n > HIGHEST )) && HIGHEST=$n
+  done
+fi
 START_N=$((HIGHEST + 1))
 END_N=$((START_N + MAX_ITERATIONS - 1))
 

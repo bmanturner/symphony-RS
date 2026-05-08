@@ -100,7 +100,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] Claude stream-json decoder; `ClaudeRunner` spawning `claude -p
       --output-format stream-json --permission-mode bypassPermissions
       --session-id <uuid>` [AgentRunner trait]
-- [ ] Subprocess tests with a fake binary in `tests/fixtures/`
+- [x] Subprocess tests with a fake binary in `tests/fixtures/`
       [CodexRunner, ClaudeRunner]
 - [ ] Stream-shape parity test: identical script → identical normalized
       `AgentEvent` sequence (modulo backend-only events) [fake binary]
