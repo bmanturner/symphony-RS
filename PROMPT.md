@@ -103,6 +103,8 @@ Do this **and only this** for the first iteration. Then commit and exit.
    - Async / runtime: `tokio` (full), `async-trait`, `futures`, `tokio-stream`
    - Serde: `serde`, `serde_json`, `serde_yaml`, `gray_matter`
    - HTTP / GraphQL: `reqwest` (rustls), `graphql_client`, `octocrab`, `url`
+   - TUI / observation: `ratatui`, `crossterm`, `axum` (HTTP SSE server,
+     Phase 8 only — do not pull in earlier)
    - CLI / config: `clap` (derive), `dotenvy`, `secrecy`, `figment`
    - Logging: `tracing`, `tracing-subscriber` (env-filter, json)
    - Errors / IDs: `anyhow`, `thiserror`, `uuid` (v4)
@@ -205,6 +207,30 @@ Do this **and only this** for the first iteration. Then commit and exit.
    - `symphony run` (default), `symphony validate`, `symphony status`
    - Graceful shutdown on SIGINT (drain in-flight, persist nothing)
    - `assert_cmd` smoke tests
+
+   **Phase 8 — Status Surface (out-of-process live TUI via HTTP SSE)**
+   SPEC §3.1 layer 7. Sits *outside* the daemon as a separate observer
+   process; the daemon stays headless and systemd-friendly.
+   - `OrchestratorEvent` enum + `tokio::sync::broadcast` event bus inside
+     `symphony-core` (pure addition; orchestrator behaviour unchanged).
+     Stable wire format — additions non-breaking, removals require a
+     major bump.
+   - `axum` HTTP server in `symphony-cli` exposing `GET /events` as
+     `text/event-stream` of NDJSON `OrchestratorEvent`s. Default bind
+     `127.0.0.1:6280`; disable-able via `status.enabled = false` in
+     `WORKFLOW.md`.
+   - `symphony watch [--url <URL>]` subcommand: SSE client (hand-rolled,
+     no extra crate) + `ratatui`/`crossterm` TUI.
+   - Panels: active issues table, cost summary, recent events log, and a
+     tandem-activity panel that appears only when at least one running
+     session uses `TandemRunner`. Hotkeys: `q` quit, `r` toggle
+     relative/absolute time, `f` filter by issue identifier.
+   - Resilience: TUI auto-reconnects with capped exponential backoff,
+     renders a "disconnected" banner during retries, survives terminal
+     resize.
+   - Tests: `insta` snapshots of the SSE stream against a scripted
+     orchestrator run, and TUI frame snapshots against a scripted event
+     sequence using ratatui's `TestBackend`.
 
 ────────────────────────────────────────────────────────────────────────────
 ## ARCHITECTURE TENETS (don't violate without an ADR)

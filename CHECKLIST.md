@@ -131,7 +131,71 @@ under their phase header and are added or refined as the project evolves.
 
 - [ ] `symphony validate <path>` subcommand wired to `WorkflowLoader`
 - [ ] `symphony run` subcommand composing real adapters
-- [ ] `symphony status` snapshot output
+- [ ] `symphony status` snapshot output (point-in-time; distinct from
+      Phase 8's `symphony watch` live TUI)
 - [ ] Graceful SIGINT shutdown that drains in-flight turns
 - [ ] README "Quickstart" section ending with a first dispatched mock
       issue
+
+## Phase 8 — Status Surface (out-of-process live TUI via HTTP SSE)
+
+SPEC §3.1 layer 7. Implemented out-of-process so the daemon stays
+headless and systemd-friendly. Sub-tasks are intentionally small —
+keep one-task-per-iteration discipline.
+
+- [ ] Define `OrchestratorEvent` enum in `symphony-core::events`
+      covering `StateChanged`, `Dispatched`, `AgentEvent` re-emission,
+      `RetryScheduled`, `Reconciled`, `Released`. `Serialize` with
+      `#[serde(tag = "type")]` so SSE consumers can switch on type.
+      Doc comment declares the wire format stable: additions
+      non-breaking, removals require a major bump.
+- [ ] Add `tokio::sync::broadcast` event bus to the orchestrator with a
+      configurable replay buffer (default 256). Public `subscribe()`
+      returns `BroadcastStream<OrchestratorEvent>`. Pure addition — no
+      behavioural change. Tests assert that events are emitted on every
+      state transition. [OrchestratorEvent, Phase 5 state machine]
+- [ ] Add `axum`, `ratatui`, `crossterm` to the workspace crate budget
+      via `cargo add --workspace`. One-paragraph ADR documenting why
+      these three over hand-rolled alternatives.
+- [ ] Add `status` section to `WorkflowConfig`: `enabled` (bool, default
+      true), `bind` (default `"127.0.0.1:6280"`), `replay_buffer`
+      (default 256). `deny_unknown_fields`, defaults via
+      `default_status_*` free functions per the existing convention.
+- [ ] Build the SSE handler in `symphony-cli`: an `axum` router with
+      `GET /events` that subscribes to the orchestrator's broadcast bus
+      and serialises each `OrchestratorEvent` as one SSE `data:` frame.
+      Bound concurrent subscribers; drop slow consumers with a
+      `Lagged` event. [event bus, axum in budget, status config]
+- [ ] Wire the SSE server into `symphony run` lifecycle (start with the
+      orchestrator, drain on SIGINT). `wiremock`-style integration test
+      that connects a fake client and asserts a scripted event sequence
+      arrives in order. [SSE handler]
+- [ ] Add `symphony watch [--url <URL>]` subcommand: hand-rolled SSE
+      client over `reqwest` (no extra crate), parsing `data: <json>`
+      lines. Reconnects with capped exponential backoff; renders a
+      "disconnected" banner during retries. [SSE server]
+- [ ] TUI scaffold with `ratatui` + `crossterm`: alternate screen,
+      raw mode, terminal-resize-safe, hotkey `q` to quit. Renders a
+      placeholder layout. [symphony watch, ratatui in budget]
+- [ ] TUI panel — **active issues** table: identifier, state, elapsed,
+      agent backend. Updates from `StateChanged` and `Dispatched`.
+      [TUI scaffold]
+- [ ] TUI panel — **cost summary**: tokens (input/output/cached),
+      cumulative dollars from `AgentEvent::TokenUsage`. [active issues
+      panel]
+- [ ] TUI panel — **recent events log**: ring buffer of the last N
+      events, colour-coded by variant. Hotkey `f` filters by issue
+      identifier substring. [active issues panel]
+- [ ] TUI panel — **tandem activity**: visible only when at least one
+      running session uses `TandemRunner`. Shows lead/follower roles,
+      strategy, current phase (drafting / reviewing / executing),
+      agreement rate. [recent events panel, Phase 6 TandemRunner]
+- [ ] Hotkey `r` toggles relative ↔ absolute time formatting across
+      all panels. [tandem panel]
+- [ ] Snapshot tests: `insta`-snapshotted SSE stream against a scripted
+      orchestrator run, and ratatui `TestBackend` frame snapshots
+      against a scripted event sequence covering every panel.
+      [all panels]
+- [ ] README "Quickstart" gains a paragraph showing `symphony run` in
+      one terminal and `symphony watch` in another, plus a screenshot
+      placeholder. [snapshot tests]

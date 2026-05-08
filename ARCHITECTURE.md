@@ -105,6 +105,44 @@ pub enum AgentEvent {
 The trait surface is intentionally narrow: the orchestrator only ever
 consumes the normalized `AgentEvent` stream — never raw JSON.
 
+### Observation surface (Phase 8)
+
+```rust
+// In symphony-core::events
+//
+// Public observation contract. Emitted by the orchestrator on a
+// `tokio::sync::broadcast` bus; the SSE endpoint is one consumer.
+// Treat as a stable wire format — additions are non-breaking, removals
+// require a major version bump.
+pub enum OrchestratorEvent {
+    StateChanged   { issue: IssueId, from: Phase, to: Phase },
+    Dispatched     { issue: IssueId, session: SessionId },
+    AgentEvent     { issue: IssueId, session: SessionId, event: AgentEvent },
+    RetryScheduled { issue: IssueId, attempt: u32, due_at: SystemTime, reason: String },
+    Reconciled     { dropped: Vec<IssueId> },
+    Released       { issue: IssueId, outcome: ReleaseOutcome },
+}
+```
+
+The observation surface lives **outside** the daemon process:
+
+```
+                      orchestrator.subscribe()
+   symphony-core ────────────────────────────────► broadcast bus
+                                                       │
+                                                       ▼
+                                       axum  GET /events  (text/event-stream)
+                                                       │
+                                                       ▼
+                                       symphony watch  (separate process)
+                                          ratatui + crossterm TUI
+```
+
+`symphony status` (Phase 7) is the snapshot view — scriptable,
+point-in-time, exits. `symphony watch` (Phase 8) is the live view —
+streams the same events that any future consumer (Grafana, custom
+exporter, web dashboard) would consume.
+
 ### Per-adapter `Issue` conventions
 
 Both v1 trackers return the same `Issue` shape, but each backend models
@@ -270,6 +308,33 @@ include a minimal shrunk counter-example, which is the affordance we
 want when an adapter contributor adds an exotic identifier scheme. No
 production code path depends on proptest.
 
+### 2026-05-08 — Status Surface as out-of-process TUI over HTTP SSE
+**Context.** SPEC §3.1's Status Surface is optional but valuable when
+running multiple issues concurrently — Tandem mode is genuinely
+confusing without a live view. SPEC §2.2 forbids "rich web UI." The
+choice space narrows to: nothing, snapshot CLI, live in-process TUI,
+or live out-of-process TUI. Daemons live in systemd units and
+container `CMD`s; binding the daemon's lifetime to a terminal would
+defeat that.
+
+**Decision.** Phase 8 (after Phase 7's daemon ships) adds an
+out-of-process TUI as a separate `symphony watch` subcommand.
+`symphony-core` gains an `OrchestratorEvent` broadcast bus.
+`symphony run` exposes those events at `GET /events` via `axum` as
+`text/event-stream` of NDJSON. The TUI is `ratatui` + `crossterm`,
+hand-rolling the SSE client to keep the dep budget tight. Existing
+`symphony status` (Phase 7) stays as the snapshot view; `symphony
+watch` is the live view. Default bind `127.0.0.1:6280`; disable-able
+via `status.enabled = false` in `WORKFLOW.md`.
+
+**Consequence.** The wire format (`OrchestratorEvent` JSON) becomes
+the stable contract for any future observer — web dashboards, Grafana
+exporters, custom CI integrations — without further changes to the
+daemon. Daemons stay headless and systemd-friendly. Three new
+production deps enter the budget: `ratatui`, `crossterm`, `axum`. The
+broadcast bus is a pure addition to the orchestrator (replay buffer
+default 256, configurable) — no behavioural change.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line
@@ -301,3 +366,10 @@ justifications follow. Anything added beyond this list requires a new ADR.
 - **proptest** — test-only; invariant coverage for pure helpers
   (workspace path sanitisation today, orchestrator state machine in
   Phase 5). See ADR `2026-05-08 — proptest for invariant coverage`.
+- **ratatui** — Phase 8 only; established Rust TUI library used by
+  `symphony watch`. See ADR `2026-05-08 — Status Surface as
+  out-of-process TUI over HTTP SSE`.
+- **crossterm** — Phase 8 only; cross-platform terminal backend for
+  ratatui.
+- **axum** — Phase 8 only; HTTP server in `symphony-cli` exposing
+  `GET /events` as `text/event-stream`.

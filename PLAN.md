@@ -39,7 +39,20 @@ for per-agent token counts, agreement rate, cost per turn.
 
 ### Phase 7 — CLI binary
 `symphony run | validate | status`. Graceful SIGINT shutdown.
-`assert_cmd` smoke tests. Quickstart README.
+`assert_cmd` smoke tests. Quickstart README. `symphony status` is the
+**snapshot** view (point-in-time, scriptable, exits) — distinct from
+Phase 8's `symphony watch` (live TUI).
+
+### Phase 8 — Status Surface (out-of-process live TUI)
+SPEC §3.1 layer 7, implemented out-of-process so the daemon stays
+headless. `symphony-core` gains an `OrchestratorEvent` broadcast bus.
+`symphony run` exposes those events at `GET /events` via `axum` as
+`text/event-stream` of NDJSON. A new `symphony watch` subcommand
+connects to that endpoint and renders a `ratatui`/`crossterm` TUI with
+panels for active issues, cost, recent events, and tandem activity.
+The wire format becomes the stable observation contract; future
+consumers (Grafana, custom dashboards, …) attach without further
+daemon changes.
 
 ## Pending Refactors
 
