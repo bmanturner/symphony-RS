@@ -13,3 +13,14 @@
 //! Adapters will live in submodules (`linear`, `mock`); they are added in
 //! Phase 2 and may be gated behind cargo features once the dependency
 //! footprint matters.
+
+// Re-export the trait surface from `symphony-core` so adapter call sites
+// don't need to know which crate defines the trait. Keeps the public API
+// of this crate self-contained: a downstream user wires
+// `symphony_tracker::{IssueTracker, MockTracker}` and never has to think
+// about the core/tracker split.
+pub use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
+pub use symphony_core::tracker_trait::{IssueTracker, TrackerError, TrackerResult};
+
+pub mod mock;
+pub use mock::{MockCall, MockTracker};

@@ -36,7 +36,7 @@ under their phase header and are added or refined as the project evolves.
       the data.
 - [x] Define the `IssueTracker` async trait with `fetch_active`,
       `fetch_state`, `fetch_terminal_recent` [Issue model]
-- [ ] Implement `MockTracker` in `symphony-tracker::mock` with a
+- [x] Implement `MockTracker` in `symphony-tracker::mock` with a
       programmable script for tests [IssueTracker trait]
 - [ ] Tracker **conformance suite** parameterised over `dyn IssueTracker`
       using `rstest`: asserts active-state filtering against
