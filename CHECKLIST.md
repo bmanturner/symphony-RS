@@ -107,7 +107,7 @@ under their phase header and are added or refined as the project evolves.
 
 ## Phase 5 — Orchestrator
 
-- [ ] State machine (`Unclaimed → Claimed{Running|RetryQueued} →
+- [x] State machine (`Unclaimed → Claimed{Running|RetryQueued} →
       Released`) as a pure module with property tests
 - [ ] Poll loop with `tokio::time::interval`, jitter, bounded concurrency
       [state machine]

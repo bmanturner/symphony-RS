@@ -308,6 +308,32 @@ include a minimal shrunk counter-example, which is the affordance we
 want when an adapter contributor adds an exotic identifier scheme. No
 production code path depends on proptest.
 
+### 2026-05-08 — Collapse the SPEC §7.1 five-state model to two stored variants
+**Context.** SPEC §7.1 enumerates `Unclaimed`, `Claimed`, `Running`,
+`RetryQueued`, and `Released`. A naive port stores all five as enum
+variants, but two of them (`Unclaimed`, `Released`) are equivalent for
+scheduling purposes — both mean "no claim exists" — and `Claimed` is
+just the union of `Running ∪ RetryQueued`. Storing all five would force
+the orchestrator to disambiguate "absent (never claimed)" from "absent
+(released)", a distinction that has no scheduling effect.
+
+**Decision.** `state_machine::ClaimState` carries two variants —
+`Running` and `RetryQueued { attempt }` — and the storage type is
+`HashMap<IssueId, ClaimState>`. Absence from the map represents both
+`Unclaimed` and `Released`; [`ReleaseReason`] is captured at the moment
+of release for logs and the Phase-8 event bus rather than persisted in
+the ledger. The five SPEC states are recoverable as a documented
+projection (see the module-level rustdoc), so faithfulness to §7.1 is
+preserved on the observable boundary.
+
+**Consequence.** Smaller surface area, cheaper invariants ("running ≤
+claimed", "claimed = running + retry_queued"), and `proptest` covers a
+state space of two storage variants instead of five. The trade-off:
+attempts to release an already-released issue are reported as
+`TransitionError::NotClaimed` rather than a distinct "already
+released" — which the orchestrator treats as a no-op via
+`release_if_present` on reconciliation passes.
+
 ### 2026-05-08 — Status Surface as out-of-process TUI over HTTP SSE
 **Context.** SPEC §3.1's Status Surface is optional but valuable when
 running multiple issues concurrently — Tandem mode is genuinely
