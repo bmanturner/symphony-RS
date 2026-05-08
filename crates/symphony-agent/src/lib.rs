@@ -21,4 +21,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod mock;
 pub mod tandem;
+
+pub use mock::{DEFAULT_MOCK_MESSAGE, MockAgentConfig, MockAgentControl, MockAgentRunner};

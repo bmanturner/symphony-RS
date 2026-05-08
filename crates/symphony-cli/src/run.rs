@@ -67,6 +67,7 @@ use futures::StreamExt;
 use secrecy::SecretString;
 use symphony_agent::claude::{ClaudeConfig, ClaudeRunner};
 use symphony_agent::codex::{CodexConfig as RunnerCodexConfig, CodexRunner};
+use symphony_agent::mock::{MockAgentConfig, MockAgentRunner};
 use symphony_agent::tandem::{TandemRunner, TandemStrategy};
 use symphony_config::{AgentKind, LayeredLoader, TrackerKind, WorkflowConfig};
 use symphony_core::agent::{AgentEvent, AgentRunner, CompletionReason, StartSessionParams};
@@ -340,6 +341,7 @@ fn build_agent_runner(cfg: &WorkflowConfig) -> Result<Arc<dyn AgentRunner>> {
                 TandemStrategy::DraftReview,
             )))
         }
+        AgentKind::Mock => Ok(Arc::new(MockAgentRunner::new(MockAgentConfig::default()))),
     }
 }
 
@@ -663,6 +665,49 @@ mod tests {
             ..WorkflowConfig::default()
         };
         let _r = build_agent_runner(&cfg).unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_agent_runner_mock_when_kind_mock() {
+        // Mock is fully in-process so we can drive it end-to-end here:
+        // verifies the factory wiring AND that the runner produced is a
+        // working `AgentRunner`. If a future change accidentally breaks
+        // the mock script (or stops using it from `Mock`) this test
+        // turns red rather than the failure surfacing only in the
+        // Quickstart smoke test.
+        use futures::StreamExt;
+        let cfg = WorkflowConfig {
+            agent: AgentConfig {
+                kind: AgentKind::Mock,
+                ..AgentConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let runner = build_agent_runner(&cfg).unwrap();
+        let session = runner
+            .start_session(StartSessionParams {
+                issue: symphony_core::tracker::IssueId::new("MOCK-1"),
+                workspace: std::path::PathBuf::from("/tmp/ws"),
+                initial_prompt: "p".into(),
+                issue_label: None,
+            })
+            .await
+            .unwrap();
+        let symphony_core::agent::AgentSession {
+            mut events,
+            control,
+            ..
+        } = session;
+        // Drop the control after draining so the channel closes cleanly.
+        let mut got_terminal = false;
+        while let Some(ev) = events.next().await {
+            if matches!(ev, AgentEvent::Completed { .. }) {
+                got_terminal = true;
+                break;
+            }
+        }
+        drop(control);
+        assert!(got_terminal, "mock runner must emit a terminal event");
     }
 
     #[test]

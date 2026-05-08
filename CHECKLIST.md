@@ -146,7 +146,7 @@ under their phase header and are added or refined as the project evolves.
       loads the fixtures into a `MockTracker`. Round-trip tests for the
       config parsing + a unit test for the CLI factory path.
       [Decompose Quickstart]
-- [ ] Add a `mock` variant to `AgentKind` driving a no-op
+- [x] Add a `mock` variant to `AgentKind` driving a no-op
       `MockAgentRunner` (returns a scripted `Started → Message →
       Completed` sequence per turn). Lets `symphony run` dispatch
       against a fixture without `codex` or `claude` installed. Unit

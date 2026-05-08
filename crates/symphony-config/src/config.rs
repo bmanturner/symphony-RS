@@ -330,6 +330,12 @@ pub enum AgentKind {
     /// strategy and lead are configured in a future `tandem` block; this
     /// variant just turns the wrapper on.
     Tandem,
+    /// In-process scripted runner that emits a deterministic
+    /// `Started → Message → Completed` sequence per turn. Lets
+    /// `symphony run` exercise the dispatch path end-to-end without a
+    /// `codex` or `claude` binary on PATH — wired by the Quickstart
+    /// fixture and the CLI smoke tests. Not for production use.
+    Mock,
 }
 
 fn default_max_concurrent_agents() -> u32 {
@@ -671,6 +677,22 @@ tracker:
             Some(std::path::Path::new("./quickstart/issues.yaml"))
         );
 
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn yaml_roundtrip_preserves_mock_agent_kind() {
+        let yaml = r#"
+tracker:
+  kind: mock
+  fixtures: ./issues.yaml
+agent:
+  kind: mock
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.agent.kind, AgentKind::Mock);
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
         assert_eq!(parsed, reparsed);
