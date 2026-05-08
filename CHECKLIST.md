@@ -157,7 +157,7 @@ under their phase header and are added or refined as the project evolves.
       test that `symphony run` against them dispatches at least one
       issue and exits cleanly on SIGINT.
       [mock tracker kind, mock agent kind]
-- [ ] README "Quickstart" section walking from `cargo install --path
+- [x] README "Quickstart" section walking from `cargo install --path
       crates/symphony-cli` through `symphony validate`, `symphony
       status`, and `symphony run` against the quickstart fixture, with
       a copy-pasteable command block. [quickstart fixture]
