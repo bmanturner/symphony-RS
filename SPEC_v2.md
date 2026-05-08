@@ -94,10 +94,13 @@ Required fields:
 - `identifier`: human-facing key.
 - `title`.
 - `description`.
-- `status`.
+- `status`: raw tracker status/state label preserved for display and sync.
+- `status_class`: normalized `WorkItemStatusClass` derived from `tracker.state_mapping`.
 - `priority`.
 - `labels`.
 - `url`.
+
+Existing implementation names such as `Issue.state` should be migrated deliberately. Preserve the existing case-insensitive equality semantics when moving to `status`/`status_class` so tracker casing does not change behavior.
 
 Optional structured fields:
 
@@ -116,7 +119,7 @@ Optional structured fields:
 - `related_prs`.
 - `run_summary`.
 
-Adapters MUST NOT fabricate fields they cannot know. They MAY attach adapter-specific metadata under `metadata`.
+Adapters MUST NOT fabricate fields they cannot know. New fields that are not available from the external tracker should be populated by the internal `WorkItem`/state layer, not guessed by tracker adapters. Adapters MAY attach adapter-specific metadata under `metadata`.
 
 ### 4.3 Work Item
 
@@ -146,17 +149,17 @@ roles:
   platform_lead:
     kind: integration_owner
     description: Owns decomposition, integration branch, and final release handoff.
-    agent: codex
+    agent: lead_agent
     max_concurrent: 1
   qa:
     kind: qa_gate
     description: Verifies acceptance criteria, files blockers, and rejects incomplete work.
-    agent: claude
+    agent: qa_agent
     max_concurrent: 2
-  elixir_engineer:
+  backend_engineer:
     kind: specialist
-    description: Implements Elixir/OTP changes.
-    agent: codex
+    description: Implements scoped backend changes.
+    agent: codex_fast
 ```
 
 Role kinds:
@@ -228,6 +231,14 @@ Minimum handoff fields:
 - `branch_or_workspace`;
 - `ready_for` (`integration`, `qa`, `human_review`, `blocked`, `done`).
 
+`ready_for` is advisory from the agent, not authority to bypass gates:
+
+- `integration`: enqueue for integration-owner consolidation.
+- `qa`: enqueue for QA only if integration is not required or already complete.
+- `human_review`: pause with a durable approval item.
+- `blocked`: require blocker records or a structured block reason.
+- `done`: valid only for simple non-decomposed work with no integration/QA requirement; otherwise the kernel downgrades it to the next required gate.
+
 ### 4.8 Blocker
 
 A blocker is a durable dependency edge plus a reason.
@@ -275,6 +286,7 @@ Top-level keys:
 ```yaml
 schema_version: 1
 tracker: {}
+polling: {}
 persistence: {}
 roles: {}
 agents: {}
@@ -283,6 +295,7 @@ decomposition: {}
 workspace: {}
 branching: {}
 integration: {}
+pull_requests: {}
 qa: {}
 followups: {}
 observability: {}
@@ -291,7 +304,15 @@ security: {}
 hooks: {}
 ```
 
-Unknown top-level and nested keys SHOULD be rejected. The schema should stay strict while the product is new.
+Unknown top-level and nested keys MUST be rejected. This software is new; strictness is cheaper than ambiguity.
+
+### 5.0 `schema_version`
+
+```yaml
+schema_version: 1
+```
+
+`schema_version` is optional while the project is pre-adoption. If omitted, it defaults to `1`. If present, it MUST be `1`; any other value is a validation error. Future schema changes should bump this field only when the file format needs an explicit migration. Do not create parallel numbered Rust config types for normal product evolution.
 
 ### 5.1 `tracker`
 
@@ -300,16 +321,43 @@ tracker:
   kind: github | linear
   repository: owner/repo
   project_slug: ENG
-  active_states: [Todo, In Progress]
-  terminal_states: [Done, Cancelled]
-  intake_states: [Backlog, Todo]
-  qa_states: [QA, In Review]
-  done_states: [Done]
+  state_mapping:
+    ignore: [Archived]
+    intake: [Backlog, Todo]
+    ready: [Ready]
+    running: [In Progress]
+    blocked: [Blocked]
+    integration: [Integration]
+    qa: [QA, In Review]
+    rework: [Rework]
+    review: [Review]
+    done: [Done]
+    cancelled: [Cancelled]
 ```
 
-A tracker adapter MUST support read operations. Write operations MAY be provided through a separate `TrackerMutations` capability. Workflows that require automatic child issue creation, blocker filing, state transitions, or comments MUST use an adapter with mutation capability.
+Tracker adapters MUST support read operations. Workflows that create child issues, blockers, follow-ups, state transitions, comments, or PR links MUST use mutation-capable tracker adapters.
 
-### 5.2 `persistence`
+Tracker state mapping rules:
+
+- Raw tracker state names are matched case-insensitively and normalized into `WorkItemStatusClass`.
+- A raw state MUST appear in at most one normalized class list.
+- Unknown raw states are validation errors unless `tracker.unknown_state_policy` is explicitly set to `ignore`.
+- `active` is not a configured class. It is derived as every non-terminal class that can still produce work: `intake`, `ready`, `running`, `blocked`, `integration`, `qa`, `rework`, and `review`.
+- Terminal classes are `done` and `cancelled`.
+- Startup recovery uses both active classes and recent terminal issues so stale leases/workspaces can be reconciled after tracker-side changes.
+
+### 5.2 `polling`
+
+```yaml
+polling:
+  interval_ms: 30000
+  jitter_ms: 5000
+  startup_reconcile_recent_terminal: true
+```
+
+The kernel MAY later add webhook intake, but polling remains the baseline operator-controlled cadence. `interval_ms` controls tracker polling and reconciliation cadence. `jitter_ms` prevents thundering-herd behavior when multiple kernels run.
+
+### 5.3 `persistence`
 
 ```yaml
 persistence:
@@ -318,11 +366,19 @@ persistence:
   event_log: .symphony/events.ndjson
 ```
 
-v2 requires durable run state. SQLite is the recommended local default.
+SQLite is mandatory for the local kernel. Use `rusqlite` for the first implementation: the kernel is local/single-process, transaction boundaries are explicit, and avoiding async SQL macro/offline setup keeps the execution substrate simpler. If later workloads require async pooled database access, that should be a deliberate ADR.
 
-### 5.3 `roles`
+SQLite stores orchestration truth: runs, leases, workspace claims, handoffs, QA verdicts, blocker edges, pending tracker syncs, budget pauses, and event history. The issue tracker remains the shared product/work truth and must be synced through tracker mutations.
 
-Roles are named, configurable, and workflow-owned. `platform_lead` and `qa` are recommended defaults, not hardcoded org requirements.
+### 5.4 `roles`
+
+Roles are named, configurable, and workflow-owned. `platform_lead` and `qa` are recommended defaults, not required names.
+
+Validation is by role kind, not by role name:
+
+- exactly one role with `kind: integration_owner` is required;
+- exactly one role with `kind: qa_gate` is required when `qa.required: true`;
+- specialists/reviewers/operators are workflow-defined.
 
 ```yaml
 roles:
@@ -346,7 +402,7 @@ roles:
     agent: codex_fast
 ```
 
-### 5.4 `agents`
+### 5.5 `agents`
 
 ```yaml
 agents:
@@ -361,30 +417,59 @@ agents:
     backend: claude
     command: claude -p --output-format stream-json --permission-mode bypassPermissions
     tools: [git, github, tracker]
+  codex_fast:
+    backend: codex
+    command: codex app-server
+    tools: [git, github, tracker]
+  hermes_agent:
+    backend: hermes
+    command: hermes chat --query-file - --source symphony
+    tools: [git, github, tracker]
 ```
 
-### 5.5 `routing`
+Product agent backends are limited to `codex`, `claude`, and `hermes`.
+
+`hermes` runs the Hermes Agent CLI in non-interactive mode. The first adapter should stream a rendered prompt through stdin or a temporary prompt file, run with an explicit source tag such as `symphony`, and require a structured handoff envelope in the final response. If Hermes later exposes a stable ACP/server protocol, the adapter may switch to it behind the same `backend: hermes` contract.
+
+Composite/tandem behavior is not a separate product adapter. Existing tandem code should be repackaged as an agent strategy that composes configured `codex`, `claude`, and/or `hermes` agents:
+
+```yaml
+agents:
+  lead_pair:
+    strategy: tandem
+    lead: lead_agent
+    follower: qa_agent
+    mode: draft_review | split_implement | consensus
+```
+
+Existing mock tracker/agent code survives only as deterministic test/fake machinery. It should not appear as a production `kind` in operator-facing workflow docs.
+
+### 5.6 `routing`
 
 Routing decides which role receives work.
 
 ```yaml
 routing:
   default_role: platform_lead
+  match_mode: first_match # first_match | priority
   rules:
-    - when:
+    - priority: 100
+      when:
         labels_any: [qa]
       assign_role: qa
-    - when:
+    - priority: 50
+      when:
         paths_any: [lib/**, test/**]
       assign_role: backend_engineer
-    - when:
+    - priority: 10
+      when:
         issue_size: broad
       assign_role: platform_lead
 ```
 
-Routing rules SHOULD be deterministic. If multiple rules match, workflow config MUST specify `first_match` or `priority` behavior.
+Routing rules MUST be deterministic. `match_mode: first_match` evaluates rules in file order and ignores `priority`. `match_mode: priority` picks the highest numeric `priority`; ties are validation errors.
 
-### 5.6 `decomposition`
+### 5.7 `decomposition`
 
 ```yaml
 decomposition:
@@ -401,7 +486,9 @@ decomposition:
 
 Broad issues SHOULD be decomposed before specialist execution. Decomposition output MUST include child scopes, owners/roles, dependencies, acceptance criteria, and integration strategy.
 
-### 5.7 `workspace`
+`child_issue_policy` uses the same policy enum as `followups.default_policy`. `create_directly` writes through `TrackerMutations`; `propose_for_approval` creates a durable approval item for the integration owner/human approval queue.
+
+### 5.8 `workspace`
 
 ```yaml
 workspace:
@@ -423,7 +510,9 @@ workspace:
 
 The runner MUST verify actual cwd before launching any agent. If branch policy is configured, the runner MUST verify actual git branch/ref before mutation-capable runs.
 
-### 5.8 `branching`
+Existing `Workspace`/`WorkspaceManager::ensure` should evolve into `WorkspaceClaim` and `WorkspaceManager::claim`. A claim records path, strategy, base ref, branch/ref, owner work item, verification status, and cleanup policy. The existing hook lifecycle remains, but hooks receive claim metadata rather than just a path.
+
+### 5.9 `branching`
 
 ```yaml
 branching:
@@ -434,9 +523,14 @@ branching:
   require_clean_tree_before_run: true
 ```
 
-For decomposed work, children MAY run in separate branches/worktrees and be consolidated by the integration owner, or they MAY all run on a shared integration branch if policy explicitly allows it.
+For decomposed work, children normally run in separate branches/worktrees and are consolidated by the integration owner. Same-branch child work is allowed only when both conditions are true:
 
-### 5.9 `integration`
+1. `branching.allow_same_branch_for_children: true`;
+2. the selected workspace strategy is explicitly a shared strategy such as `shared_integration`.
+
+If those disagree, validation MUST fail. The safer setting wins by rejecting the config, not by guessing.
+
+### 5.10 `integration`
 
 ```yaml
 integration:
@@ -445,6 +539,7 @@ integration:
     - decomposed_parent
     - multiple_child_branches
   merge_strategy: sequential_cherry_pick | merge_commits | shared_branch
+  conflict_policy: integration_owner_repair_turn | route_to_child_owner | block_for_human
   require_all_children_terminal: true
   require_no_open_blockers: true
   require_integration_summary: true
@@ -461,7 +556,9 @@ Integration owner responsibilities:
 - produce handoff for QA;
 - request QA only when ready.
 
-### 5.10 `pull_requests`
+Merge/cherry-pick failures follow `conflict_policy`. The default is `integration_owner_repair_turn`: the integration owner gets a repair turn in the canonical integration workspace. If that repair fails, the work item becomes blocked with conflict evidence.
+
+### 5.11 `pull_requests`
 
 ```yaml
 pull_requests:
@@ -496,7 +593,7 @@ PR lifecycle rules:
 - After QA passes, the integration owner marks the PR ready for review or hands it off according to workflow policy.
 - The tracker is updated with the PR URL/ref, and follow-up/blocker issues should link back to the PR when relevant.
 
-### 5.11 `qa`
+### 5.12 `qa`
 
 ```yaml
 qa:
@@ -507,6 +604,7 @@ qa:
   can_file_blockers: true
   can_file_followups: true
   blocker_policy: blocks_parent
+  waiver_roles: [platform_lead]
   evidence_required:
     tests: true
     changed_files_review: true
@@ -515,35 +613,45 @@ qa:
   rerun_after_blockers_resolved: true
 ```
 
-QA MUST verify acceptance criteria against the final integration branch/worktree, not only child branches. QA MAY file blockers that route back to specialists or the integration owner.
+QA MUST verify acceptance criteria against the final integration branch/worktree and draft PR when PRs are enabled, not only child branches. QA MAY file blockers that route back to specialists or the integration owner. A `waived` QA verdict is valid only when created by a role listed in `qa.waiver_roles`, and it MUST include a reason.
 
-### 5.12 `followups`
+### 5.13 `followups`
 
 ```yaml
 followups:
   enabled: true
   default_policy: create_directly | propose_for_approval
+  approval_role: platform_lead
   non_blocking_label: follow-up
   blocking_label: blocker
   require_reason: true
   require_acceptance_criteria: true
 ```
 
-### 5.13 `observability`
+A follow-up MUST include title, reason, scope, acceptance criteria, relationship to current work, and whether it blocks current completion.
+
+### 5.14 `observability`
 
 ```yaml
 observability:
-  logs: structured
+  logs:
+    format: json # json | pretty
   event_bus: true
   sse:
     enabled: true
     bind: 127.0.0.1:6280
+    replay_buffer: 1024
   tui:
     enabled: true
-  dashboard: optional
+  dashboard:
+    enabled: false
 ```
 
-### 5.14 `budgets`
+The kernel remains headless: it runs without requiring a TUI or web dashboard. TUI/dashboard surfaces are optional out-of-process operator views over durable state and/or the event stream.
+
+`status` config from the current implementation should move under `observability.sse`, preserving `bind` and `replay_buffer`.
+
+### 5.15 `budgets`
 
 ```yaml
 budgets:
@@ -551,19 +659,33 @@ budgets:
   max_cost_per_issue_usd: 10.00
   max_turns_per_run: 20
   max_retries: 3
+  pause_policy: block_work_item
 ```
 
-Budget exhaustion MUST produce a structured pause/block, not silent failure.
+Budget exhaustion MUST create a durable budget pause/block and emit a `BudgetExceeded` event. It MUST NOT silently fail or spin retries. The state store needs enough information to resume after a human/operator changes budget policy or explicitly approves continuation.
 
-### 5.15 `security`
+### 5.16 `security`
 
 ```yaml
 security:
   destructive_actions_require_approval: true
-  publish_post_purchase_require_human: true
-  network_policy: workflow-defined
+  publish_purchase_deploy_require_human: true
+  network_policy: workflow_defined
   secret_redaction: true
 ```
+
+### 5.17 `hooks`
+
+```yaml
+hooks:
+  timeout_ms: 300000
+  after_create: []
+  before_run: []
+  after_run: []
+  before_remove: []
+```
+
+Keep the current hook lifecycle and extend it to receive `WorkspaceClaim` metadata through environment variables and/or a small JSON file. Hook failures are governed by the existing phase semantics: `after_create` and `before_run` failures block launch; `after_run` and `before_remove` are best-effort unless the workflow explicitly makes them blocking.
 
 ## 6. Orchestration Flow
 
@@ -616,7 +738,7 @@ security:
 
 Any role may identify follow-up work. The workflow decides whether the issue is created immediately or proposed.
 
-A follow-up must include:
+A follow-up MUST include:
 
 - title;
 - reason;
@@ -725,7 +847,7 @@ Minimum surfaces:
 - JSON API or equivalent;
 - optional live TUI/dashboard.
 
-## 10. Migration Posture
+## 10. Product Posture
 
 Symphony-RS v2 should absorb the operating lessons learned from prior orchestration work while building directly on this codebase.
 

@@ -10,7 +10,7 @@ Read these files first, in this order:
 4. `CHECKLIST_v2.md` — executable iteration queue.
 5. Existing implementation files (`SPEC.md`, `ARCHITECTURE.md`, `PLAN.md`, `CHECKLIST.md`) as current-state context to reshape, not preserve.
 
-The goal is to shape Symphony-RS directly into a product that reliably turns issues into integrated, QA-verified changes through configurable specialist agents.
+The goal is to shape Symphony-RS directly into a product that captures the useful essence of the Paperclip workflow: specialist decomposition, single-owner integration, relentless QA, blockers, follow-ups, and durable evidence.
 
 ## North Star
 
@@ -76,9 +76,9 @@ Rules:
 - Write tests with the implementation.
 - Prefer pure domain/state tests before live adapter integration tests.
 - Keep public APIs documented.
-- Do not paper over workflow invariants in prompts when they belong in state or typed config.
+- Do not paper over workflow invariants in prompts when they belong in state or typed config. The tracker remains product/work truth; SQLite is orchestration truth and retry/recovery evidence.
 - Do not add a dependency without an ADR in `ARCHITECTURE_v2.md`.
-- Change existing behavior when the v2 product direction requires it; keep removals scoped and tested.
+- Change existing behavior when the target product direction requires it; keep removals scoped and tested. Repackage useful current code such as tandem rather than leaving it dangling.
 
 ### Step 4 — Verify
 

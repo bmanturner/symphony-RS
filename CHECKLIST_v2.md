@@ -6,24 +6,25 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Add `SPEC_v2.md`, `ARCHITECTURE_v2.md`, `PLAN_v2.md`, `CHECKLIST_v2.md`, and `PROMPT_v2.md` to the repo root.
 - [ ] Add README note that v2 files are the product direction and existing implementation docs should be updated as the code moves to that direction.
-- [ ] Add a target workflow fixture under `tests/fixtures/workflow/WORKFLOW.md` with roles, routing, integration, PR, and QA sections.
+- [ ] Rewrite existing quickstart/sample workflow fixtures to the target schema with roles, routing, polling, hooks, integration, PR, and QA sections.
 
 ## Phase 1 — Workflow Config Schema
 
-- [ ] Replace the current workflow config shape with `WorkflowConfig`; use `schema_version` only as an optional file-format guard, not as a parallel implementation type.
+- [ ] Replace the current workflow config shape with `WorkflowConfig`; validate optional `schema_version` where only `1` is accepted and unknown keys are denied.
 - [ ] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`; `custom` is a role kind, not an adapter extension point.
 - [ ] Add typed `AgentProfileConfig` decoupled from role names.
-- [ ] Add typed `RoutingConfig` and `RoutingRule` with deterministic first-match behavior.
-- [ ] Add `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, and `FollowupConfig`.
+- [ ] Add `HermesAgentConfig` command/protocol shape and repackage existing tandem support as a composite strategy over configured agents; keep mock variants test-only.
+- [ ] Add typed `RoutingConfig` and `RoutingRule` with explicit `match_mode = first_match | priority` semantics.
+- [ ] Add `PollingConfig`, `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, `FollowupConfig`, `HooksConfig`, and `ObservabilityConfig`.
 - [ ] Add `WorkspacePolicyConfig` and `BranchPolicyConfig` for worktree/shared-branch strategies.
-- [ ] Add v2 validation errors: missing integration owner role, missing QA role when QA required, unknown role/agent references, invalid max depth, invalid branch template.
+- [ ] Add validation errors: missing `kind: integration_owner`, missing `kind: qa_gate` when QA is required, unknown role/agent references, duplicate tracker state mappings, invalid max depth, invalid branch template, PR config without GitHub, and contradictory shared-branch policy.
 - [ ] Add round-trip tests for a full v2 workflow fixture.
 - [ ] Add negative tests for unknown nested keys, dangling role references, and invalid strategy combinations.
 
 ## Phase 2 — Durable State
 
-- [ ] Add `crates/symphony-state` with SQLite-backed migrations.
-- [ ] Create migrations for `work_items`, `work_item_edges`, `runs`, `workspace_claims`, `handoffs`, `qa_verdicts`, and `events`.
+- [ ] Add `crates/symphony-state` with SQLite-backed `rusqlite` migrations.
+- [ ] Create migrations for `work_items`, `work_item_edges`, `runs`, `workspace_claims`, `handoffs`, `qa_verdicts`, `events`, pending tracker syncs, and budget pauses.
 - [ ] Add repository traits for work items and runs.
 - [ ] Add append-only event repository with monotonically increasing sequence.
 - [ ] Add transaction helper for state transition + event append.
@@ -32,7 +33,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 3 — Core Domain Types
 
-- [ ] Add `WorkItem`, `WorkItemStatusClass`, and `WorkItemId` to `symphony-core`.
+- [ ] Add `WorkItem`, `WorkItemStatusClass`, and `WorkItemId` to `symphony-core`, including tracker-state-to-status-class mapping and case-insensitive raw state handling.
 - [ ] Add `RoleKind`, `RoleContext`, and role authority flags.
 - [ ] Add `Blocker`, `BlockerStatus`, and blocker edge invariants.
 - [ ] Add `Handoff` and `ReadyFor` structured output type.
@@ -43,7 +44,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 4 — Tracker Capabilities
 
-- [ ] Split current `IssueTracker` into `TrackerRead` and `TrackerMutations` traits.
+- [ ] Split current `IssueTracker` into `TrackerRead` and `TrackerMutations` traits, preserving `fetch_terminal_recent` recovery semantics.
 - [ ] Add `TrackerCapabilities` so workflows can detect read-only vs mutation-capable adapters.
 - [ ] Add mutation request/response types: create issue, update issue, add comment, add blocker, link parent/child, attach artifact.
 - [ ] Implement mutation no-op/advisory wrapper for read-only trackers.
@@ -64,7 +65,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 6 — Workspace and Branch Claims
 
-- [ ] Replace path-only workspace return with `WorkspaceClaim` containing path, strategy, base ref, branch, and verification report.
+- [ ] Replace `WorkspaceManager::ensure` / path-only workspace return with `WorkspaceClaim` containing path, strategy, base ref, branch, owner, cleanup policy, and verification report.
 - [ ] Add `git_worktree` strategy with branch template expansion using the git adapter.
 - [ ] Add `existing_worktree` strategy with required branch verification.
 - [ ] Add shared integration branch strategy for explicit same-branch workflows.
@@ -75,9 +76,9 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 7 — Structured Agent Handoffs
 
-- [ ] Define agent output schema for handoffs, blockers, follow-ups, and verdict requests.
+- [ ] Define agent output schema for handoffs, blockers, follow-ups, verdict requests, and `ready_for` queue consequences.
 - [ ] Update prompt rendering to include role context, workspace claim, parent/child context, blockers, acceptance criteria, and output schema.
-- [ ] Replace tiny string substitution with strict template engine or structured renderer that fails on unknown variables.
+- [ ] Replace tiny string substitution with the strict built-in `{{path.to.value}}` renderer that fails on unknown variables.
 - [ ] Add malformed-handoff handling: fail run or request repair turn by policy.
 - [ ] Persist handoffs and expose them in `symphony status`.
 - [ ] Add tests for handoff parsing and repair/failure behavior.
@@ -86,11 +87,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Add integration queue fed by completed child issues or broad issues requiring consolidation.
 - [ ] Implement integration-owner run request with child handoffs and branch/workspace claims.
-- [ ] Add integration record persistence.
-- [ ] Add git integration operation abstraction: merge/cherry-pick/shared-branch verification.
+- [ ] Add integration record and pull request record persistence.
+- [ ] Add git integration operation abstraction in `symphony-workspace` using the git CLI: merge/cherry-pick/shared-branch verification and push.
 - [ ] Add gate requiring all child issues terminal before integration unless explicitly waived.
 - [ ] Add gate requiring no open blockers before draft PR creation and QA request.
-- [ ] Add tests for child completion, blocker prevention, draft PR creation, successful integration handoff, and conflict/rework path.
+- [ ] Add tests for child completion, blocker prevention, draft PR creation, successful integration handoff, merge conflict repair, and conflict/block path.
 
 ## Phase 9 — QA Gate Flow
 
@@ -98,7 +99,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Implement QA run request with draft PR ref, final branch/workspace, acceptance trace, changed files, CI/check status, and prior handoffs.
 - [ ] Add QA verdict persistence.
 - [ ] Add blocker creation from QA verdict when failures are found.
-- [ ] Add policy: QA blockers block parent completion by default.
+- [ ] Add policy: QA blockers block parent completion by default; QA waivers require a configured waiver role and reason.
 - [ ] Add rework routing after QA failure.
 - [ ] Add tests for QA pass, QA fail with blockers, inconclusive verdict, and waiver policy.
 
@@ -106,35 +107,35 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Add follow-up issue proposal/creation API in core.
 - [ ] Allow all roles to emit follow-up requests in structured handoff.
-- [ ] Apply workflow policy: create directly vs propose for approval.
+- [ ] Apply shared workflow policy enum: `create_directly` vs `propose_for_approval`, routed to the follow-up approval queue when approval is required.
 - [ ] Link follow-ups to source work item.
 - [ ] Distinguish blocking follow-ups from non-blocking follow-ups.
 - [ ] Add tests for specialist, integration-owner, and QA follow-up creation.
 
 ## Phase 11 — Scheduler v2
 
-- [ ] Replace single flat poll loop with logical queues: intake, specialist, integration, QA, follow-up approval, recovery.
+- [ ] Replace single flat poll loop with logical queues: intake, specialist, integration, QA, follow-up approval, budget pause, recovery; keep cadence under `polling.interval_ms`.
 - [ ] Add durable leases for running work.
 - [ ] Add lease heartbeat and expiration handling.
 - [ ] Add global/role/agent/repository concurrency limits.
-- [ ] Add retry policy with max retries and budget awareness.
+- [ ] Add retry policy with max retries, budget awareness, durable budget pauses, and `BudgetExceeded` events.
 - [ ] Add cancellation path that records durable run status.
 - [ ] Add recovery command that reconciles leases, workspaces, tracker state, and runs.
 
 ## Phase 12 — Observability and Operator Surfaces
 
-- [ ] Extend event model to `OrchestratorEventV2` covering work item, run, blocker, integration, QA, follow-up, and budget events.
+- [ ] Extend existing `OrchestratorEvent` in place to cover work item, run, blocker, integration, PR, QA, follow-up, and budget events.
 - [ ] Persist every event before broadcasting.
 - [ ] Update `symphony status` to read durable state, not only tracker snapshot.
 - [ ] Add `symphony issue graph <id>` for parent/child/blocker graph.
 - [ ] Add `symphony qa verdict <id>` for QA evidence.
 - [ ] Add JSON output mode for status commands.
-- [ ] Add optional SSE stream from durable event tail.
+- [ ] Move current `status` config under `observability.sse`, preserving bind and replay buffer, and stream from the durable event tail.
 - [ ] Add TUI panels for queues, blockers, QA, integration branch, and runs.
 
 ## Phase 13 — End-to-End Scenarios
 
-- [ ] Add deterministic test scenario: broad parent decomposes into two child specialist issues, integrates, passes QA, closes parent.
+- [ ] Add deterministic fake test scenario: broad parent decomposes into two child specialist issues, integrates, opens draft PR, passes QA, marks PR ready, closes parent.
 - [ ] Add deterministic test scenario: QA files blocker, blocker routes to specialist, integration reruns, QA passes.
 - [ ] Add deterministic test scenario: specialist files non-blocking follow-up while current work proceeds.
 - [ ] Add deterministic test scenario: dirty/wrong branch blocks agent launch.
@@ -147,5 +148,5 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Write `docs/roles.md` explaining integration owner, QA gate, and configurable specialists.
 - [ ] Write `docs/workspaces.md` explaining worktree/shared-branch policies.
 - [ ] Write `docs/qa.md` explaining verdicts, blockers, evidence, and waivers.
-- [ ] Write upgrade note explaining how existing implementation docs/code are being reshaped into v2 orchestration workflow.
+- [ ] Write upgrade note: rewrite current fixtures, fold current v1 docs into target docs, repackage tandem as a composite strategy, keep mock code test-only, and retire dangling old checklist items.
 - [ ] Add quickstart fixture and README walkthrough for v2 workflow.

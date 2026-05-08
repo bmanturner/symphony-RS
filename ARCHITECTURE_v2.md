@@ -107,6 +107,7 @@ Add typed workflow config:
 - `WorkspacePolicyConfig`;
 - `BranchPolicyConfig`;
 - `IntegrationConfig`;
+- `PullRequestConfig`;
 - `QaConfig`;
 - `FollowupConfig`;
 - `PersistenceConfig`;
@@ -141,7 +142,7 @@ Core owns pure state transitions and invariants. It should not call git, GitHub,
 
 Add a new crate for durable persistence.
 
-Recommended default: SQLite via `sqlx` or `rusqlite`.
+Required local default: SQLite via `rusqlite`. Use explicit transactions and keep the first persistence layer local/single-process. A move to `sqlx` or another database requires an ADR.
 
 The state crate owns:
 
@@ -156,7 +157,7 @@ Rationale: v2 cannot rely on in-memory scheduler state. Runs, blockers, handoffs
 
 ### 4.4 `symphony-tracker`
 
-Split read and mutation traits:
+Split read and mutation traits while preserving required recovery semantics from the current tracker trait:
 
 ```rust
 #[async_trait]
@@ -164,6 +165,7 @@ pub trait TrackerRead {
     async fn fetch_candidates(&self, query: CandidateQuery) -> Result<Vec<Issue>>;
     async fn fetch_issue(&self, id: &IssueId) -> Result<Option<Issue>>;
     async fn fetch_related(&self, id: &IssueId) -> Result<IssueRelations>;
+    async fn fetch_recent_terminal(&self, query: RecentTerminalQuery) -> Result<Vec<Issue>>;
 }
 
 #[async_trait]
@@ -177,11 +179,11 @@ pub trait TrackerMutations {
 }
 ```
 
-If an adapter only supports read, the workflow can still run in advisory mode but cannot autonomously file blockers/follow-ups.
+If an adapter only supports read, the workflow can still run in advisory mode but cannot autonomously file blockers/follow-ups. Existing `fetch_active`, `fetch_state`, and `fetch_terminal_recent` map to `fetch_candidates`, `fetch_issue`, and `fetch_recent_terminal`; do not drop terminal-recent recovery behavior.
 
 ### 4.5 `symphony-agent`
 
-Keep agent adapters limited to Codex, Claude, and Hermes, but move from generic prompt-only execution to structured run requests:
+Keep product agent adapters limited to Codex, Claude, and Hermes. Repackage existing tandem code as a composite strategy over those adapters, and keep mock implementations as test-only fakes. Move from generic prompt-only execution to structured run requests:
 
 ```rust
 pub struct AgentRunRequest {
@@ -198,7 +200,7 @@ All agents should return a structured handoff envelope. Free-form transcript rem
 
 ### 4.6 `symphony-workspace`
 
-Evolve from `LocalFsWorkspace` into policy-driven workspace management:
+Evolve existing `Workspace`/`WorkspaceManager::ensure` into policy-driven `WorkspaceClaim` management:
 
 - `directory` strategy;
 - `git_worktree` strategy;
@@ -216,6 +218,8 @@ pub trait GitProvider {
     async fn push_branch(&self, req: PushBranchRequest) -> Result<PushedBranchRef>;
 }
 ```
+
+Implement this in `symphony-workspace` first using the git CLI; do not add `git2`/`gix` until a concrete need appears. Extract `crates/symphony-git` only if the module grows beyond workspace concerns.
 
 ### 4.7 `symphony-cli`
 
@@ -322,15 +326,26 @@ Append-only event log:
 - `payload` JSON;
 - `created_at`.
 
+### 5.8 `budget_pauses`
+
+- `id`;
+- `work_item_id`;
+- `budget_kind`;
+- `limit`;
+- `observed`;
+- `status`;
+- `created_at`;
+- `resolved_at`.
+
 ## 6. State Machines
 
 ### 6.1 Work item state classes
 
 ```text
 intake -> ready -> running -> integration -> qa -> review -> done
-                  |            |          |      |
-                  v            v          v      v
-                blocked      rework     blocked rework
+   |              |            |          |      |      |
+   v              v            v          v      v      v
+cancelled      blocked      rework     blocked rework cancelled
 ```
 
 Transitions are workflow-policy constrained.
@@ -352,13 +367,13 @@ qa_ready -> qa_running -> qa_passed -> review/done
                     \-> qa_failed -> blockers/rework -> integration/ready
 ```
 
-QA failure must produce either blockers, rework instructions, or an inconclusive verdict with reason.
+QA failure MUST produce either blockers, rework instructions, or an inconclusive verdict with reason. `Handoff.ready_for` never skips required downstream gates; it only selects the next eligible queue after policy checks.
 
 ## 7. Scheduler Architecture
 
 ### 7.1 Queues
 
-Use logical queues rather than one flat poll loop:
+Use logical queues rather than one flat poll loop. Poll cadence comes from `polling.interval_ms`; webhook intake may enqueue work immediately but does not remove polling/reconciliation:
 
 - intake/decomposition queue;
 - specialist execution queue;
@@ -394,6 +409,8 @@ Concurrency limits apply at multiple levels:
 Integration-owner roles should default to low concurrency, often `1`, because split-brain integration is worse than slow integration.
 
 ## 8. Prompt and Tool Contract
+
+Prompt templates use a strict built-in `{{path.to.value}}` renderer. Unknown variables are validation errors. No loops or arbitrary code in the first implementation; richer rendering requires an ADR.
 
 Agents receive:
 
@@ -465,7 +482,7 @@ QA must not sign off solely from implementation summaries unless workflow explic
 
 ## 12. Observability Architecture
 
-Emit `OrchestratorEventV2` for:
+Extend the existing `OrchestratorEvent` in place for:
 
 - work item created/updated;
 - role assignment;

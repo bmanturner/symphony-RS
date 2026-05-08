@@ -26,7 +26,7 @@ Success bar: a full v2 fixture validates and negative fixtures fail loudly.
 
 ### Phase 2 — Durable State
 
-Introduce persistent state for work items, runs, edges, handoffs, QA verdicts, workspace claims, and events.
+Introduce `rusqlite`-backed persistent state for work items, runs, edges, handoffs, QA verdicts, workspace claims, pending tracker syncs, budget pauses, and events.
 
 Success bar: a deterministic fake run survives process restart with enough state to recover safely.
 
@@ -38,13 +38,13 @@ Success bar: pure unit tests cover state invariants before scheduler code uses t
 
 ### Phase 4 — Tracker Capabilities
 
-Split tracker reads from mutations. Add capability detection. Mutation-capable adapters can create issues, comments, blockers, parent/child links, and artifacts.
+Split tracker reads from mutations while preserving terminal-recent recovery. Add capability detection. Mutation-capable adapters can create issues, comments, blockers, parent/child links, PR links, and artifacts.
 
 Success bar: workflows can declare whether direct blocker/follow-up creation is allowed or advisory-only.
 
 ### Phase 5 — Routing and Decomposition
 
-Implement role routing and integration-owner decomposition. Broad issues become child issues with owners, acceptance criteria, and dependencies.
+Implement deterministic role routing and integration-owner decomposition. Broad issues become child issues with owners, acceptance criteria, dependencies, and explicit approval policy for child creation.
 
 Success bar: parent completion is impossible while child work remains incomplete.
 
@@ -56,7 +56,7 @@ Success bar: the runner refuses to launch in the wrong cwd, wrong branch, dirty 
 
 ### Phase 7 — Structured Agent Handoffs
 
-Agents stop returning only free-form text. Every run produces a structured handoff with changed files, tests, evidence, risks, blockers, follow-ups, and readiness.
+Agents stop returning only free-form text. Every run produces a structured handoff with changed files, tests, evidence, risks, blockers, follow-ups, and `ready_for` guidance that the kernel validates against gates.
 
 Success bar: malformed output is caught and either repaired or failed.
 
@@ -94,7 +94,7 @@ Success bar: an operator can answer “what is blocked, who owns it, what branch
 
 Use deterministic fake trackers/agents to test the whole product loop before relying on live GitHub, Linear, Codex, Claude, or Hermes.
 
-Success bar: broad issue -> decomposition -> child execution -> integration -> QA failure -> blocker -> rework -> QA pass is covered by an automated test.
+Success bar: broad issue -> decomposition -> child execution -> integration -> draft PR -> QA failure -> blocker -> rework -> QA pass -> PR ready is covered by an automated test.
 
 ### Phase 14 — Documentation and Productization
 
@@ -117,10 +117,9 @@ Document workflow schema, role semantics, workspace policy, PR lifecycle, QA pro
 - Move current in-memory scheduler state behind a durable state abstraction.
 - Promote `LocalFsWorkspace` return values into `WorkspaceClaim`.
 - Reconcile retry queue comments/checklist with actual production wiring.
+- Fold old checklist remnants into target docs: TUI tandem panel becomes composite-agent observability, old fixtures are rewritten, and old v1 planning docs are superseded rather than maintained in parallel.
 
 ## Open Questions
 
-1. Persistence crate choice: `sqlx` vs `rusqlite`.
-2. Whether tracker mutations should be direct adapter methods or exposed as agent tools plus audited orchestrator wrappers.
-3. Whether GitHub PR operations should live in the GitHub tracker adapter or a separate GitHub repository adapter. Git branch operations belong in the git adapter.
-4. How much of the live dashboard should ship before the durable CLI status is excellent.
+1. Whether tracker mutations should be direct adapter methods or exposed as agent tools plus audited orchestrator wrappers.
+2. How much of the live dashboard should ship before the durable CLI status is excellent.
