@@ -88,13 +88,15 @@ tempfile = "3"
 # Test-only: tokio-test for #[tokio::test] runtimes, wiremock for HTTP
 # fakes (Linear), rstest for parameterized tests, insta for snapshot tests
 # of normalized AgentEvent streams, assert_cmd + predicates for CLI smoke
-# tests.
+# tests, proptest for invariant-style coverage of pure helpers
+# (workspace path sanitization, orchestrator state machine).
 tokio-test = "0.4"
 wiremock = "0.6"
 rstest = "0.26"
 insta = { version = "1", features = ["yaml", "json"] }
 assert_cmd = "2"
 predicates = "3"
+proptest = "1"
 
 [profile.dev]
 # Faster incremental rebuilds during the loop.

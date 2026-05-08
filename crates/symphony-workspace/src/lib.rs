@@ -33,6 +33,36 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::fs;
 
+/// Replace every character that is not in `[A-Za-z0-9._-]` with `_`.
+///
+/// This is the SPEC §4.2 / §9.5 "filesystem-safe identifier" rule. The
+/// orchestrator hands the manager whatever identifier the tracker produced
+/// (Linear keys like `ENG-42`, GitHub identifiers like `octo/repo#7`,
+/// hypothetical Jira keys with slashes) and the manager has to land that
+/// somewhere on disk. Sanitisation lives here, in one named function, so
+/// every adapter shares the same rule and the property tests cover it
+/// exactly once.
+///
+/// Replacement is char-by-char (not byte-by-byte): a single multi-byte
+/// codepoint becomes a single `_`, preserving the visible-length of the
+/// caller's identifier. Idempotent — `sanitize(sanitize(x)) == sanitize(x)`
+/// because every produced char is already in the allowlist.
+///
+/// Containment of the resulting path inside the workspace root is the
+/// *next* checklist item; this function is intentionally narrow. The dot
+/// is in the allowlist (so `0.1.2` survives unchanged), which means
+/// inputs like `..`, `.`, or the empty string pass through here and must
+/// be rejected by the containment check that lands next.
+pub fn sanitize_identifier(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
 /// Errors a [`WorkspaceManager`] can report.
 ///
 /// Mirrors the structure of `TrackerError` in `symphony-core`: a small,
@@ -150,10 +180,11 @@ impl LocalFsWorkspace {
 #[async_trait]
 impl WorkspaceManager for LocalFsWorkspace {
     async fn ensure(&self, identifier: &str) -> WorkspaceResult<Workspace> {
-        // Naive join for now. Sanitization (replace [^A-Za-z0-9._-] with
-        // `_`) and containment validation (path must remain rooted at
-        // `self.root`) are the next two checklist items.
-        let path = self.root.join(identifier);
+        // Sanitise per SPEC §4.2 before joining. Containment validation
+        // (path must canonicalise inside `self.root`, no `..` smuggling)
+        // is the next checklist item.
+        let safe = sanitize_identifier(identifier);
+        let path = self.root.join(&safe);
 
         // `try_exists` distinguishes "does not exist" from "I cannot
         // tell" (e.g. permission denied on the parent). The latter is an
@@ -175,7 +206,9 @@ impl WorkspaceManager for LocalFsWorkspace {
     }
 
     async fn release(&self, identifier: &str) -> WorkspaceResult<()> {
-        let path = self.root.join(identifier);
+        // Apply the same sanitisation as `ensure` so a release call uses
+        // the same on-disk path the ensure call materialised.
+        let path = self.root.join(sanitize_identifier(identifier));
         match fs::remove_dir_all(&path).await {
             Ok(()) => Ok(()),
             // Missing is fine — release is an assertion of absence, not a
@@ -257,6 +290,168 @@ mod tests {
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
         mgr.release("never-existed").await.unwrap();
+    }
+
+    /// Identifiers built only from the allowlist are returned verbatim:
+    /// the rule must not mangle inputs the trackers already produce
+    /// (`ENG-42`, `gh-org_repo-7`, `0.1.2`).
+    #[test]
+    fn sanitize_passes_allowlisted_chars_through() {
+        for id in [
+            "ENG-42",
+            "gh-org_repo-7",
+            "0.1.2",
+            "ABC.def_GHI-123",
+            "_",
+            ".",
+            "-",
+        ] {
+            assert_eq!(sanitize_identifier(id), id, "input: {id:?}");
+        }
+    }
+
+    /// Every disallowed character — slashes, spaces, NULs, glob meta-
+    /// characters, control bytes — collapses to `_`. This is the table
+    /// of cases the property tests would otherwise generate by random
+    /// search; pinning them as a named test makes regressions obvious.
+    #[test]
+    fn sanitize_replaces_disallowed_chars_with_underscore() {
+        let cases = [
+            ("a/b", "a_b"),
+            // `.` is allowlisted (so `0.1.2` survives), therefore `..`
+            // passes through verbatim. Rejecting `..` is the next
+            // checklist item's containment check, not this rule's job.
+            ("..", ".."),
+            ("a b", "a_b"),
+            ("a\0b", "a_b"),
+            ("a\nb", "a_b"),
+            ("a:b", "a_b"),
+            ("a*b?", "a_b_"),
+            ("foo bar/baz", "foo_bar_baz"),
+            // Non-ASCII codepoints are replaced char-by-char (one
+            // codepoint → one `_`), not byte-by-byte.
+            ("π", "_"),
+            ("café", "caf_"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                sanitize_identifier(input),
+                want,
+                "input: {input:?} → expected {want:?}",
+            );
+        }
+    }
+
+    /// `ensure` must safely accept hostile-looking identifiers: the on-
+    /// disk path stays a *child* of `root`. The next checklist item adds
+    /// a stronger containment check (canonicalisation against the root);
+    /// at this layer the guarantee is "every disallowed char is `_`,
+    /// therefore no path separator survives".
+    #[tokio::test]
+    async fn ensure_sanitises_path_traversal_attempts() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let ws = mgr.ensure("../etc/passwd").await.unwrap();
+
+        // Sanitisation maps each disallowed char (`.`, `.`, `/`, …) — but
+        // `.` is *allowed*, so only the `/` chars become `_`. The result
+        // is `..` becoming literal `..` then `_etc_passwd`. We assert two
+        // properties separately:
+        //   1. the produced path component contains no path separator,
+        //   2. the resulting path is a direct child of `root` (one extra
+        //      component, no `..` segments).
+        let component = ws.path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(component, ".._etc_passwd");
+        assert_eq!(
+            ws.path.parent().unwrap(),
+            mgr.root(),
+            "sanitised id must land directly under root, not nested",
+        );
+        assert!(ws.path.starts_with(mgr.root()));
+    }
+
+    /// `release` must use the same sanitisation as `ensure` — otherwise
+    /// the orchestrator could materialise a workspace and then fail to
+    /// remove it because it computed a different on-disk name.
+    #[tokio::test]
+    async fn release_uses_same_sanitisation_as_ensure() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let ws = mgr.ensure("ORG/repo#7").await.unwrap();
+        assert!(ws.path.is_dir());
+        assert_eq!(ws.path.file_name().unwrap(), "ORG_repo_7");
+
+        mgr.release("ORG/repo#7").await.unwrap();
+        assert!(!ws.path.exists(), "release must remove what ensure created");
+    }
+
+    // ----- property tests --------------------------------------------------
+    //
+    // We use `proptest` for invariants of the pure sanitiser. These cover
+    // the corners random fuzzing surfaces that an enumerated table cannot
+    // (combining marks, surrogate-adjacent codepoints, mixed-script
+    // identifiers, runs of disallowed bytes).
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Output may only contain characters from the allowlist.
+        #[test]
+        fn prop_output_only_allowlisted_chars(input in any::<String>()) {
+            let out = sanitize_identifier(&input);
+            for c in out.chars() {
+                prop_assert!(
+                    matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-'),
+                    "char {:?} not in allowlist (input: {:?}, output: {:?})",
+                    c, input, out,
+                );
+            }
+        }
+
+        /// Sanitisation is idempotent: a second pass changes nothing.
+        /// This is what makes it safe to apply at every entry point —
+        /// composing `ensure(sanitize(id))` with the manager's own
+        /// internal sanitisation is a no-op.
+        #[test]
+        fn prop_sanitize_is_idempotent(input in any::<String>()) {
+            let once = sanitize_identifier(&input);
+            let twice = sanitize_identifier(&once);
+            prop_assert_eq!(once, twice);
+        }
+
+        /// Char count is preserved (1:1 char replacement). This lets us
+        /// reason about visible-length bounds when the orchestrator logs
+        /// or displays the sanitised identifier.
+        #[test]
+        fn prop_sanitize_preserves_char_count(input in any::<String>()) {
+            let out = sanitize_identifier(&input);
+            prop_assert_eq!(input.chars().count(), out.chars().count());
+        }
+
+        /// Inputs already in the allowlist are returned verbatim. The
+        /// orchestrator depends on this so well-formed tracker IDs
+        /// (`ENG-42`, `0.1.2`) never get mangled by passing through a
+        /// safety helper.
+        #[test]
+        fn prop_allowlisted_inputs_are_unchanged(
+            input in proptest::string::string_regex("[A-Za-z0-9._-]{0,32}").unwrap()
+        ) {
+            prop_assert_eq!(input.clone(), sanitize_identifier(&input));
+        }
+
+        /// No path-separator survives, regardless of platform: the
+        /// sanitised name must be a *single* path component. This is
+        /// the workspace-safety property that lets the next checklist
+        /// item layer a containment check on top — the path can grow
+        /// at most by one component beyond `root`.
+        #[test]
+        fn prop_output_has_no_path_separator(input in any::<String>()) {
+            let out = sanitize_identifier(&input);
+            prop_assert!(!out.contains('/'));
+            prop_assert!(!out.contains('\\'));
+        }
     }
 
     /// The orchestrator stores managers as `Arc<dyn WorkspaceManager>`,

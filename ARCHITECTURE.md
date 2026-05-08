@@ -248,6 +248,28 @@ enough to trip clippy's `result_large_err` lint otherwise. Tests use
 `figment::Jail` (gated behind figment's `test` feature, enabled as a
 dev-dependency only) so env mutations are process-isolated.
 
+### 2026-05-08 — `proptest` for invariant coverage
+**Context.** The workspace identifier sanitiser is a pure function with
+a small set of structural properties (allowlist closure, idempotence,
+char-count preservation, no path-separator survives). Enumerated tests
+catch the cases we name; the corner cases — combining marks, mixed-
+script identifiers, runs of disallowed bytes — are exactly what random
+property coverage finds. Phase 5's orchestrator state machine has the
+same shape: pure transitions whose invariants are easier to express as
+properties than as exhaustive tables. The bootstrap CLAUDE.md flagged
+proptest as a "add when you reach Phase 5" dep; Phase 3's sanitiser
+needs it first.
+
+**Decision.** Add `proptest` (v1) to the workspace crate budget,
+test-only. Used today by `symphony-workspace` for the four sanitiser
+invariants; will be used by `symphony-core` in Phase 5 for the state
+machine.
+
+**Consequence.** One additional dev-dependency tree. Property failures
+include a minimal shrunk counter-example, which is the affordance we
+want when an adapter contributor adds an exotic identifier scheme. No
+production code path depends on proptest.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line
@@ -276,3 +298,6 @@ justifications follow. Anything added beyond this list requires a new ADR.
 - **tempfile** — throwaway workspaces in tests.
 - **tokio-test / wiremock / rstest / insta / assert_cmd / predicates** —
   test-only.
+- **proptest** — test-only; invariant coverage for pure helpers
+  (workspace path sanitisation today, orchestrator state machine in
+  Phase 5). See ADR `2026-05-08 — proptest for invariant coverage`.
