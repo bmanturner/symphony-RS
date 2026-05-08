@@ -40,10 +40,11 @@
 //! defined in this file. [`TandemStrategy::DraftReview`] is sequential
 //! (lead drafts, then follower reviews) and is implemented in the
 //! private `draft_review` submodule. [`TandemStrategy::SplitImplement`]
-//! currently falls through to the baseline pending its own checklist
-//! item.
+//! is also sequential (lead plans, then follower executes claimed
+//! subtasks via tool-use) and lives in the `split_implement` submodule.
 
 mod draft_review;
+mod split_implement;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -146,13 +147,19 @@ impl TandemRunner {
 #[async_trait]
 impl AgentRunner for TandemRunner {
     async fn start_session(&self, params: StartSessionParams) -> AgentResult<AgentSession> {
-        // Strategy-specific dispatch. Draft-review is sequential (lead
-        // first, follower reviews after) and lives in its own module.
-        // Consensus and split-implement currently share the parallel
-        // poll-merge baseline below; split-implement gets its own commit
-        // once the orchestrator-side subtask routing lands.
-        if matches!(self.strategy, TandemStrategy::DraftReview) {
-            return draft_review::start(self.lead.clone(), self.follower.clone(), params).await;
+        // Strategy-specific dispatch. Draft-review and split-implement
+        // are sequential (lead first, follower second) and each live in
+        // their own submodule. Consensus uses the parallel poll-merge
+        // baseline below.
+        match self.strategy {
+            TandemStrategy::DraftReview => {
+                return draft_review::start(self.lead.clone(), self.follower.clone(), params).await;
+            }
+            TandemStrategy::SplitImplement => {
+                return split_implement::start(self.lead.clone(), self.follower.clone(), params)
+                    .await;
+            }
+            TandemStrategy::Consensus => {}
         }
 
         // Lead first so a follower-launch failure can clean up by aborting

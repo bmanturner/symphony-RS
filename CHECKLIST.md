@@ -121,7 +121,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] `TandemRunner` wrapping two inner `AgentRunner`s with strategy enum
 - [x] `draft-review` strategy: lead drafts, follower reviews, orchestrator
       decides accept-or-rerun [TandemRunner]
-- [ ] `split-implement` strategy: lead plans, follower executes claimed
+- [x] `split-implement` strategy: lead plans, follower executes claimed
       subtasks via tool-use [TandemRunner]
 - [ ] `consensus` strategy: both run, pick the output with greater
       test-pass delta [TandemRunner]
