@@ -113,7 +113,7 @@ under their phase header and are added or refined as the project evolves.
       [state machine]
 - [x] Retry queue with exponential backoff (cap from config) [state
       machine]
-- [ ] Reconciliation pass each tick (drop runs whose issue left active
+- [x] Reconciliation pass each tick (drop runs whose issue left active
       states) [poll loop]
 
 ## Phase 6 — Tandem mode

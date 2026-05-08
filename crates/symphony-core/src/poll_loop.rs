@@ -12,15 +12,29 @@
 //!    avoid lockstep behaviour across multiple Symphony deployments
 //!    polling the same tracker (SPEC §16.2).
 //!
+//! ## Reconciliation
+//!
+//! On every tick — *before* claiming new issues — the loop diffs the
+//! current claim ledger against the freshly-fetched `active_set`. Any
+//! issue still claimed but absent from the active set has, per SPEC §7,
+//! "left active states" since the previous tick (closed, archived,
+//! moved to a non-active status, or deleted). The loop reacts by:
+//!
+//! 1. Stamping a [`ReleaseReason::NoLongerActive`] override onto that
+//!    dispatch's bookkeeping handle.
+//! 2. Firing the per-dispatch [`CancellationToken`] so the in-flight
+//!    `Dispatcher::dispatch` future tears down promptly.
+//!
+//! The dispatch task still resolves to whatever [`ReleaseReason`] the
+//! dispatcher returned (typically `Canceled`), but on reap the loop
+//! prefers the override — preserving the *cause* (the issue went
+//! inactive) rather than the *proximate effect* (we cancelled).
+//!
 //! ## What this module deliberately does NOT do
 //!
 //! - **Retry queue.** A failed dispatch is released as
 //!   [`ReleaseReason::Completed`] in this iteration. Exponential-backoff
 //!   retries land in their own checklist item.
-//! - **Reconciliation.** Issues that leave `active_states` mid-flight
-//!   are not yet detected. The reconciliation pass lands in its own
-//!   checklist item and will plug into [`PollLoop::tick`] without
-//!   reshaping the public API.
 //! - **Agent dispatch protocol.** The [`Dispatcher`] trait is
 //!   intentionally minimal — `dispatch(issue) -> ReleaseReason` — so
 //!   this module can be tested without pulling in the agent-runner or
@@ -37,6 +51,7 @@
 //! release. This keeps the single-authority invariant from SPEC §7
 //! mechanically true: only the loop ever mutates the claim ledger.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -109,7 +124,7 @@ impl PollLoopConfig {
 /// The fields are deliberately small integers rather than `Vec<...>`
 /// so callers (today: tests; tomorrow: the Phase-8 event bus) can log
 /// or assert on them cheaply without snapshotting issue payloads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
     /// Issues newly claimed this tick.
     pub claimed: usize,
@@ -119,6 +134,29 @@ pub struct TickReport {
     pub observed: usize,
     /// Issues skipped because the concurrency cap was already reached.
     pub deferred_capacity: usize,
+    /// Claims that left the active set this tick. Their dispatches were
+    /// cancelled and will be reaped on a subsequent tick (or in the
+    /// `run` drain) with [`ReleaseReason::NoLongerActive`].
+    pub reconciled: usize,
+    /// Release reasons recorded this tick, in reap order. Lets callers
+    /// (tests today; the Phase-8 event bus tomorrow) observe the
+    /// reconciliation override without re-hooking the dispatcher.
+    pub release_reasons: Vec<(IssueId, ReleaseReason)>,
+}
+
+/// Per-issue bookkeeping for an in-flight dispatch.
+///
+/// Lets the loop signal cancellation to a specific dispatch task and
+/// override the [`ReleaseReason`] that will eventually be recorded —
+/// reconciliation needs the latter so the ledger reflects *why* a claim
+/// ended (the issue went inactive) rather than *how* (we cancelled).
+struct DispatchHandle {
+    /// Child cancellation token threaded into the dispatcher future.
+    cancel: CancellationToken,
+    /// If `Some`, the loop will use this reason instead of the one the
+    /// dispatcher returned when reaping the task. Set by the
+    /// reconciliation pass; left `None` for a normal completion.
+    override_reason: Option<ReleaseReason>,
 }
 
 /// The orchestrator's poll loop.
@@ -133,6 +171,11 @@ pub struct PollLoop {
     config: PollLoopConfig,
     state: StateMachine,
     in_flight: JoinSet<(IssueId, ReleaseReason)>,
+    /// Per-issue dispatch bookkeeping. Keyed identically to the
+    /// [`StateMachine`] claim ledger; entries are inserted on dispatch
+    /// and removed on reap. Lets reconciliation cancel a specific run
+    /// and override its release reason.
+    handles: HashMap<IssueId, DispatchHandle>,
     /// Monotonic counter used to derive jitter without pulling in a
     /// random-number generator. See `jittered_sleep_for`.
     tick_seq: u64,
@@ -151,6 +194,7 @@ impl PollLoop {
             config,
             state: StateMachine::new(),
             in_flight: JoinSet::new(),
+            handles: HashMap::new(),
             tick_seq: 0,
         }
     }
@@ -177,15 +221,44 @@ impl PollLoop {
         //    concurrency budget reflects the freshest possible state.
         // 2. Ask the tracker. The loop survives transport hiccups —
         //    return the error to the caller (which logs and continues).
-        let released = self.reap_finished();
+        let release_reasons = self.reap_finished();
+        let released = release_reasons.len();
         let active = self.tracker.fetch_active().await?;
+
+        // 3. Reconciliation: any claim whose issue is no longer in
+        //    `active` should be torn down. We mark the override first
+        //    (so the eventual reap records `NoLongerActive`) and then
+        //    fire the cancel token. The dispatch task may resolve this
+        //    tick or a later one; either way the ledger entry stays
+        //    around until the spawned future returns.
+        let active_ids: HashSet<&IssueId> = active.iter().map(|i| &i.id).collect();
+        let mut reconciled = 0usize;
+        let stale: Vec<IssueId> = self
+            .handles
+            .keys()
+            .filter(|id| !active_ids.contains(*id))
+            .cloned()
+            .collect();
+        for id in &stale {
+            if let Some(handle) = self.handles.get_mut(id)
+                && handle.override_reason.is_none()
+            {
+                handle.override_reason = Some(ReleaseReason::NoLongerActive);
+                handle.cancel.cancel();
+                reconciled += 1;
+                debug!(issue = %id, "reconciliation: issue left active set; cancelling dispatch");
+            }
+        }
+
         let mut report = TickReport {
             released,
             observed: active.len(),
+            reconciled,
+            release_reasons,
             ..TickReport::default()
         };
 
-        // 3. Claim and dispatch up to the cap.
+        // 4. Claim and dispatch up to the cap.
         for issue in active {
             if self.state.get(&issue.id).is_some() {
                 // Already claimed: skip silently. Reconciliation will
@@ -255,7 +328,16 @@ impl PollLoop {
         // Drain in-flight: child tokens already fired with the parent.
         while let Some(joined) = self.in_flight.join_next().await {
             match joined {
-                Ok((id, reason)) => {
+                Ok((id, dispatcher_reason)) => {
+                    // Honour any pending reconciliation override
+                    // exactly as `reap_finished` does — a reconciled
+                    // run that races with shutdown should still record
+                    // `NoLongerActive`, not the dispatcher's reason.
+                    let reason = self
+                        .handles
+                        .remove(&id)
+                        .and_then(|h| h.override_reason)
+                        .unwrap_or(dispatcher_reason);
                     let _ = self.state.release(id.clone(), reason);
                     debug!(issue = %id, ?reason, "drained dispatch on shutdown");
                 }
@@ -265,15 +347,27 @@ impl PollLoop {
         info!("poll loop drained");
     }
 
-    /// Reap completed dispatches without blocking. Returns how many
-    /// were released so the caller can fold it into a [`TickReport`].
-    fn reap_finished(&mut self) -> usize {
-        let mut count = 0;
+    /// Reap completed dispatches without blocking. Returns the
+    /// (id, reason) pairs that were released so the caller can fold
+    /// them into a [`TickReport`].
+    fn reap_finished(&mut self) -> Vec<(IssueId, ReleaseReason)> {
+        let mut releases = Vec::new();
         while let Some(res) = self.in_flight.try_join_next() {
             match res {
-                Ok((id, reason)) => {
+                Ok((id, dispatcher_reason)) => {
+                    // Reconciliation may have stamped an override on
+                    // this issue's handle (e.g. `NoLongerActive` when
+                    // the tracker dropped it from the active set); if
+                    // present, the override wins so the ledger records
+                    // *why* the run ended rather than just the
+                    // proximate effect (cancellation).
+                    let reason = self
+                        .handles
+                        .remove(&id)
+                        .and_then(|h| h.override_reason)
+                        .unwrap_or(dispatcher_reason);
                     if self.state.release(id.clone(), reason).is_ok() {
-                        count += 1;
+                        releases.push((id, reason));
                     } else {
                         // Releasing an absent issue is a logic bug —
                         // nothing else removes from the ledger except
@@ -285,12 +379,22 @@ impl PollLoop {
                 Err(err) => warn!(error = %err, "dispatch task panicked"),
             }
         }
-        count
+        releases
     }
 
     fn spawn_dispatch(&mut self, issue: Issue, cancel: CancellationToken) {
         let dispatcher = Arc::clone(&self.dispatcher);
         let id = issue.id.clone();
+        // Record the handle BEFORE spawning so a fast-finishing task
+        // can never out-race us — `try_join_next` is only consulted
+        // from `reap_finished` on the loop task itself.
+        self.handles.insert(
+            id.clone(),
+            DispatchHandle {
+                cancel: cancel.clone(),
+                override_reason: None,
+            },
+        );
         self.in_flight.spawn(async move {
             let reason = dispatcher.dispatch(issue, cancel).await;
             (id, reason)
@@ -563,6 +667,139 @@ mod tests {
 
         // Suppress unused warning on tracker (the loop owns its own clone).
         tracker.replace(Vec::new());
+    }
+
+    /// Dispatcher that resolves only when its cancellation token fires,
+    /// returning [`ReleaseReason::Canceled`]. Used to verify that
+    /// reconciliation actually cancels in-flight runs and that the
+    /// recorded release reason wins out over what the dispatcher
+    /// returned (`NoLongerActive` over `Canceled`).
+    struct CancellableDispatcher {
+        started: AtomicUsize,
+    }
+
+    impl CancellableDispatcher {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Dispatcher for CancellableDispatcher {
+        async fn dispatch(&self, _issue: Issue, cancel: CancellationToken) -> ReleaseReason {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            cancel.cancelled().await;
+            ReleaseReason::Canceled
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_cancels_runs_that_left_active_set() {
+        let tracker = Arc::new(StaticTracker::new(issues(3)));
+        let dispatcher = Arc::new(CancellableDispatcher::new());
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(1),
+            jitter_ratio: 0.0,
+            max_concurrent: 10,
+        };
+        let mut loop_ = PollLoop::new(
+            Arc::clone(&tracker) as Arc<dyn IssueTracker>,
+            Arc::clone(&dispatcher) as Arc<dyn Dispatcher>,
+            cfg,
+        );
+        let cancel = CancellationToken::new();
+
+        // First tick: claim all three.
+        let r1 = loop_.tick(&cancel).await.unwrap();
+        assert_eq!(r1.claimed, 3);
+        assert_eq!(r1.reconciled, 0);
+        assert_eq!(loop_.state().running_len(), 3);
+
+        // Wait until each dispatch has actually started awaiting cancel.
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(dispatcher.started.load(Ordering::SeqCst), 3);
+
+        // Tracker now drops `id-2` from the active set. Next tick must
+        // detect the orphan claim, override the release reason to
+        // `NoLongerActive`, and fire the per-run cancel token.
+        tracker.replace(issues(2));
+        let r2 = loop_.tick(&cancel).await.unwrap();
+        assert_eq!(r2.observed, 2);
+        assert_eq!(r2.reconciled, 1);
+        // The cancelled task may not have been reaped yet on this tick
+        // (the dispatch future has to round-trip through tokio).
+        // Ledger still holds it; it'll release on the next tick.
+
+        // Give the cancelled future a chance to resolve.
+        for _ in 0..200 {
+            if loop_.state().running_len() < 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let r3 = loop_.tick(&cancel).await.unwrap();
+        assert_eq!(r3.released, 1);
+        // The override must win: dispatcher returned `Canceled` but
+        // reconciliation overrode to `NoLongerActive`.
+        assert_eq!(
+            r3.release_reasons,
+            vec![(IssueId::new("id-2"), ReleaseReason::NoLongerActive)]
+        );
+        assert_eq!(loop_.state().running_len(), 2);
+        assert!(loop_.state().get(&IssueId::new("id-2")).is_none());
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_is_idempotent_across_ticks() {
+        // If a reconciled run hasn't reaped yet, a second tick that
+        // still doesn't see the issue must not re-fire the cancel or
+        // double-count the reconciliation.
+        let tracker = Arc::new(StaticTracker::new(issues(2)));
+        let dispatcher = Arc::new(CancellableDispatcher::new());
+        let cfg = PollLoopConfig {
+            interval: Duration::from_millis(1),
+            jitter_ratio: 0.0,
+            max_concurrent: 10,
+        };
+        let mut loop_ = PollLoop::new(
+            Arc::clone(&tracker) as Arc<dyn IssueTracker>,
+            Arc::clone(&dispatcher) as Arc<dyn Dispatcher>,
+            cfg,
+        );
+        let cancel = CancellationToken::new();
+
+        loop_.tick(&cancel).await.unwrap();
+        for _ in 0..200 {
+            if dispatcher.started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Empty the active set. First tick reconciles both. Note: we
+        // do NOT yield long enough between ticks for reaps; the
+        // override must remain set.
+        tracker.replace(Vec::new());
+        let r2 = loop_.tick(&cancel).await.unwrap();
+        assert_eq!(r2.reconciled, 2);
+
+        // Immediate second tick before the cancelled futures get a
+        // chance to be reaped: still no active issues; the handles are
+        // still present with override already set; reconciled must be 0.
+        let r3 = loop_.tick(&cancel).await.unwrap();
+        assert_eq!(r3.reconciled, 0);
+
+        cancel.cancel();
     }
 
     #[test]
