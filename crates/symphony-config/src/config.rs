@@ -5977,4 +5977,190 @@ hooks:
         cfg.followups.approval_role = Some("lead".into());
         assert_eq!(cfg.validate(), Ok(()));
     }
+
+    // -----------------------------------------------------------------
+    // Phase 1 negative tests: unknown nested keys, dangling role
+    // references, and invalid strategy combinations (CHECKLIST_v2
+    // phase 1 final item). These cover sections whose deny_unknown_fields
+    // and validate() branches did not yet have explicit negative coverage.
+    // -----------------------------------------------------------------
+
+    fn assert_unknown_field(yaml: &str, needle: &str) {
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(needle) || msg.contains("unknown field"),
+            "expected unknown-field error mentioning `{needle}`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tracker_unknown_nested_key_is_rejected() {
+        assert_unknown_field(
+            r#"
+tracker:
+  kind: linear
+  proj_slug: ENG
+"#,
+            "proj_slug",
+        );
+    }
+
+    #[test]
+    fn hooks_unknown_nested_key_is_rejected() {
+        assert_unknown_field(
+            r#"
+hooks:
+  after_created:
+    - "echo hi"
+"#,
+            "after_created",
+        );
+    }
+
+    #[test]
+    fn routing_rule_unknown_nested_key_is_rejected() {
+        assert_unknown_field(
+            r#"
+routing:
+  rules:
+    - assign_role: worker
+      whne:
+        labels_any: [bug]
+"#,
+            "whne",
+        );
+    }
+
+    #[test]
+    fn workspace_strategy_entry_unknown_nested_key_is_rejected() {
+        assert_unknown_field(
+            r#"
+workspace:
+  strategies:
+    issue_worktree:
+      kind: git_worktree
+      branch_tmpl: "symphony/{{identifier}}"
+"#,
+            "branch_tmpl",
+        );
+    }
+
+    #[test]
+    fn agent_top_level_unknown_nested_key_is_rejected() {
+        assert_unknown_field(
+            r#"
+agent:
+  kindd: codex
+"#,
+            "kindd",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_integration_owner_role() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.integration.required_for = vec![IntegrationRequirement::DecomposedParent];
+        cfg.integration.owner_role = Some("ghost".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "integration.owner_role".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_pull_requests_owner_role() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.pull_requests.enabled = true;
+        cfg.pull_requests.owner_role = Some("ghost".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "pull_requests.owner_role".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_pull_requests_owner_role_with_wrong_kind() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.roles
+            .insert("worker".into(), role(RoleKind::Specialist));
+        cfg.pull_requests.enabled = true;
+        cfg.pull_requests.owner_role = Some("worker".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::RoleKindMismatch {
+                field: "pull_requests.owner_role".into(),
+                role: "worker".into(),
+                actual: RoleKind::Specialist,
+                expected: RoleKind::IntegrationOwner,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_qa_owner_role() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles.insert("qa".into(), role(RoleKind::QaGate));
+        cfg.qa.required = true;
+        cfg.qa.owner_role = Some("ghost".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "qa.owner_role".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_followups_approval_role() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.followups.enabled = true;
+        cfg.followups.approval_role = Some("ghost".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "followups.approval_role".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_integration_owner_when_pull_requests_enabled() {
+        // Decomposition off, integration.required_for empty, but PR
+        // lifecycle is on — the cross-cutting sweep must still demand an
+        // integration_owner role and report `pull_requests` as the
+        // triggering feature.
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.roles
+            .insert("worker".into(), role(RoleKind::Specialist));
+        cfg.pull_requests.enabled = true;
+        // owner_role unset so the role-ref check passes and the sweep
+        // surfaces the missing-kind error.
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::MissingIntegrationOwnerRole {
+                feature: "pull_requests".into(),
+            })
+        );
+    }
 }
