@@ -1,11 +1,11 @@
 //! Integration tests for [`GitHubTracker`] driven by `wiremock`.
 //!
-//! This first slice exercises the happy path of [`IssueTracker::fetch_active`]:
-//! a wiremock server returns a small list of GitHub issues, and the
-//! adapter normalises them into our [`Issue`] model. Wider scenarios
-//! (4xx/5xx/malformed, `fetch_state`, `fetch_terminal_recent`,
-//! `blocked_by`, `branch_name`) land alongside the matching CHECKLIST
-//! items (b/c/d).
+//! Covers the full surface: `fetch_active` happy path, status-label
+//! state derivation, PR filtering, native-state fallback, every row of
+//! the [`TrackerError`] mapping table, `fetch_state` ordering and
+//! failure modes, `fetch_terminal_recent` filtering, body-text
+//! `blocked_by` recovery, and timeline-derived `branch_name` resolution
+//! against the most-recently-opened linked PR.
 //!
 //! ## Why a hand-rolled JSON builder
 //!
@@ -113,11 +113,184 @@ fn gh_issue_json(
     issue
 }
 
+/// Build a `cross-referenced` timeline event whose `source.issue` is a
+/// pull request. This is the wire shape the adapter scans when deriving
+/// `branch_name`.
+///
+/// `opened_at` is the PR's `created_at`, *not* the cross-reference time
+/// — the adapter ranks candidates by the PR's open time so newer PRs
+/// win. Tests pass an explicit RFC-3339 timestamp so ordering is stable.
+fn gh_timeline_cross_ref_pr(pr_number: u64, opened_at: &str) -> Value {
+    // The PR-as-issue payload nested under `source.issue`. Reuse
+    // [`gh_issue_json`] for parity with the real shape, then mark it as
+    // a PR so `pull_request.is_some()` on octocrab's side.
+    let mut pr_as_issue = gh_issue_json(
+        pr_number,
+        &format!("PR #{pr_number}"),
+        Some("PR body"),
+        "open",
+        &[],
+        true,
+    );
+    // Override `created_at` so the test controls ordering. The default
+    // baked into `gh_issue_json` is fine for issues, but PR ordering
+    // matters here.
+    pr_as_issue["created_at"] = json!(opened_at);
+    json!({
+        "id": pr_number * 1000,
+        "node_id": format!("E_{pr_number}"),
+        "url": format!("https://api.test/repos/acme/robot/issues/events/{}", pr_number * 1000),
+        "actor": null,
+        // Kebab case on the wire — octocrab maps it to
+        // `Event::CrossReferenced` via `#[serde(rename = "cross-referenced")]`.
+        "event": "cross-referenced",
+        "commit_id": null,
+        "commit_url": null,
+        "created_at": opened_at,
+        "source": {
+            "type": "issue",
+            "issue": pr_as_issue,
+        },
+    })
+}
+
+/// Build the JSON payload for a single pull request response with the
+/// minimum fields octocrab's `pulls::PullRequest` struct deserializes.
+fn gh_pull_request_json(pr_number: u64, head_ref: &str) -> Value {
+    let urls =
+        |suffix: &str| format!("https://api.test/repos/acme/robot/pulls/{pr_number}{suffix}");
+    let user = json!({
+        "login": "octocat",
+        "id": 1u64,
+        "node_id": "MDQ6VXNlcjE=",
+        "avatar_url": "https://api.test/avatars/octocat",
+        "gravatar_id": "",
+        "url": "https://api.test/users/octocat",
+        "html_url": "https://github.test/octocat",
+        "followers_url": "https://api.test/users/octocat/followers",
+        "following_url": "https://api.test/users/octocat/following{/other_user}",
+        "gists_url": "https://api.test/users/octocat/gists{/gist_id}",
+        "starred_url": "https://api.test/users/octocat/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.test/users/octocat/subscriptions",
+        "organizations_url": "https://api.test/users/octocat/orgs",
+        "repos_url": "https://api.test/users/octocat/repos",
+        "events_url": "https://api.test/users/octocat/events{/privacy}",
+        "received_events_url": "https://api.test/users/octocat/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null,
+    });
+    let head_or_base = |ref_field: &str| {
+        json!({
+            "label": format!("acme:{ref_field}"),
+            "ref": ref_field,
+            "sha": "deadbeefcafef00ddeadbeefcafef00ddeadbeef",
+            "user": user,
+            "repo": null,
+        })
+    };
+    json!({
+        "url": urls(""),
+        "id": pr_number * 7,
+        "node_id": format!("PR_{pr_number}"),
+        "html_url": format!("https://github.test/acme/robot/pull/{pr_number}"),
+        "diff_url": urls(".diff"),
+        "patch_url": urls(".patch"),
+        "issue_url": format!("https://api.test/repos/acme/robot/issues/{pr_number}"),
+        "commits_url": urls("/commits"),
+        "review_comments_url": urls("/comments"),
+        "review_comment_url": "https://api.test/repos/acme/robot/pulls/comments{/number}",
+        "comments_url": format!("https://api.test/repos/acme/robot/issues/{pr_number}/comments"),
+        "statuses_url": urls("/statuses/abc"),
+        "number": pr_number,
+        "state": "open",
+        "title": format!("PR #{pr_number}"),
+        "body": null,
+        "labels": [],
+        "created_at": "2026-05-03T00:00:00Z",
+        "updated_at": "2026-05-03T00:00:00Z",
+        "closed_at": null,
+        "merged_at": null,
+        "merge_commit_sha": null,
+        // octocrab requires these on `PullRequest` deserialisation —
+        // they are not `#[serde(default)]`. Empty/false values are fine
+        // for our branch-name lookup.
+        "merged": false,
+        "assignees": [],
+        "requested_reviewers": [],
+        "requested_teams": [],
+        "head": head_or_base(head_ref),
+        "base": head_or_base("main"),
+        "_links": {
+            "self": { "href": urls("") },
+            "html": { "href": format!("https://github.test/acme/robot/pull/{pr_number}") },
+            "issue": { "href": format!("https://api.test/repos/acme/robot/issues/{pr_number}") },
+            "comments": { "href": format!("https://api.test/repos/acme/robot/issues/{pr_number}/comments") },
+            "review_comments": { "href": urls("/comments") },
+            "review_comment": { "href": "https://api.test/repos/acme/robot/pulls/comments{/number}" },
+            "commits": { "href": urls("/commits") },
+            "statuses": { "href": urls("/statuses/abc") },
+        },
+        "user": user,
+        "author_association": "OWNER",
+        "additions": 0,
+        "deletions": 0,
+        "changed_files": 0,
+        "commits": 1,
+        "review_comments": 0,
+        "comments": 0,
+    })
+}
+
+/// Mount the timeline + `/pulls/{n}` responders that the adapter walks
+/// when recovering `branch_name`. Replaces any default-empty timeline
+/// previously mounted for the same issue (wiremock matches on insertion
+/// order; later mounts win for the same path).
+async fn install_linked_pr(
+    server: &MockServer,
+    issue_number: u64,
+    pr_number: u64,
+    head_ref: &str,
+    opened_at: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/repos/acme/robot/issues/{issue_number}/timeline"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([gh_timeline_cross_ref_pr(pr_number, opened_at),])),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/acme/robot/pulls/{pr_number}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(gh_pull_request_json(pr_number, head_ref)),
+        )
+        .mount(server)
+        .await;
+}
+
 /// Stand up a wiremock server that returns the supplied issues from
 /// `GET /repos/acme/robot/issues`, plus a [`GitHubTracker`] pointed at
 /// it. Returns both so the test can keep the server alive.
 async fn tracker_serving(issues: Vec<Value>) -> (MockServer, GitHubTracker) {
     let server = MockServer::start().await;
+    // Mount a default-empty timeline for every issue we serve. The
+    // adapter walks `/issues/{n}/timeline` to recover `branch_name`;
+    // without these mounts every test would fail with a wiremock 404
+    // even when it doesn't care about branch derivation.
+    for issue in &issues {
+        if let Some(n) = issue.get("number").and_then(|v| v.as_u64()) {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/robot/issues/{n}/timeline")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+        }
+    }
     Mock::given(method("GET"))
         .and(path("/repos/acme/robot/issues"))
         .respond_with(ResponseTemplate::new(200).set_body_json(Value::Array(issues)))
@@ -191,7 +364,10 @@ async fn fetch_active_filters_by_status_label_and_drops_pull_requests() {
         i1.priority.is_none(),
         "GitHub has no native priority — adapter must leave this None"
     );
-    assert!(i1.branch_name.is_none(), "branch_name lands in (d)");
+    assert!(
+        i1.branch_name.is_none(),
+        "no linked PR in this fixture's timeline → branch_name must stay None"
+    );
     assert!(i1.blocked_by.is_empty(), "blocked_by lands in (c)");
     assert_eq!(i1.description.as_deref(), Some("body 1"));
 
@@ -221,6 +397,12 @@ async fn fetch_active_falls_back_to_native_state_when_no_status_label_matches() 
                 false
             )])),
         )
+        .mount(&server)
+        .await;
+    // No linked PR — branch_name derivation expects an empty timeline.
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/7/timeline"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&server)
         .await;
     let cfg = GitHubConfig {
@@ -278,6 +460,14 @@ async fn fetch_state_preserves_caller_order_across_per_issue_gets() {
             )))
             .mount(&server)
             .await;
+        // Empty timeline → no linked PR → branch_name stays None.
+        // Without this mount the per-id branch-name follow-up triggers
+        // a wiremock 404 and the test fails for the wrong reason.
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/robot/issues/{n}/timeline")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
     }
     let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
 
@@ -322,6 +512,13 @@ async fn fetch_state_404_on_one_id_fails_the_whole_call() {
             &["status:todo"],
             false,
         )))
+        .mount(&server)
+        .await;
+    // #1's branch-name follow-up needs an empty timeline so the
+    // failure under test is the #2 lookup, not an unmounted timeline.
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/1/timeline"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -571,6 +768,22 @@ async fn github_against(scenario: Scenario) -> (MockServer, GitHubTracker) {
             )
             .mount(&server)
             .await;
+
+        // Issues with `branch_name = Some(..)` get a real linked-PR
+        // timeline below; everyone else gets a default-empty timeline
+        // so the adapter's branch-name follow-up cleanly returns None.
+        if let Some(head_ref) = issue.branch_name.as_deref() {
+            // PR number is synthesized — anything not colliding with an
+            // issue id works. We use `n + 1000` so the relationship is
+            // obvious in failure output.
+            install_linked_pr(&server, n, n + 1000, head_ref, "2026-05-03T00:00:00Z").await;
+        } else {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/acme/robot/issues/{n}/timeline")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+        }
     }
 
     let cfg = GitHubConfig {
@@ -592,6 +805,68 @@ async fn github_tracker_passes_the_full_conformance_suite() {
     let (_server, tracker) = github_against(scenario.clone()).await;
     let dyn_tracker: Arc<dyn IssueTracker> = Arc::new(tracker);
     run_full_suite(dyn_tracker.as_ref(), &scenario).await;
+}
+
+#[tokio::test]
+async fn fetch_active_recovers_branch_name_from_most_recently_opened_linked_pr() {
+    // Stand up a single-issue server, then mount a timeline with two
+    // CrossReferenced PR events. The newer PR's head ref must win.
+    let issues = vec![gh_issue_json(
+        42,
+        "Wire login",
+        Some("body"),
+        "open",
+        &["status:todo"],
+        false,
+    )];
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Value::Array(issues)))
+        .mount(&server)
+        .await;
+    // Two PRs: an older one on `feature/login-old`, a newer one on
+    // `feature/login-new`. The adapter must pick the newer.
+    // A non-PR cross-reference (issue → issue) must be ignored: build
+    // it from the helper, then strip the `pull_request` flag so the
+    // adapter sees a plain issue cross-reference, not a PR one.
+    let mut non_pr_event = gh_timeline_cross_ref_pr(101, "2026-04-15T00:00:00Z");
+    non_pr_event["source"]["issue"]["pull_request"] = Value::Null;
+    let timeline = json!([
+        gh_timeline_cross_ref_pr(100, "2026-04-01T00:00:00Z"),
+        non_pr_event,
+        gh_timeline_cross_ref_pr(200, "2026-05-01T00:00:00Z"),
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/42/timeline"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(timeline))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/pulls/100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(gh_pull_request_json(100, "feature/login-old")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/pulls/200"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(gh_pull_request_json(200, "feature/login-new")),
+        )
+        .mount(&server)
+        .await;
+    let tracker = GitHubTracker::new(cfg_for(&server)).unwrap();
+
+    let active = tracker.fetch_active().await.expect("fetch_active");
+    assert_eq!(active.len(), 1);
+    assert_eq!(
+        active[0].branch_name.as_deref(),
+        Some("feature/login-new"),
+        "the newer linked PR's head ref must win the tiebreak",
+    );
 }
 
 #[tokio::test]

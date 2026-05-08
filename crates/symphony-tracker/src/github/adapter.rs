@@ -45,6 +45,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use http::Uri;
 use octocrab::Octocrab;
+use octocrab::models::Event as GhEvent;
 use octocrab::models::IssueState as GhIssueState;
 use octocrab::models::issues::Issue as GhIssue;
 use octocrab::params::State as GhState;
@@ -138,6 +139,83 @@ impl std::fmt::Debug for GitHubTracker {
 }
 
 impl GitHubTracker {
+    /// Walk an issue's timeline and recover the `head.ref` of the
+    /// most-recently-opened linked pull request, if one exists.
+    ///
+    /// ## Why timeline + a second pulls call
+    ///
+    /// GitHub does not expose "linked PRs" as a structured field on the
+    /// issue itself — the relationship is a side effect of someone
+    /// posting a comment, commit message, or PR body that mentions the
+    /// issue (`#42`, `closes #42`, etc.). Each such mention surfaces in
+    /// `GET /repos/{owner}/{repo}/issues/{n}/timeline` as a
+    /// `cross-referenced` event whose `source.issue` carries the
+    /// referencing issue/PR.
+    ///
+    /// We filter to events whose `source.issue.pull_request.is_some()`
+    /// — that distinguishes a referencing pull request from a referencing
+    /// plain issue — and pick the most recently created one (its
+    /// `created_at` is when the PR was opened, not when the cross-reference
+    /// was made; for our purposes, "newest PR" is the right tiebreaker
+    /// because operators almost always rebase work onto the latest branch).
+    ///
+    /// The cross-reference event's `source.issue` is the PR rendered as
+    /// an issue, which intentionally does *not* carry `head.ref`. So we
+    /// follow up with `GET /repos/{owner}/{repo}/pulls/{n}` to pull the
+    /// branch name. One extra round trip per active issue with a linked
+    /// PR is acceptable here — these issues are the orchestrator's hot
+    /// path and the data is needed before it can dispatch a worker.
+    ///
+    /// ## Why fail-fast on transport errors
+    ///
+    /// "Branch name lookup failed" is operationally indistinguishable
+    /// from "Linear is down": both invalidate this poll cycle. Bubbling
+    /// the error keeps the orchestrator's reconcile loop honest — it
+    /// will retry on the next tick rather than dispatching a worker
+    /// against the wrong (or stale) branch.
+    async fn derive_branch_name(&self, issue_number: u64) -> TrackerResult<Option<String>> {
+        // Pull the timeline. Pagination matters here in principle (busy
+        // issues can have hundreds of events), so we lean on `all_pages`
+        // for parity with the issues listing path.
+        let first = self
+            .client
+            .issues(&self.config.owner, &self.config.repo)
+            .list_timeline_events(issue_number)
+            .per_page(100u8)
+            .send()
+            .await
+            .map_err(map_octocrab_error)?;
+        let events = self
+            .client
+            .all_pages(first)
+            .await
+            .map_err(map_octocrab_error)?;
+
+        // Walk events, retain only PR cross-references, key by the PR's
+        // `created_at`. `max_by_key` returns the latest — `None` here
+        // simply means "no linked PR yet" and `branch_name` stays None.
+        let candidate = events
+            .into_iter()
+            .filter(|ev| matches!(ev.event, GhEvent::CrossReferenced))
+            .filter_map(|ev| ev.source)
+            .filter(|src| src.issue.pull_request.is_some())
+            .map(|src| (src.issue.number, src.issue.created_at))
+            .max_by_key(|(_, created_at)| *created_at)
+            .map(|(n, _)| n);
+
+        let Some(pr_number) = candidate else {
+            return Ok(None);
+        };
+
+        let pr = self
+            .client
+            .pulls(&self.config.owner, &self.config.repo)
+            .get(pr_number)
+            .await
+            .map_err(map_octocrab_error)?;
+        Ok(Some(pr.head.ref_field))
+    }
+
     /// Build a tracker from a config. Constructs the underlying
     /// [`Octocrab`] handle with the personal token wired in.
     pub fn new(config: GitHubConfig) -> Result<Self, TrackerError> {
@@ -192,6 +270,20 @@ impl IssueTracker for GitHubTracker {
                 out.push(issue);
             }
         }
+        // Active issues are dispatch candidates, so the orchestrator
+        // wants `branch_name` populated when a linked PR exists. We do
+        // this *after* state filtering so we never spend a timeline
+        // round-trip on issues we'd just drop. See
+        // [`Self::derive_branch_name`] for the lookup contract.
+        for issue in &mut out {
+            let n: u64 = issue.id.as_str().parse().map_err(|e| {
+                TrackerError::Other(format!(
+                    "internal: gh issue id should be numeric, got {:?}: {e}",
+                    issue.id.as_str()
+                ))
+            })?;
+            issue.branch_name = self.derive_branch_name(n).await?;
+        }
         Ok(out)
     }
 
@@ -222,7 +314,13 @@ impl IssueTracker for GitHubTracker {
                 .get(number)
                 .await
                 .map_err(map_octocrab_error)?;
-            out.push(gh_to_issue(gh, &self.config.status_label_prefix));
+            let mut issue = gh_to_issue(gh, &self.config.status_label_prefix);
+            // `fetch_state` is the orchestrator's reconcile probe — it
+            // wants the same enrichment shape as `fetch_active` so the
+            // branch_name a worker is actively running against does not
+            // suddenly appear `None` on a refresh.
+            issue.branch_name = self.derive_branch_name(number).await?;
+            out.push(issue);
         }
         Ok(out)
     }
@@ -288,9 +386,10 @@ fn lowercase_set(states: &[String]) -> std::collections::HashSet<String> {
 
 /// Translate `octocrab`'s issue model into our normalized [`Issue`].
 ///
-/// Keeps the mapping in one place so unit tests can exercise every
-/// branch without HTTP. `branch_name` and `blocked_by` stay empty for
-/// this slice — items (c) and (d) populate them.
+/// Pure / synchronous — keeps the mapping testable without HTTP.
+/// `branch_name` lands here as `None`; the calling method
+/// (`fetch_active` / `fetch_state`) is responsible for the timeline
+/// follow-up that fills it in. See [`GitHubTracker::derive_branch_name`].
 fn gh_to_issue(gh: GhIssue, status_prefix: &str) -> Issue {
     // Note: `body` is the raw markdown body. We hand it through verbatim
     // so the orchestrator's prompt template can include the user's
@@ -308,7 +407,8 @@ fn gh_to_issue(gh: GhIssue, status_prefix: &str) -> Issue {
         // fabrication contract on `Issue`, we leave this `None`.
         priority: None,
         state,
-        // Lands in (d) — derived from a linked PR's head ref.
+        // Filled in by the caller via `derive_branch_name` after the
+        // sync mapping returns — keeps the pure helper free of HTTP.
         branch_name: None,
         url: Some(gh.html_url.to_string()),
         labels,

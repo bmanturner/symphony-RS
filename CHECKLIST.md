@@ -74,7 +74,7 @@ under their phase header and are added or refined as the project evolves.
       Add `github_canonical_scenario()` mirroring the Linear fixture but
       using GitHub-style identifiers; full conformance suite passes
       against the wiremock-backed adapter. [GitHubTracker (b)]
-- [ ] **GitHubTracker (d)** — derive `branch_name` from linked-PR head
+- [x] **GitHubTracker (d)** — derive `branch_name` from linked-PR head
       ref by querying `GET /repos/{owner}/{repo}/issues/{n}/timeline` for
       cross-referenced PR events; take the most-recently-opened PR's
       `head.ref`. Extend `github_canonical_scenario()` to cover this and

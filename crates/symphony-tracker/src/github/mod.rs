@@ -1,12 +1,11 @@
 //! GitHub Issues adapter.
 //!
 //! Companion to [`crate::linear`]: same trait surface (`IssueTracker`),
-//! different wire protocol. This first slice ships [`GitHubConfig`],
-//! [`GitHubTracker`], and a working [`IssueTracker::fetch_active`]
-//! built on `octocrab`'s REST client. The remaining trait methods
-//! (`fetch_state`, `fetch_terminal_recent`) and the richer mappings
-//! (`blocked_by`, `branch_name`) land in the follow-up checklist
-//! items (b), (c), and (d).
+//! different wire protocol. The full trait — `fetch_active`,
+//! `fetch_state`, `fetch_terminal_recent` — is implemented on
+//! `octocrab`, with `blocked_by` recovered from issue body text and
+//! `branch_name` recovered from the most-recently-opened linked PR via
+//! the issue timeline.
 //!
 //! ## Why a configurable `base_uri`
 //!

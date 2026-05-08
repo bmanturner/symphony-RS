@@ -177,15 +177,17 @@ pub fn canonical_scenario() -> Scenario {
 /// The shared [`canonical_scenario`] uses Linear-style identifiers
 /// (`ABC-1`) and exercises optional fields the GitHub adapter cannot
 /// populate without lying — `priority` is always absent on GitHub Issues
-/// (no native field), `branch_name` lands in checklist item (d), and
-/// `blocked_by` only carries the human identifier (`id` and `state` stay
-/// `None` until server-side resolution).
+/// (no native field), and `blocked_by` only carries the human identifier
+/// (`id` and `state` stay `None` until server-side resolution).
 ///
 /// This fixture mirrors the *shape* of `canonical_scenario` (mixed-case
-/// states, multiple terminal states, one issue with a blocker) but stays
-/// honest about what the GitHub backend exposes. Wire-level test setup
-/// renders each issue as a GitHub REST payload (with the blocker hint
-/// injected into the body so [`crate::github`]'s parser can recover it).
+/// states, multiple terminal states, one issue with a blocker, one
+/// issue with `branch_name = Some` recovered via the timeline +
+/// linked-PR lookup) while staying honest about what the GitHub backend
+/// exposes. Wire-level test setup renders each issue as a GitHub REST
+/// payload (with the blocker hint injected into the body so
+/// [`crate::github`]'s parser can recover it) and mounts a timeline +
+/// pulls responder for the issue with a linked PR.
 pub fn github_canonical_scenario() -> Scenario {
     let active_issues = vec![
         Issue {
@@ -233,6 +235,25 @@ pub fn github_canonical_scenario() -> Scenario {
                 identifier: Some("#1".into()),
                 state: None,
             }],
+            created_at: Some("2026-05-01T00:00:00Z".into()),
+            updated_at: Some("2026-05-02T00:00:00Z".into()),
+        },
+        Issue {
+            id: IssueId::new("4"),
+            identifier: "#4".into(),
+            title: "Fourth, has a linked PR".into(),
+            description: Some("Plain body, work already in flight on a PR.".into()),
+            priority: None,
+            state: IssueState::new("Todo"),
+            // Recovered by the adapter via the timeline + pulls
+            // follow-up. The wire fixture mounts a CrossReferenced
+            // timeline event pointing at PR #200 with head ref
+            // `feature/login`, and a `/pulls/200` responder returning
+            // that branch.
+            branch_name: Some("feature/login".into()),
+            url: Some("https://github.test/acme/robot/issues/4".into()),
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
             created_at: Some("2026-05-01T00:00:00Z".into()),
             updated_at: Some("2026-05-02T00:00:00Z".into()),
         },
