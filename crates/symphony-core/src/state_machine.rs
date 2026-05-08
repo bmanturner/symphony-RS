@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::tracker::IssueId;
@@ -50,7 +51,8 @@ use crate::tracker::IssueId;
 /// | `Unclaimed` / `Released` | absent | — |
 /// | `Running` | present | `Running` |
 /// | `RetryQueued` | present | `RetryQueued { attempt }` |
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ClaimState {
     /// A worker task currently owns this issue and is streaming a turn.
     Running,
@@ -69,7 +71,8 @@ pub enum ClaimState {
 /// the poll loop decide whether to schedule a continuation retry. The
 /// state machine itself only stores the discriminant; it does not act on
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReleaseReason {
     /// Worker exited normally and there is nothing more to retry.
     Completed,

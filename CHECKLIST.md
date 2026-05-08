@@ -168,7 +168,7 @@ SPEC §3.1 layer 7. Implemented out-of-process so the daemon stays
 headless and systemd-friendly. Sub-tasks are intentionally small —
 keep one-task-per-iteration discipline.
 
-- [ ] Define `OrchestratorEvent` enum in `symphony-core::events`
+- [x] Define `OrchestratorEvent` enum in `symphony-core::events`
       covering `StateChanged`, `Dispatched`, `AgentEvent` re-emission,
       `RetryScheduled`, `Reconciled`, `Released`. `Serialize` with
       `#[serde(tag = "type")]` so SSE consumers can switch on type.

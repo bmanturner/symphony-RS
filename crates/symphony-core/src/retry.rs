@@ -73,7 +73,8 @@ impl RetryConfig {
 
 /// Why this retry was scheduled. Drives the backoff formula and is
 /// preserved on the [`RetryEntry`] for log surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RetryReason {
     /// Worker exited normally; schedule a short continuation turn.
     Continuation,
