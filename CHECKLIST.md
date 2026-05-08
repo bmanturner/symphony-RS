@@ -29,7 +29,7 @@ under their phase header and are added or refined as the project evolves.
 
 ## Phase 2 — IssueTracker abstraction + Linear + GitHub Issues
 
-- [ ] Define `Issue`, `IssueId`, `IssueState` per SPEC §4.1.1 in
+- [x] Define `Issue`, `IssueId`, `IssueState` per SPEC §4.1.1 in
       `symphony-core::tracker`. Doc comments must spell out that
       `branch_name`, `priority`, and `blocked_by` are `Option`s and that
       adapters **never fabricate** these when the source backend lacks

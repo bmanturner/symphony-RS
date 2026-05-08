@@ -10,3 +10,7 @@
 //! Linear/Codex/Claude protocol details. The orchestrator only sees the
 //! normalized `Issue` model and the `AgentEvent` enum (defined in later
 //! phases).
+
+pub mod tracker;
+
+pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
