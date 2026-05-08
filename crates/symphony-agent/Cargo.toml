@@ -7,6 +7,7 @@ license.workspace = true
 description = "AgentRunner trait with Codex, Claude, and Tandem backends."
 
 [dependencies]
+symphony-core = { path = "../symphony-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

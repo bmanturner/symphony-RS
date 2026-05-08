@@ -18,3 +18,5 @@
 //!
 //! The orchestrator only ever sees `AgentEvent` values. All backend
 //! protocol differences are absorbed here.
+
+pub mod codex;

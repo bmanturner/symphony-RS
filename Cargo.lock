@@ -2925,6 +2925,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "symphony-core",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
