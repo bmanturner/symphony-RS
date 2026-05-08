@@ -13,3 +13,10 @@
 //!
 //! This crate intentionally has no async surface; the orchestrator owns
 //! the runtime and feeds parsed config in.
+
+pub mod config;
+
+pub use config::{
+    AgentConfig, AgentKind, CodexConfig, ConfigValidationError, HooksConfig, PollingConfig,
+    TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
+};

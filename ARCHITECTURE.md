@@ -179,6 +179,28 @@ the `RUST_LOG` muscle memory. `logging::init` is idempotent (a
 re-install is a no-op) so test harnesses that pre-install a subscriber
 are not broken.
 
+### 2026-05-08 — Typed `WorkflowConfig` with `deny_unknown_fields` on nested sections
+**Context.** SPEC §5.3 says unknown *top-level* keys SHOULD be ignored
+for forward compatibility, but says nothing about typos inside known
+sections. A silent fallback of `polling.interva_ms: 10` to the 30 s
+default is the kind of bug that only surfaces when an operator wonders
+why their override "didn't work." We also need defaults to be auditable
+without grepping serde attributes.
+
+**Decision.** Every nested config struct (`TrackerConfig`,
+`PollingConfig`, `HooksConfig`, `AgentConfig`, `CodexConfig`, …) carries
+`#[serde(deny_unknown_fields)]`. Every default value is a free function
+named `default_<key>` so a reviewer can audit a SPEC default with
+`git grep default_max_turns`. Codex pass-through fields stay typed as
+`serde_yaml::Value` because SPEC §5.3.6 explicitly directs implementors
+to treat them as opaque. `agent.kind` and `tracker.kind` are typed enums
+so the orchestrator can `match` exhaustively on backend selection.
+
+**Consequence.** `WorkflowConfig` cannot derive `Eq` (the Codex
+pass-through values are `serde_yaml::Value`); `PartialEq` is enough for
+the round-trip tests we need. Adding a new tracker or agent kind is a
+two-line change to the relevant enum plus an arm in `validate`.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line

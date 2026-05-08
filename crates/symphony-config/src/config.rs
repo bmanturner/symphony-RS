@@ -1,0 +1,626 @@
+//! Typed `WORKFLOW.md` front-matter model.
+//!
+//! This module defines [`WorkflowConfig`] and its child structs, which
+//! together form the in-memory representation of the YAML front matter
+//! described in SPEC §5.3. The shape mirrors the spec verbatim so that
+//! adding or renaming a key happens in exactly one place.
+//!
+//! ## Why a typed struct (and not a `serde_yaml::Value`)?
+//!
+//! The orchestrator branches on a handful of these fields on every tick
+//! (`polling.interval_ms`, `agent.max_concurrent_agents`,
+//! `tracker.kind`). Pushing them through a typed struct gives us:
+//!
+//! 1. **Validation at the boundary.** Bad values fail loudly during
+//!    `WorkflowLoader::from_path`, not three hours into a run.
+//! 2. **Defaults documented as code.** Every `#[serde(default = "...")]`
+//!    points at a function whose name encodes the SPEC default value, so
+//!    a reviewer can audit a default with `git grep`.
+//! 3. **Forward compatibility.** Unknown top-level keys are ignored
+//!    (SPEC §5.3) but unknown nested keys inside known sections are
+//!    rejected — typos in `polling.interva_ms` should not silently fall
+//!    back to defaults.
+//!
+//! ## Deviations from the upstream Symphony spec
+//!
+//! - `agent.kind` is added so we can pick between the `codex`, `claude`,
+//!   and experimental `tandem` runners. The upstream spec hard-codes
+//!   Codex; we abstract it behind [`AgentRunner`](../../symphony_agent/index.html).
+//! - `tracker.kind` is widened from a single `linear` literal to an enum
+//!   that also accepts `github` for the GitHub Issues adapter we ship in
+//!   v1.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+/// Root of the `WORKFLOW.md` front matter.
+///
+/// Round-trips losslessly through `serde_yaml`. Constructed either via
+/// `serde_yaml::from_str` (during load) or `WorkflowConfig::default()`
+/// (for tests and the in-memory base layer of the figment merge).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowConfig {
+    /// Issue-tracker selection and credentials. See SPEC §5.3.1.
+    #[serde(default)]
+    pub tracker: TrackerConfig,
+
+    /// Polling cadence for the orchestrator's tick loop. SPEC §5.3.2.
+    #[serde(default)]
+    pub polling: PollingConfig,
+
+    /// Per-issue workspace root and isolation rules. SPEC §5.3.3.
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
+
+    /// Optional shell hooks fired around each workspace lifecycle event.
+    /// SPEC §5.3.4.
+    #[serde(default)]
+    pub hooks: HooksConfig,
+
+    /// Concurrency, turn caps, and backoff for the coding-agent layer.
+    /// SPEC §5.3.5 plus our `agent.kind` deviation.
+    #[serde(default)]
+    pub agent: AgentConfig,
+
+    /// Codex-specific pass-through config. SPEC §5.3.6.
+    ///
+    /// Fields are intentionally typed loosely (`serde_yaml::Value`)
+    /// because Codex evolves its own schema and we are not the source of
+    /// truth for it. The runtime validates these at dispatch preflight.
+    #[serde(default)]
+    pub codex: CodexConfig,
+}
+
+// ---------------------------------------------------------------------------
+// tracker
+// ---------------------------------------------------------------------------
+
+/// Issue tracker configuration.
+///
+/// `api_key` is stored as the raw string literal (or `$VAR_NAME`
+/// placeholder) read from disk. Environment expansion happens during
+/// the figment-layered load step so that the typed struct is plain old
+/// data with no IO side effects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrackerConfig {
+    /// Which adapter to instantiate. We default to `Linear` so an
+    /// out-of-the-box `WORKFLOW.md` matches the upstream Symphony spec.
+    #[serde(default)]
+    pub kind: TrackerKind,
+
+    /// Tracker API endpoint. `None` means "use the adapter default".
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Tracker API token. May be a literal value or a `$VAR_NAME`
+    /// placeholder; resolution happens during workflow loading.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// Linear project slug. REQUIRED for dispatch when `kind == Linear`.
+    /// Ignored for the GitHub adapter, which derives the project scope
+    /// from `repository`.
+    #[serde(default)]
+    pub project_slug: Option<String>,
+
+    /// GitHub `owner/repo` slug. REQUIRED for dispatch when
+    /// `kind == Github`. Mirrors `project_slug`'s role for Linear.
+    #[serde(default)]
+    pub repository: Option<String>,
+
+    /// State names that count as "needs work". Stored case-sensitive
+    /// because operators write them naturally; conformance tests assert
+    /// adapters do the lowercase comparison.
+    #[serde(default = "default_active_states")]
+    pub active_states: Vec<String>,
+
+    /// State names treated as terminal for cleanup purposes.
+    #[serde(default = "default_terminal_states")]
+    pub terminal_states: Vec<String>,
+}
+
+impl Default for TrackerConfig {
+    fn default() -> Self {
+        Self {
+            kind: TrackerKind::default(),
+            endpoint: None,
+            api_key: None,
+            project_slug: None,
+            repository: None,
+            active_states: default_active_states(),
+            terminal_states: default_terminal_states(),
+        }
+    }
+}
+
+/// Adapter discriminator for the `IssueTracker` trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrackerKind {
+    /// Linear via GraphQL. Default for parity with upstream Symphony.
+    #[default]
+    Linear,
+    /// GitHub Issues via REST + GraphQL.
+    Github,
+}
+
+fn default_active_states() -> Vec<String> {
+    vec!["Todo".to_string(), "In Progress".to_string()]
+}
+
+fn default_terminal_states() -> Vec<String> {
+    vec![
+        "Closed".to_string(),
+        "Cancelled".to_string(),
+        "Canceled".to_string(),
+        "Duplicate".to_string(),
+        "Done".to_string(),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// polling
+// ---------------------------------------------------------------------------
+
+/// Tick cadence for the orchestrator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollingConfig {
+    /// Wall-clock milliseconds between successive polls. The
+    /// orchestrator adds jitter on top.
+    #[serde(default = "default_poll_interval_ms")]
+    pub interval_ms: u64,
+}
+
+impl Default for PollingConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_poll_interval_ms(),
+        }
+    }
+}
+
+fn default_poll_interval_ms() -> u64 {
+    30_000
+}
+
+// ---------------------------------------------------------------------------
+// workspace
+// ---------------------------------------------------------------------------
+
+/// Per-issue workspace root.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// Root directory for per-issue workspaces. `~` and `$VAR`
+    /// expansion happen during loading. `None` resolves at runtime to
+    /// `<system-temp>/symphony_workspaces` per SPEC §5.3.3.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// hooks
+// ---------------------------------------------------------------------------
+
+/// Shell hook scripts fired around the workspace lifecycle.
+///
+/// Each script is the raw `bash -lc` body (multi-line strings are
+/// natural in YAML). The runtime is responsible for composing the
+/// command, not for parsing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HooksConfig {
+    /// Runs once when the workspace directory is newly created. A
+    /// non-zero exit aborts workspace creation.
+    #[serde(default)]
+    pub after_create: Option<String>,
+
+    /// Runs before each agent attempt, after workspace prep. Failure
+    /// aborts the attempt.
+    #[serde(default)]
+    pub before_run: Option<String>,
+
+    /// Runs after each agent attempt regardless of outcome. Failure is
+    /// logged and ignored.
+    #[serde(default)]
+    pub after_run: Option<String>,
+
+    /// Runs before workspace deletion if the directory exists. Failure
+    /// is logged and ignored; cleanup still proceeds.
+    #[serde(default)]
+    pub before_remove: Option<String>,
+
+    /// Wall-clock timeout applied to every hook in this section.
+    #[serde(default = "default_hook_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            before_remove: None,
+            timeout_ms: default_hook_timeout_ms(),
+        }
+    }
+}
+
+fn default_hook_timeout_ms() -> u64 {
+    60_000
+}
+
+// ---------------------------------------------------------------------------
+// agent
+// ---------------------------------------------------------------------------
+
+/// Coding-agent dispatch policy.
+///
+/// `kind` is our agent-agnostic deviation: it picks which `AgentRunner`
+/// the orchestrator instantiates. Everything else mirrors SPEC §5.3.5.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    /// Which `AgentRunner` to instantiate.
+    #[serde(default)]
+    pub kind: AgentKind,
+
+    /// Hard cap on simultaneously running coding-agent sessions.
+    #[serde(default = "default_max_concurrent_agents")]
+    pub max_concurrent_agents: u32,
+
+    /// Hard cap on the number of agent turns within one session.
+    /// MUST be positive; validated at load time.
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
+
+    /// Upper bound on the exponential-backoff delay between retries.
+    #[serde(default = "default_max_retry_backoff_ms")]
+    pub max_retry_backoff_ms: u64,
+
+    /// Optional per-state concurrency caps. Keys SHOULD be lowercase;
+    /// the orchestrator normalises before lookup.
+    #[serde(default)]
+    pub max_concurrent_agents_by_state: BTreeMap<String, u32>,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            kind: AgentKind::default(),
+            max_concurrent_agents: default_max_concurrent_agents(),
+            max_turns: default_max_turns(),
+            max_retry_backoff_ms: default_max_retry_backoff_ms(),
+            max_concurrent_agents_by_state: BTreeMap::new(),
+        }
+    }
+}
+
+/// Which coding-agent backend to drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    /// `codex app-server` over JSONL stdio. Default for parity with
+    /// upstream Symphony.
+    #[default]
+    Codex,
+    /// `claude -p --output-format stream-json` over stdio.
+    Claude,
+    /// Run both runners concurrently with one designated lead. The
+    /// strategy and lead are configured in a future `tandem` block; this
+    /// variant just turns the wrapper on.
+    Tandem,
+}
+
+fn default_max_concurrent_agents() -> u32 {
+    10
+}
+
+fn default_max_turns() -> u32 {
+    20
+}
+
+fn default_max_retry_backoff_ms() -> u64 {
+    300_000
+}
+
+// ---------------------------------------------------------------------------
+// codex
+// ---------------------------------------------------------------------------
+
+/// Codex-specific pass-through config.
+///
+/// We deliberately do not type `approval_policy`, `thread_sandbox`, or
+/// `turn_sandbox_policy` because their value sets evolve with the Codex
+/// app-server and SPEC §5.3.6 explicitly directs implementors to treat
+/// them as opaque. They're carried through as `serde_yaml::Value` and
+/// validated at dispatch preflight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexConfig {
+    /// Shell command launched via `bash -lc` from the workspace root.
+    #[serde(default = "default_codex_command")]
+    pub command: String,
+
+    /// Codex `AskForApproval` value. Pass-through; not validated here.
+    #[serde(default)]
+    pub approval_policy: Option<serde_yaml::Value>,
+
+    /// Codex `SandboxMode` value. Pass-through; not validated here.
+    #[serde(default)]
+    pub thread_sandbox: Option<serde_yaml::Value>,
+
+    /// Codex `SandboxPolicy` value. Pass-through; not validated here.
+    #[serde(default)]
+    pub turn_sandbox_policy: Option<serde_yaml::Value>,
+
+    /// Per-turn timeout in milliseconds. SPEC default: 1 hour.
+    #[serde(default = "default_codex_turn_timeout_ms")]
+    pub turn_timeout_ms: u64,
+
+    /// Idle-read timeout in milliseconds. SPEC default: 5 seconds.
+    #[serde(default = "default_codex_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+
+    /// Stall-detection window. `0` disables stall detection. SPEC
+    /// default: 5 minutes.
+    #[serde(default = "default_codex_stall_timeout_ms")]
+    pub stall_timeout_ms: u64,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            command: default_codex_command(),
+            approval_policy: None,
+            thread_sandbox: None,
+            turn_sandbox_policy: None,
+            turn_timeout_ms: default_codex_turn_timeout_ms(),
+            read_timeout_ms: default_codex_read_timeout_ms(),
+            stall_timeout_ms: default_codex_stall_timeout_ms(),
+        }
+    }
+}
+
+fn default_codex_command() -> String {
+    "codex app-server".to_string()
+}
+
+fn default_codex_turn_timeout_ms() -> u64 {
+    3_600_000
+}
+
+fn default_codex_read_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_codex_stall_timeout_ms() -> u64 {
+    300_000
+}
+
+// ---------------------------------------------------------------------------
+// validation
+// ---------------------------------------------------------------------------
+
+/// Validation errors raised by [`WorkflowConfig::validate`].
+///
+/// These are the "value out of range" class of errors that serde cannot
+/// catch on its own — for example, a `max_turns: 0` deserialises fine
+/// but is semantically invalid per SPEC §5.3.5.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigValidationError {
+    /// `agent.max_turns` must be a positive integer.
+    #[error("agent.max_turns must be > 0 (got {0})")]
+    MaxTurnsZero(u32),
+
+    /// `agent.max_concurrent_agents` must be a positive integer.
+    #[error("agent.max_concurrent_agents must be > 0 (got {0})")]
+    MaxConcurrentZero(u32),
+
+    /// `polling.interval_ms` must be > 0 — a zero interval would
+    /// produce a busy-spin tick loop.
+    #[error("polling.interval_ms must be > 0 (got {0})")]
+    PollingIntervalZero(u64),
+
+    /// `tracker.kind == Linear` requires `tracker.project_slug`.
+    #[error("tracker.project_slug is required when tracker.kind = linear")]
+    LinearMissingProjectSlug,
+
+    /// `tracker.kind == Github` requires `tracker.repository`.
+    #[error("tracker.repository is required when tracker.kind = github")]
+    GithubMissingRepository,
+}
+
+impl WorkflowConfig {
+    /// Reject configs whose values parse but cannot be dispatched.
+    ///
+    /// Run this after deserialisation but before handing the config to
+    /// the orchestrator. The CLI's `symphony validate` subcommand maps
+    /// the resulting errors to non-zero exits.
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self.agent.max_turns == 0 {
+            return Err(ConfigValidationError::MaxTurnsZero(self.agent.max_turns));
+        }
+        if self.agent.max_concurrent_agents == 0 {
+            return Err(ConfigValidationError::MaxConcurrentZero(
+                self.agent.max_concurrent_agents,
+            ));
+        }
+        if self.polling.interval_ms == 0 {
+            return Err(ConfigValidationError::PollingIntervalZero(
+                self.polling.interval_ms,
+            ));
+        }
+        match self.tracker.kind {
+            TrackerKind::Linear => {
+                if self.tracker.project_slug.is_none() {
+                    return Err(ConfigValidationError::LinearMissingProjectSlug);
+                }
+            }
+            TrackerKind::Github => {
+                if self.tracker.repository.is_none() {
+                    return Err(ConfigValidationError::GithubMissingRepository);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_spec_5_3() {
+        // Mirrors SPEC §5.3 defaults explicitly so a future spec drift
+        // forces the test to be updated alongside the constants.
+        let cfg = WorkflowConfig::default();
+        assert_eq!(cfg.tracker.kind, TrackerKind::Linear);
+        assert_eq!(cfg.tracker.active_states, vec!["Todo", "In Progress"]);
+        assert_eq!(
+            cfg.tracker.terminal_states,
+            vec!["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+        );
+        assert_eq!(cfg.polling.interval_ms, 30_000);
+        assert_eq!(cfg.hooks.timeout_ms, 60_000);
+        assert_eq!(cfg.agent.kind, AgentKind::Codex);
+        assert_eq!(cfg.agent.max_concurrent_agents, 10);
+        assert_eq!(cfg.agent.max_turns, 20);
+        assert_eq!(cfg.agent.max_retry_backoff_ms, 300_000);
+        assert!(cfg.agent.max_concurrent_agents_by_state.is_empty());
+        assert_eq!(cfg.codex.command, "codex app-server");
+        assert_eq!(cfg.codex.turn_timeout_ms, 3_600_000);
+        assert_eq!(cfg.codex.read_timeout_ms, 5_000);
+        assert_eq!(cfg.codex.stall_timeout_ms, 300_000);
+    }
+
+    #[test]
+    fn yaml_roundtrip_preserves_overrides() {
+        let yaml = r#"
+tracker:
+  kind: github
+  repository: foglet-io/rust-symphony
+  active_states: [open]
+polling:
+  interval_ms: 5000
+agent:
+  kind: claude
+  max_turns: 7
+  max_concurrent_agents_by_state:
+    in_progress: 2
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.tracker.kind, TrackerKind::Github);
+        assert_eq!(
+            parsed.tracker.repository.as_deref(),
+            Some("foglet-io/rust-symphony")
+        );
+        assert_eq!(parsed.tracker.active_states, vec!["open"]);
+        // Defaults still flow through for keys we did not override.
+        assert_eq!(parsed.tracker.terminal_states, default_terminal_states());
+        assert_eq!(parsed.polling.interval_ms, 5_000);
+        assert_eq!(parsed.agent.kind, AgentKind::Claude);
+        assert_eq!(parsed.agent.max_turns, 7);
+        assert_eq!(
+            parsed
+                .agent
+                .max_concurrent_agents_by_state
+                .get("in_progress"),
+            Some(&2)
+        );
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn unknown_nested_key_is_rejected() {
+        // Forward-compat at the *top* level only. Typos inside known
+        // sections (e.g. `interva_ms`) should not silently default.
+        let yaml = r#"
+polling:
+  interva_ms: 10
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("interva_ms") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_turns() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.agent.max_turns = 0;
+        assert_eq!(cfg.validate(), Err(ConfigValidationError::MaxTurnsZero(0)));
+    }
+
+    #[test]
+    fn validate_rejects_zero_concurrency() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.agent.max_concurrent_agents = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::MaxConcurrentZero(0))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_poll_interval() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.polling.interval_ms = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::PollingIntervalZero(0))
+        );
+    }
+
+    #[test]
+    fn validate_requires_project_slug_for_linear() {
+        let cfg = WorkflowConfig::default();
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::LinearMissingProjectSlug)
+        );
+    }
+
+    #[test]
+    fn validate_requires_repository_for_github() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::GithubMissingRepository)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_minimal_linear_config() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_minimal_github_config() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+}

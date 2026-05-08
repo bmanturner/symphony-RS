@@ -15,7 +15,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] Wire `tracing-subscriber` in `symphony-cli` with env-filter and an
       optional JSON formatter selectable by `SYMPHONY_LOG_FORMAT` [needs
       cargo check green]
-- [ ] Define a typed `WorkflowConfig` struct in `symphony-config` covering
+- [x] Define a typed `WorkflowConfig` struct in `symphony-config` covering
       the SPEC §5.1 keys (poll interval, concurrency, retry caps, agent
       kind, tracker kind)
 - [ ] Implement `WorkflowLoader::from_path()` using `gray_matter` to split
