@@ -31,7 +31,7 @@
 //! iterations — running a real raw-mode terminal in `cargo test` is
 //! flaky and not worth the maintenance.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -42,7 +42,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
-use symphony_agent::tandem::CostModel;
+use symphony_agent::tandem::{CostModel, TandemRole};
 use symphony_core::agent::{AgentEvent, SessionId, TokenUsage};
 use symphony_core::events::OrchestratorEvent;
 use symphony_core::state_machine::ClaimState;
@@ -228,6 +228,116 @@ pub struct RecentEvent {
     pub identifier: Option<String>,
 }
 
+/// Stable wire label the orchestrator stamps on tandem dispatches. Lives
+/// here as a constant so the apply logic and the tests both reference the
+/// same string — a typo would silently make the tandem panel disappear
+/// from production while still passing tests written against the typo.
+pub const TANDEM_BACKEND_LABEL: &str = "tandem";
+
+/// One row of the tandem-activity panel.
+///
+/// We intentionally derive everything in this struct from data that is
+/// **already on the SSE wire today** — `Dispatched { backend, session }`
+/// and the session ids on subsequent [`AgentEvent`]s. Fields that *would*
+/// require new wire surface (concrete [`symphony_agent::tandem::TandemStrategy`]
+/// label, "drafting / reviewing / executing" phase tag, lead/follower
+/// backend names) are deliberately left off rather than fabricated:
+/// surfacing a placeholder strategy is worse than admitting the wire
+/// doesn't carry one yet, because operators trust what the panel shows.
+/// A follow-up checklist item can extend [`crate::watch`] / the
+/// `OrchestratorEvent::Dispatched` payload with a `tandem` descriptor and
+/// upgrade this struct in lockstep.
+///
+/// What we *do* render:
+///
+/// - Lead [`SessionId`] from the original `Dispatched` event.
+/// - Follower [`SessionId`] inferred when an [`OrchestratorEvent::Agent`]
+///   event arrives with a session id different from the lead's.
+/// - Per-side message and tool-use counts, so the operator can see at a
+///   glance which side is currently doing the work.
+/// - A live `AgentTelemetry`-style Jaccard agreement rate computed
+///   from accumulated [`AgentEvent::Message`] contents. Computation
+///   matches `aggregate_agent` in
+///   `crates/symphony-agent/src/tandem/telemetry.rs` so the
+///   panel's number agrees with the canonical post-turn telemetry.
+/// - `last_active_role` — `Lead` or `Follower` depending on which side
+///   most recently emitted an event. This is the closest we can get to
+///   "current phase" without strategy on the wire; the panel labels it
+///   honestly as "active" rather than "drafting".
+#[derive(Debug, Clone, Default)]
+pub struct TandemSession {
+    /// Best-effort tracker identifier (`ENG-123`) snapshot from the
+    /// `Dispatched` event. Carried so the row renders without joining
+    /// against [`AppState::identifier_cache`].
+    pub identifier: String,
+    /// Session id stamped on the originating `Dispatched`. Treated as
+    /// the lead by convention — `TandemRunner` constructs its
+    /// `AgentSession` with `initial_session = lead.start_session(...).initial_session`,
+    /// so the orchestrator's `Dispatched` always carries the lead's id.
+    pub lead_session: Option<SessionId>,
+    /// First *other* session id observed on an `Agent` event for this
+    /// issue. `None` until the follower starts emitting; the panel
+    /// renders "—" in that case.
+    pub follower_session: Option<SessionId>,
+    /// Count of [`AgentEvent::Message`] events attributed to the lead.
+    pub lead_messages: u32,
+    /// Count of [`AgentEvent::Message`] events attributed to the
+    /// follower.
+    pub follower_messages: u32,
+    /// Count of [`AgentEvent::ToolUse`] events attributed to the lead.
+    pub lead_tools: u32,
+    /// Count of [`AgentEvent::ToolUse`] events attributed to the
+    /// follower.
+    pub follower_tools: u32,
+    /// Bag of lowercase alphanumeric word tokens drawn from every lead
+    /// `Message.content` seen so far. Drives the Jaccard agreement
+    /// computation. Bounded growth: each unique word is stored once.
+    pub lead_word_bag: HashSet<String>,
+    /// Bag of lowercase alphanumeric word tokens drawn from every
+    /// follower `Message.content` seen so far. See `lead_word_bag`.
+    pub follower_word_bag: HashSet<String>,
+    /// Which side most recently emitted an event; rendered as the
+    /// `active` column. `None` until the first event after dispatch.
+    pub last_active_role: Option<TandemRole>,
+}
+
+impl TandemSession {
+    /// Live agreement rate, identical in spirit to
+    /// `tandem::telemetry::compute`'s post-turn computation: Jaccard
+    /// similarity over the bag-of-tokens. Returns `0.0` if either side
+    /// has yet to emit any message tokens — no honest agreement can be
+    /// claimed when one side is silent.
+    pub fn agreement_rate(&self) -> f64 {
+        if self.lead_word_bag.is_empty() || self.follower_word_bag.is_empty() {
+            return 0.0;
+        }
+        let intersection = self
+            .lead_word_bag
+            .intersection(&self.follower_word_bag)
+            .count();
+        let union = self.lead_word_bag.union(&self.follower_word_bag).count();
+        if union == 0 {
+            return 0.0;
+        }
+        intersection as f64 / union as f64
+    }
+}
+
+/// Extract lowercase alphanumeric word tokens from `content`.
+///
+/// Pulled into a free function so the bag-update path in
+/// [`AppState::apply_orchestrator_event`] and the agreement test fixtures
+/// share one definition. Kept *intentionally simple*: anything outside
+/// `[a-z0-9]` is a separator. This matches the spirit of
+/// `tandem::telemetry::collect_message_tokens` while staying inline so
+/// the TUI doesn't need to depend on private helpers.
+fn extract_word_tokens(content: &str) -> impl Iterator<Item = String> + '_ {
+    content
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+}
+
 /// All state the TUI needs to render a frame.
 ///
 /// Future panels (tandem activity) push their own fields onto this
@@ -267,6 +377,12 @@ pub struct AppState {
     /// [`AppState::event_filter`] instead of routing as commands; `Esc`
     /// cancels (clears + exits) and `Enter` commits (keeps + exits).
     pub filter_input_mode: bool,
+    /// Live tandem-mode dispatches keyed by [`IssueId`]. Populated only
+    /// when an [`OrchestratorEvent::Dispatched`] arrives with
+    /// `backend == TANDEM_BACKEND_LABEL`; cleared on `Released`. The
+    /// tandem-activity panel renders **only** while this map is
+    /// non-empty, so a non-tandem workflow never sees the panel chrome.
+    pub tandem_sessions: HashMap<IssueId, TandemSession>,
     /// Set true when the user pressed `q` (or `Ctrl+C`); the run loop
     /// terminates on the next iteration. Tests inspect this directly.
     pub should_quit: bool,
@@ -411,6 +527,23 @@ impl AppState {
                 self.cost
                     .session_backend
                     .insert(session.clone(), backend.clone());
+                if backend == TANDEM_BACKEND_LABEL {
+                    // Establish a tandem-panel row keyed by the issue.
+                    // The dispatch's session id is the lead by convention
+                    // (see `TandemSession::lead_session` doc). We
+                    // *replace* any prior entry rather than merging:
+                    // a re-dispatch (retry) starts a fresh tandem turn,
+                    // and stale message/tool counts from the previous
+                    // turn would mislead the operator.
+                    self.tandem_sessions.insert(
+                        issue.clone(),
+                        TandemSession {
+                            identifier: identifier.clone(),
+                            lead_session: Some(session.clone()),
+                            ..Default::default()
+                        },
+                    );
+                }
                 self.push_recent(
                     "dispatched",
                     format!("{identifier} dispatched [{backend}] attempt {attempt}"),
@@ -426,6 +559,12 @@ impl AppState {
                 self.identifier_cache
                     .insert(issue.clone(), identifier.clone());
                 self.active_issues.remove(issue);
+                // Drop the tandem-panel row in lockstep with the active
+                // issue. Cumulative cost survives release (see CostState
+                // docs), but the tandem panel is *live activity only* —
+                // a released issue is no longer doing tandem work and
+                // keeping the row would imply otherwise.
+                self.tandem_sessions.remove(issue);
                 // Cost totals are intentionally *not* purged on
                 // release: the panel renders a cumulative-since-launch
                 // figure, and dropping a session's contribution when
@@ -447,6 +586,13 @@ impl AppState {
                     self.cost
                         .session_tokens
                         .insert(session.clone(), usage.clone());
+                }
+                // Route into the tandem panel if we're tracking this
+                // issue as a tandem dispatch. Done before
+                // identifier-cache lookup so the lead/follower
+                // attribution is independent of any other panel state.
+                if let Some(t) = self.tandem_sessions.get_mut(issue) {
+                    apply_tandem_agent_event(t, event);
                 }
                 let identifier = self.identifier_cache.get(issue).cloned();
                 let label = identifier.clone().unwrap_or_else(|| "?".into());
@@ -584,6 +730,58 @@ fn format_agent_event(label: &str, event: &AgentEvent) -> String {
     }
 }
 
+/// Fold one [`AgentEvent`] into a tandem-session row.
+///
+/// Routing rule: an event whose session id matches the lead is attributed
+/// to the lead seat; any other session id is attributed to the follower.
+/// The first non-lead session id we observe is *adopted* as the follower
+/// (the wire does not carry an explicit follower-session announcement, so
+/// we rely on this "first other session wins" heuristic — `TandemRunner`
+/// only ever spawns two inner runners, so this is unambiguous in
+/// practice). Once adopted, a third unrecognised session id is silently
+/// ignored rather than overwriting the follower; that path should never
+/// fire in production but is the safe choice if a future strategy ever
+/// emits stray events.
+///
+/// We deliberately ignore non-message / non-tool events here so the bag
+/// of tokens powering the agreement rate stays focused on substantive
+/// content; `Started` / `Completed` carry no semantically interesting
+/// text.
+fn apply_tandem_agent_event(t: &mut TandemSession, event: &AgentEvent) {
+    let session = event.session();
+    let role = match (&t.lead_session, &t.follower_session) {
+        (Some(lead), _) if lead == session => TandemRole::Lead,
+        (_, Some(follower)) if follower == session => TandemRole::Follower,
+        (Some(_), None) => {
+            // Adopt this session as the follower on first sighting.
+            t.follower_session = Some(session.clone());
+            TandemRole::Follower
+        }
+        // Pre-dispatch state (no lead recorded yet). Should not happen
+        // because tandem rows are only inserted on `Dispatched`, which
+        // sets `lead_session`; defend with a no-op.
+        _ => return,
+    };
+    t.last_active_role = Some(role);
+    match event {
+        AgentEvent::Message { content, .. } => match role {
+            TandemRole::Lead => {
+                t.lead_messages = t.lead_messages.saturating_add(1);
+                t.lead_word_bag.extend(extract_word_tokens(content));
+            }
+            TandemRole::Follower => {
+                t.follower_messages = t.follower_messages.saturating_add(1);
+                t.follower_word_bag.extend(extract_word_tokens(content));
+            }
+        },
+        AgentEvent::ToolUse { .. } => match role {
+            TandemRole::Lead => t.lead_tools = t.lead_tools.saturating_add(1),
+            TandemRole::Follower => t.follower_tools = t.follower_tools.saturating_add(1),
+        },
+        _ => {}
+    }
+}
+
 /// Trim a free-text string to a single line, truncating to `max` chars
 /// with an ellipsis if needed. Newlines and tabs are collapsed to
 /// spaces so multi-line message content does not break the panel
@@ -626,15 +824,27 @@ fn truncate_one_line(s: &str, max: usize) -> String {
 /// rendering deterministically.
 pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
     let area = frame.area();
+    // The tandem panel is conditional: when no tandem sessions are
+    // active we collapse it out of the layout entirely so non-tandem
+    // workflows do not pay the chrome of an empty box. When present,
+    // its height is sized to the number of rows (capped at 5) plus
+    // header + 2 borders, so a single tandem session uses ~4 lines and
+    // a busy fleet uses no more than ~8.
+    let tandem_visible = !state.tandem_sessions.is_empty();
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(3),
+    ];
+    if tandem_visible {
+        let rows = state.tandem_sessions.len().min(5) as u16;
+        constraints.push(Constraint::Length(rows + 3));
+    }
+    constraints.push(Constraint::Min(5));
+    constraints.push(Constraint::Length(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(area);
 
     let header_text = match &state.connection {
@@ -656,8 +866,103 @@ pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
 
     render_active_issues(state, now, frame, chunks[1]);
     render_cost_summary(state, frame, chunks[2]);
-    render_recent_events(state, now, frame, chunks[3]);
-    render_footer(state, frame, chunks[4]);
+    // Index bookkeeping: when the tandem panel is hidden, recent-events
+    // and footer slide up by one. Computing the indices once keeps the
+    // routing readable even as the layout grows.
+    let (tandem_idx, recent_idx, footer_idx) = if tandem_visible {
+        (Some(3usize), 4usize, 5usize)
+    } else {
+        (None, 3usize, 4usize)
+    };
+    if let Some(idx) = tandem_idx {
+        render_tandem_activity(state, frame, chunks[idx]);
+    }
+    render_recent_events(state, now, frame, chunks[recent_idx]);
+    render_footer(state, frame, chunks[footer_idx]);
+}
+
+/// Render the tandem-activity panel: one row per active tandem dispatch
+/// showing the lead/follower session ids, message and tool counts per
+/// side, the side that most recently emitted an event, and the live
+/// Jaccard agreement rate.
+///
+/// Layout note: this function is only invoked when the panel is visible
+/// (see [`render`]) — it does not branch on emptiness internally because
+/// the slot is collapsed out of the layout in the empty case.
+///
+/// Strategy and a strategy-aware phase tag (`drafting` / `reviewing` /
+/// `executing`) are *intentionally* not shown: they are not on the
+/// `OrchestratorEvent` wire today, and the project convention is to
+/// admit a gap rather than fabricate a label. The "active" column —
+/// `lead` or `follower` — is the closest honest substitute and matches
+/// what the operator can verify by reading the recent-events log.
+fn render_tandem_activity(state: &AppState, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    let title = format!("tandem activity ({})", state.tandem_sessions.len());
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    // Sort by identifier so two equal AppStates render byte-identical
+    // frames — the foundation for snapshot tests and a property the
+    // active-issues panel already relies on.
+    let mut rows: Vec<(&IssueId, &TandemSession)> = state.tandem_sessions.iter().collect();
+    rows.sort_by(|a, b| a.1.identifier.cmp(&b.1.identifier));
+
+    let header = Row::new(vec![
+        Cell::from("identifier"),
+        Cell::from("active"),
+        Cell::from("lead"),
+        Cell::from("follower"),
+        Cell::from("agree"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .height(1);
+
+    let body_rows: Vec<Row> = rows
+        .into_iter()
+        .map(|(_, t)| {
+            let active = match t.last_active_role {
+                Some(TandemRole::Lead) => "lead".to_string(),
+                Some(TandemRole::Follower) => "follower".to_string(),
+                // No event yet — the row exists because the dispatch
+                // arrived but neither side has spoken. "—" mirrors the
+                // active-issues panel's pre-dispatch convention.
+                None => "—".to_string(),
+            };
+            let active_style = match t.last_active_role {
+                Some(TandemRole::Lead) => Style::default().fg(Color::Cyan),
+                Some(TandemRole::Follower) => Style::default().fg(Color::Magenta),
+                None => Style::default().add_modifier(Modifier::DIM),
+            };
+            // Render a session id as `(msgs/tools)` so the row stays
+            // tight: full session ids are 36-char UUIDs and would
+            // overflow the column. The session ids themselves are not
+            // load-bearing for the operator — the recent-events log
+            // already shows them.
+            let lead = format!("msg {} tool {}", t.lead_messages, t.lead_tools);
+            let follower = if t.follower_session.is_some() {
+                format!("msg {} tool {}", t.follower_messages, t.follower_tools)
+            } else {
+                "—".to_string()
+            };
+            let agree = format!("{:.2}", t.agreement_rate());
+            Row::new(vec![
+                Cell::from(t.identifier.clone()),
+                Cell::from(active).style(active_style),
+                Cell::from(lead),
+                Cell::from(follower),
+                Cell::from(agree),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(10),
+        Constraint::Length(18),
+        Constraint::Length(18),
+        Constraint::Length(6),
+    ];
+    let table = Table::new(body_rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
 }
 
 /// Render the footer line: shortcut help when idle, an inline filter
@@ -2083,6 +2388,189 @@ mod tests {
         assert!(summary.contains("100"));
         assert!(summary.contains("50"));
         assert!(summary.contains("150"));
+    }
+
+    // ---- tandem-activity panel ----------------------------------------
+
+    fn dispatch_tandem(state: &mut AppState, issue: &str, session_str: &str) {
+        state.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new(issue),
+            identifier: issue.into(),
+            session: session(session_str, "u"),
+            backend: TANDEM_BACKEND_LABEL.into(),
+            attempt: 1,
+        });
+    }
+
+    fn agent_msg(state: &mut AppState, issue: &str, session_str: &str, content: &str) {
+        state.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new(issue),
+            event: AgentEvent::Message {
+                session: session(session_str, "u"),
+                role: "assistant".into(),
+                content: content.into(),
+            },
+        });
+    }
+
+    #[test]
+    fn tandem_dispatch_creates_tandem_session() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert_eq!(t.identifier, "ENG-1");
+        assert!(t.lead_session.is_some());
+        assert!(t.follower_session.is_none());
+        assert!(t.last_active_role.is_none());
+    }
+
+    #[test]
+    fn non_tandem_dispatch_does_not_create_tandem_session() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            session: session("t", "u"),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+        assert!(s.tandem_sessions.is_empty());
+    }
+
+    #[test]
+    fn release_drops_tandem_session() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        assert!(!s.tandem_sessions.is_empty());
+        s.apply_orchestrator_event(&OrchestratorEvent::Released {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            reason: ReleaseReason::Completed,
+            final_state: None,
+        });
+        assert!(s.tandem_sessions.is_empty());
+    }
+
+    #[test]
+    fn agent_event_attributes_lead_to_dispatch_session() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        agent_msg(&mut s, "ENG-1", "lead-thread", "lead speaks");
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert_eq!(t.lead_messages, 1);
+        assert_eq!(t.follower_messages, 0);
+        assert_eq!(t.last_active_role, Some(TandemRole::Lead));
+    }
+
+    #[test]
+    fn first_other_session_is_adopted_as_follower() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        agent_msg(&mut s, "ENG-1", "follower-thread", "review");
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert!(t.follower_session.is_some());
+        assert_eq!(t.follower_messages, 1);
+        assert_eq!(t.last_active_role, Some(TandemRole::Follower));
+    }
+
+    #[test]
+    fn tool_use_counts_per_side() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        // Adopt follower first.
+        agent_msg(&mut s, "ENG-1", "follower-thread", "hi");
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::ToolUse {
+                session: session("lead-thread", "u"),
+                tool: "rg".into(),
+                input: serde_json::Value::Null,
+            },
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Agent {
+            issue: IssueId::new("ENG-1"),
+            event: AgentEvent::ToolUse {
+                session: session("follower-thread", "u"),
+                tool: "patch".into(),
+                input: serde_json::Value::Null,
+            },
+        });
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert_eq!(t.lead_tools, 1);
+        assert_eq!(t.follower_tools, 1);
+    }
+
+    #[test]
+    fn agreement_rate_zero_when_one_side_silent() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        agent_msg(&mut s, "ENG-1", "lead-thread", "alpha beta gamma");
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert_eq!(t.agreement_rate(), 0.0);
+    }
+
+    #[test]
+    fn agreement_rate_jaccard_over_word_bags() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        agent_msg(&mut s, "ENG-1", "lead-thread", "alpha beta gamma");
+        agent_msg(&mut s, "ENG-1", "follower-thread", "beta gamma delta");
+        // bags: {alpha,beta,gamma} and {beta,gamma,delta}
+        // intersection = 2 (beta, gamma); union = 4 → 0.5
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert!(
+            (t.agreement_rate() - 0.5).abs() < 1e-9,
+            "rate was {}",
+            t.agreement_rate()
+        );
+    }
+
+    #[test]
+    fn redispatch_resets_tandem_session_counts() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        agent_msg(&mut s, "ENG-1", "lead-thread", "foo");
+        // A retry produces a new Dispatched. Stale counts must not carry.
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread-2");
+        let t = s.tandem_sessions.get(&IssueId::new("ENG-1")).unwrap();
+        assert_eq!(t.lead_messages, 0);
+        assert_eq!(t.follower_messages, 0);
+    }
+
+    #[test]
+    fn render_hides_tandem_panel_when_no_tandem_sessions() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let s = AppState::default();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(
+            !buf.contains("tandem activity"),
+            "tandem panel leaked into non-tandem UI: {buf}"
+        );
+    }
+
+    #[test]
+    fn render_shows_tandem_panel_with_rows() {
+        let mut s = AppState::default();
+        dispatch_tandem(&mut s, "ENG-1", "lead-thread");
+        agent_msg(&mut s, "ENG-1", "lead-thread", "draft text here");
+        agent_msg(&mut s, "ENG-1", "follower-thread", "draft text approved");
+
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("tandem activity (1)"), "buf: {buf}");
+        assert!(buf.contains("ENG-1"), "buf: {buf}");
+        assert!(buf.contains("follower"), "buf: {buf}");
+        assert!(buf.contains("msg 1"), "lead msg count missing: {buf}");
+    }
+
+    #[test]
+    fn extract_word_tokens_lowercases_and_splits() {
+        let v: Vec<String> = extract_word_tokens("Hello, World! 123-foo").collect();
+        assert_eq!(v, vec!["hello", "world", "123", "foo"]);
     }
 
     #[test]

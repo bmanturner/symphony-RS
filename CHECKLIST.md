@@ -211,10 +211,24 @@ keep one-task-per-iteration discipline.
 - [x] TUI panel — **recent events log**: ring buffer of the last N
       events, colour-coded by variant. Hotkey `f` filters by issue
       identifier substring. [active issues panel]
-- [ ] TUI panel — **tandem activity**: visible only when at least one
+- [x] TUI panel — **tandem activity**: visible only when at least one
       running session uses `TandemRunner`. Shows lead/follower roles,
       strategy, current phase (drafting / reviewing / executing),
       agreement rate. [recent events panel, Phase 6 TandemRunner]
+      *Implementation note:* the SSE wire format does not currently
+      carry a tandem strategy or strategy-aware phase tag, so the panel
+      shows the closest honest substitutes — `last_active_role`
+      (`lead` / `follower`) instead of `drafting / reviewing /
+      executing`, and omits the strategy column. A follow-up item adds
+      `tandem: Option<TandemDescriptor>` to `OrchestratorEvent::Dispatched`
+      and upgrades the panel in lockstep.
+
+- [ ] Extend `OrchestratorEvent::Dispatched` with an optional
+      `tandem: Option<TandemDescriptor>` payload (strategy, lead
+      backend, follower backend). Surfaces strategy + a strategy-aware
+      "current phase" label in the tandem-activity panel without
+      fabrication. Wire-stable addition, panel upgrade in the same
+      commit. [tandem activity]
 - [ ] Hotkey `r` toggles relative ↔ absolute time formatting across
       all panels. [tandem panel]
 - [ ] Snapshot tests: `insta`-snapshotted SSE stream against a scripted

@@ -127,7 +127,7 @@ A work item is a normalized internal representation of issue work. It may corres
 
 Work item states are workflow-defined, but the orchestrator requires normalized classes:
 
-- `ignore`: ignore
+- `ignore`: ignore.
 - `intake`: eligible for triage/decomposition.
 - `ready`: eligible for specialist dispatch.
 - `running`: actively owned by a run.

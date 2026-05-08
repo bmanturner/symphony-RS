@@ -4,8 +4,6 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 0 — v2 Grounding
 
-- [ ] Add `SPEC_v2.md`, `ARCHITECTURE_v2.md`, `PLAN_v2.md`, `CHECKLIST_v2.md`, and `PROMPT_v2.md` to the repo root.
-- [ ] Add README note that v2 files are the product direction and existing implementation docs should be updated as the code moves to that direction.
 - [ ] Rewrite existing quickstart/sample workflow fixtures to the target schema with roles, routing, polling, hooks, integration, PR, and QA sections.
 
 ## Phase 1 — Workflow Config Schema
