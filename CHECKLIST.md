@@ -182,7 +182,7 @@ keep one-task-per-iteration discipline.
 - [x] Add `axum`, `ratatui`, `crossterm` to the workspace crate budget
       via `cargo add --workspace`. One-paragraph ADR documenting why
       these three over hand-rolled alternatives.
-- [ ] Add `status` section to `WorkflowConfig`: `enabled` (bool, default
+- [x] Add `status` section to `WorkflowConfig`: `enabled` (bool, default
       true), `bind` (default `"127.0.0.1:6280"`), `replay_buffer`
       (default 256). `deny_unknown_fields`, defaults via
       `default_status_*` free functions per the existing convention.

@@ -72,6 +72,14 @@ pub struct WorkflowConfig {
     /// truth for it. The runtime validates these at dispatch preflight.
     #[serde(default)]
     pub codex: CodexConfig,
+
+    /// Out-of-process status surface (Phase 8). Controls whether the
+    /// daemon exposes `GET /events` as an SSE feed and where it binds.
+    /// Defaults are loopback-only and on, so a fresh `WORKFLOW.md`
+    /// "just works" with `symphony watch` without surprising the
+    /// operator with an open port on a public interface.
+    #[serde(default)]
+    pub status: StatusConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +433,72 @@ fn default_codex_stall_timeout_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// status (Phase 8 — SSE event surface)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the out-of-process status surface.
+///
+/// The status surface is a narrow `axum` HTTP server inside the daemon
+/// that re-emits the orchestrator's broadcast bus over Server-Sent
+/// Events. `symphony watch` (and any third-party observer) connects to
+/// `GET /events` and receives one `OrchestratorEvent` per SSE frame.
+///
+/// The server is intentionally simple — no auth, no TLS — because the
+/// default bind is `127.0.0.1`. Operators who want to expose the
+/// surface beyond localhost are expected to put a reverse proxy in
+/// front of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Whether to start the SSE server alongside the orchestrator.
+    /// `true` keeps `symphony watch` working out of the box; setting
+    /// this to `false` skips the bind entirely (useful in CI, in
+    /// systemd unit tests, or when running multiple daemons on the
+    /// same host).
+    #[serde(default = "default_status_enabled")]
+    pub enabled: bool,
+
+    /// Address to bind the SSE listener on. Defaults to
+    /// `127.0.0.1:6280` — loopback so the server isn't accidentally
+    /// reachable from the network. Anything `SocketAddr` accepts is
+    /// valid; the runtime parses lazily on bind, so a malformed value
+    /// surfaces at startup rather than at config-load time.
+    #[serde(default = "default_status_bind")]
+    pub bind: String,
+
+    /// Capacity of the `tokio::sync::broadcast` channel that fans
+    /// orchestrator events out to subscribers. Higher values absorb
+    /// slower consumers at the cost of memory; a slow consumer that
+    /// falls behind by more than this many events sees a `Lagged`
+    /// signal and is expected to reconnect. Default mirrors the
+    /// orchestrator's own internal default (256).
+    #[serde(default = "default_status_replay_buffer")]
+    pub replay_buffer: usize,
+}
+
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_status_enabled(),
+            bind: default_status_bind(),
+            replay_buffer: default_status_replay_buffer(),
+        }
+    }
+}
+
+fn default_status_enabled() -> bool {
+    true
+}
+
+fn default_status_bind() -> String {
+    "127.0.0.1:6280".to_string()
+}
+
+fn default_status_replay_buffer() -> usize {
+    256
+}
+
+// ---------------------------------------------------------------------------
 // validation
 // ---------------------------------------------------------------------------
 
@@ -459,6 +533,15 @@ pub enum ConfigValidationError {
     /// `tracker.kind == Mock` requires `tracker.fixtures`.
     #[error("tracker.fixtures is required when tracker.kind = mock")]
     MockMissingFixtures,
+
+    /// `status.replay_buffer` must be > 0; `tokio::sync::broadcast`
+    /// rejects zero-capacity channels at construction time.
+    #[error("status.replay_buffer must be > 0 (got {0})")]
+    StatusReplayBufferZero(usize),
+
+    /// `status.bind` must be a parseable `SocketAddr`.
+    #[error("status.bind is not a valid socket address: {0}")]
+    StatusBindInvalid(String),
 }
 
 impl WorkflowConfig {
@@ -498,6 +581,21 @@ impl WorkflowConfig {
                 }
             }
         }
+        if self.status.enabled {
+            if self.status.replay_buffer == 0 {
+                return Err(ConfigValidationError::StatusReplayBufferZero(
+                    self.status.replay_buffer,
+                ));
+            }
+            // Parse-only; the runtime binds later. We surface the
+            // failure at validate-time so `symphony validate` catches
+            // it before the daemon is ever started.
+            if self.status.bind.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigValidationError::StatusBindInvalid(
+                    self.status.bind.clone(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -532,6 +630,9 @@ mod tests {
         assert_eq!(cfg.codex.turn_timeout_ms, 3_600_000);
         assert_eq!(cfg.codex.read_timeout_ms, 5_000);
         assert_eq!(cfg.codex.stall_timeout_ms, 300_000);
+        assert!(cfg.status.enabled);
+        assert_eq!(cfg.status.bind, "127.0.0.1:6280");
+        assert_eq!(cfg.status.replay_buffer, 256);
     }
 
     #[test]
@@ -696,6 +797,80 @@ agent:
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn yaml_roundtrip_preserves_status_overrides() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+status:
+  enabled: false
+  bind: 0.0.0.0:7000
+  replay_buffer: 1024
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert!(!parsed.status.enabled);
+        assert_eq!(parsed.status.bind, "0.0.0.0:7000");
+        assert_eq!(parsed.status.replay_buffer, 1024);
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn status_unknown_nested_key_is_rejected() {
+        // Mirrors the polling test: typos inside the status section
+        // must not silently default — operators expect feedback.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+status:
+  enabld: true
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("enabld") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_replay_buffer_when_status_enabled() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.status.replay_buffer = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::StatusReplayBufferZero(0))
+        );
+    }
+
+    #[test]
+    fn validate_ignores_zero_replay_buffer_when_status_disabled() {
+        // A disabled status surface never constructs the broadcast
+        // channel, so a zero buffer is harmless. Surfacing it as an
+        // error would force operators to delete the (otherwise
+        // illustrative) value just to start the daemon with status off.
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.status.enabled = false;
+        cfg.status.replay_buffer = 0;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_bind() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.status.bind = "not-a-socket".into();
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::StatusBindInvalid(
+                "not-a-socket".into()
+            ))
+        );
     }
 
     #[test]
