@@ -11,8 +11,14 @@
 //! normalized `Issue` model and the `AgentEvent` enum (defined in later
 //! phases).
 
+pub mod agent;
 pub mod tracker;
 pub mod tracker_trait;
 
+pub use agent::{
+    AgentControl, AgentError, AgentEvent, AgentEventStream, AgentResult, AgentRunner, AgentSession,
+    CompletionReason, RateLimitSnapshot, SessionId, StartSessionParams, ThreadId, TokenUsage,
+    TurnId,
+};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
 pub use tracker_trait::{IssueTracker, TrackerError, TrackerResult};

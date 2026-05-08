@@ -94,7 +94,7 @@ under their phase header and are added or refined as the project evolves.
 
 ## Phase 4 — AgentRunner abstraction + two backends
 
-- [ ] Define `AgentRunner` trait + `AgentEvent` enum + `SessionId`
+- [x] Define `AgentRunner` trait + `AgentEvent` enum + `SessionId`
 - [ ] Codex JSONL protocol decoder; `CodexRunner` spawning `codex
       app-server` [AgentRunner trait]
 - [ ] Claude stream-json decoder; `ClaudeRunner` spawning `claude -p
