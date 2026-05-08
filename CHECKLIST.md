@@ -152,7 +152,7 @@ under their phase header and are added or refined as the project evolves.
       against a fixture without `codex` or `claude` installed. Unit
       tests on the runner and CLI factory wiring.
       [Decompose Quickstart]
-- [ ] Add `tests/fixtures/quickstart-workflow/WORKFLOW.md` and
+- [x] Add `tests/fixtures/quickstart-workflow/WORKFLOW.md` and
       `issues.yaml` exercising both new mock kinds; `assert_cmd` smoke
       test that `symphony run` against them dispatches at least one
       issue and exits cleanly on SIGINT.

@@ -1,0 +1,27 @@
+# Canned issues consumed by the `MockTracker` in the Quickstart fixture.
+#
+# The schema is the one defined in `symphony-tracker::fixtures` —
+# `active:` becomes the `fetch_active` reply, `terminal:` becomes the
+# `fetch_terminal_recent` reply (subject to caller-side state filters).
+#
+# Keep at least one entry whose `state` matches an entry in the
+# WORKFLOW.md `tracker.active_states` list — otherwise the smoke test
+# will see an empty active set and never dispatch.
+active:
+  - id: quick-1
+    identifier: QUICK-1
+    title: Wire up the Symphony quickstart
+    state: Todo
+    description: |
+      Sample issue for the Quickstart smoke test. Symphony will dispatch
+      this issue against the mock agent, which replies with a scripted
+      Started/Message/Completed sequence and exits.
+  - id: quick-2
+    identifier: QUICK-2
+    title: Show that concurrent dispatch works
+    state: In Progress
+    description: |
+      Second active issue so the smoke test exercises the
+      `max_concurrent_agents > 1` path with the mock agent.
+
+terminal: []
