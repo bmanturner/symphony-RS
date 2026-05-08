@@ -118,7 +118,7 @@ under their phase header and are added or refined as the project evolves.
 
 ## Phase 6 — Tandem mode
 
-- [ ] `TandemRunner` wrapping two inner `AgentRunner`s with strategy enum
+- [x] `TandemRunner` wrapping two inner `AgentRunner`s with strategy enum
 - [ ] `draft-review` strategy: lead drafts, follower reviews, orchestrator
       decides accept-or-rerun [TandemRunner]
 - [ ] `split-implement` strategy: lead plans, follower executes claimed
