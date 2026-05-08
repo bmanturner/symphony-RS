@@ -155,6 +155,15 @@ pub struct WorkflowConfig {
     /// (only GitHub supports PR mutations today).
     #[serde(default)]
     pub pull_requests: PullRequestConfig,
+
+    /// QA gate policy. SPEC v2 §5.12. Defaults to `required: false`
+    /// with no `owner_role` so a workflow that omits the block behaves
+    /// identically to v1 (no QA gate). When `required` flips to true,
+    /// later phases enforce that `owner_role` resolves to a role of
+    /// `kind: qa_gate` and that the gate observes the documented
+    /// blocker-policy semantics.
+    #[serde(default)]
+    pub qa: QaConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -184,6 +193,7 @@ impl Default for WorkflowConfig {
             decomposition: DecompositionConfig::default(),
             integration: IntegrationConfig::default(),
             pull_requests: PullRequestConfig::default(),
+            qa: QaConfig::default(),
         }
     }
 }
@@ -1650,6 +1660,196 @@ pub enum PrMarkReadyStage {
     /// The orchestrator never auto-promotes. The integration owner
     /// or an operator marks the PR ready out-of-band.
     Manual,
+}
+
+// ---------------------------------------------------------------------------
+// qa (SPEC v2 §5.12)
+// ---------------------------------------------------------------------------
+
+/// QA gate policy.
+///
+/// SPEC v2 §5.12 makes QA a first-class gate: by the time a parent
+/// closes, QA must either have signed off or been waived by an
+/// authorised role. This struct is the typed mirror of the YAML
+/// surface; the kernel consumes the discriminants on it (notably
+/// [`BlockerPolicy`] and the [`QaEvidenceRequired`] flags) directly.
+///
+/// Defaults are deliberately conservative: `required: false` with no
+/// `owner_role` means an omitted `qa:` block behaves identically to v1
+/// (no QA gate). When the operator flips `required: true`, later
+/// phases enforce that `owner_role` resolves to a role of
+/// `kind: qa_gate` and that any waiver references resolve to
+/// configured roles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QaConfig {
+    /// Role name (key into [`WorkflowConfig::roles`]) responsible for
+    /// running the QA gate. Optional at parse time so partial fixtures
+    /// can declare an empty `qa:` block; later phases enforce that the
+    /// reference resolves to a role of `kind: qa_gate` whenever
+    /// `required` is true.
+    #[serde(default)]
+    pub owner_role: Option<String>,
+
+    /// Master switch. When `false` (the default), the orchestrator
+    /// skips the QA gate entirely and the integration owner can
+    /// promote PRs / close parents without a QA verdict. The SPEC
+    /// recommends `true` for any workflow with non-trivial runtime
+    /// behaviour; the default stays off so a stub workflow loads
+    /// cleanly.
+    #[serde(default)]
+    pub required: bool,
+
+    /// When `true` (the default once enabled), QA is expected to walk
+    /// every acceptance criterion against the final integration
+    /// branch, not just the diff. SPEC v2 §5.12 calls this out
+    /// explicitly because QA reading just the unified diff is the
+    /// most common way QA misses runtime regressions.
+    #[serde(default = "default_true")]
+    pub exhaustive: bool,
+
+    /// When `false` (the default), QA MUST capture runtime/visual
+    /// evidence for runtime-sensitive work (TUI, UI, async I/O). A
+    /// value of `true` lets QA close out from static review alone —
+    /// use only for read-only tooling or workflows that explicitly
+    /// accept the static-only risk.
+    #[serde(default)]
+    pub allow_static_only: bool,
+
+    /// When `true` (the default), QA may file blockers that route
+    /// back to specialists or the integration owner. Setting this to
+    /// `false` neuters QA's authority and is rarely correct; it is
+    /// preserved for read-only environments where the tracker
+    /// adapter cannot create blocker records.
+    #[serde(default = "default_true")]
+    pub can_file_blockers: bool,
+
+    /// When `true` (the default), QA may file follow-up issues for
+    /// adjacent problems uncovered during review. Pairs with the
+    /// follow-up policy in SPEC v2 §5.13 (typed in a later phase).
+    #[serde(default = "default_true")]
+    pub can_file_followups: bool,
+
+    /// What a QA-filed blocker means for the parent. Defaults to
+    /// [`BlockerPolicy::BlocksParent`] per SPEC v2 §5.12: an open QA
+    /// blocker keeps the parent from closing until a waiver or
+    /// resolution lands.
+    #[serde(default)]
+    pub blocker_policy: BlockerPolicy,
+
+    /// Role names (keys into [`WorkflowConfig::roles`]) authorised to
+    /// record a `waived` QA verdict. Empty by default — a fresh
+    /// workflow refuses waivers until an operator names the
+    /// authorising role explicitly. The SPEC requires every waiver
+    /// to include a reason; that's enforced on the verdict surface
+    /// rather than this list.
+    #[serde(default)]
+    pub waiver_roles: Vec<String>,
+
+    /// Evidence categories QA must produce for an accepting verdict.
+    /// SPEC v2 §5.12 lists four bundled defaults; per-category
+    /// flipping (e.g. dropping `visual_or_runtime_evidence_when_applicable`
+    /// for read-only adapters) is allowed but discouraged. See
+    /// [`QaEvidenceRequired`].
+    #[serde(default)]
+    pub evidence_required: QaEvidenceRequired,
+
+    /// When `true` (the default), the QA gate reruns automatically
+    /// once every blocker it filed is resolved. Setting this to
+    /// `false` keeps QA on the manual queue after a blocker round —
+    /// useful when the QA agent is expensive and operators want to
+    /// batch reruns.
+    #[serde(default = "default_true")]
+    pub rerun_after_blockers_resolved: bool,
+}
+
+impl Default for QaConfig {
+    fn default() -> Self {
+        Self {
+            owner_role: None,
+            required: false,
+            exhaustive: true,
+            allow_static_only: false,
+            can_file_blockers: true,
+            can_file_followups: true,
+            blocker_policy: BlockerPolicy::default(),
+            waiver_roles: Vec::new(),
+            evidence_required: QaEvidenceRequired::default(),
+            rerun_after_blockers_resolved: true,
+        }
+    }
+}
+
+/// What a QA-filed blocker means for parent completion (SPEC v2
+/// §5.12 `blocker_policy`).
+///
+/// Defaults to [`BlockerPolicy::BlocksParent`]: the kernel refuses to
+/// close the parent while any QA blocker is open unless a role from
+/// `qa.waiver_roles` records a waiver with a reason.
+/// [`BlockerPolicy::Advisory`] is the escape hatch for workflows that
+/// want QA's voice surfaced as comments/labels without the hard gate
+/// — rarely correct, but required for some read-only audit pipelines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerPolicy {
+    /// QA blockers block parent completion until resolved or waived.
+    /// Default per SPEC v2 §5.12.
+    #[default]
+    BlocksParent,
+    /// QA blockers are recorded but do not gate parent completion.
+    /// Use only for advisory pipelines where QA's role is reporting,
+    /// not gating.
+    Advisory,
+}
+
+/// Evidence categories the QA gate must capture for an accepting
+/// verdict (SPEC v2 §5.12 `evidence_required`).
+///
+/// All four flags default to `true`. Per-category flipping is
+/// allowed (e.g. `visual_or_runtime_evidence_when_applicable: false`
+/// for a workflow whose only runtime is HTTP that CI already
+/// covers), but the kernel surfaces a warning whenever an evidence
+/// category is dropped so operators don't quietly weaken QA over
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QaEvidenceRequired {
+    /// Test runs (unit/integration as applicable) must be exercised
+    /// against the integration branch. Default `true`.
+    #[serde(default = "default_true")]
+    pub tests: bool,
+
+    /// Every changed file in the integration diff must be reviewed.
+    /// Default `true`. Pairs with `exhaustive` on [`QaConfig`]: the
+    /// flag here speaks to *coverage*, the `exhaustive` flag speaks
+    /// to *depth*.
+    #[serde(default = "default_true")]
+    pub changed_files_review: bool,
+
+    /// Each acceptance criterion on the work item must be traced to
+    /// concrete evidence (test, screenshot, log excerpt, etc.).
+    /// Default `true`.
+    #[serde(default = "default_true")]
+    pub acceptance_criteria_trace: bool,
+
+    /// Runtime-sensitive work (TUI, UI, async I/O) must include
+    /// visual or runtime evidence (screenshot, recording, captured
+    /// log). When the work is not runtime-sensitive QA records the
+    /// not-applicable rationale; this flag never silently degrades
+    /// to "skipped". Default `true`.
+    #[serde(default = "default_true")]
+    pub visual_or_runtime_evidence_when_applicable: bool,
+}
+
+impl Default for QaEvidenceRequired {
+    fn default() -> Self {
+        Self {
+            tests: true,
+            changed_files_review: true,
+            acceptance_criteria_trace: true,
+            visual_or_runtime_evidence_when_applicable: true,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3658,5 +3858,217 @@ routing:
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn qa_block_defaults_when_omitted() {
+        // SPEC v2 §5.12 defaults: an omitted `qa:` block must produce
+        // safe defaults — disabled, no owner, exhaustive, no static
+        // shortcut, can file blockers/followups, blocks parent on
+        // blocker, no waivers, all evidence categories required, and
+        // auto-rerun after blockers resolve.
+        let cfg = WorkflowConfig::default();
+        let q = &cfg.qa;
+        assert!(q.owner_role.is_none());
+        assert!(!q.required);
+        assert!(q.exhaustive);
+        assert!(!q.allow_static_only);
+        assert!(q.can_file_blockers);
+        assert!(q.can_file_followups);
+        assert_eq!(q.blocker_policy, BlockerPolicy::BlocksParent);
+        assert!(q.waiver_roles.is_empty());
+        assert!(q.evidence_required.tests);
+        assert!(q.evidence_required.changed_files_review);
+        assert!(q.evidence_required.acceptance_criteria_trace);
+        assert!(
+            q.evidence_required
+                .visual_or_runtime_evidence_when_applicable
+        );
+        assert!(q.rerun_after_blockers_resolved);
+    }
+
+    #[test]
+    fn qa_partial_block_inherits_documented_defaults() {
+        // An operator who writes only `required` and `owner_role`
+        // should still get exhaustive=true, blocker_policy=blocks_parent,
+        // every evidence category required, and the auto-rerun.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+qa:
+  owner_role: qa
+  required: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let q = &parsed.qa;
+        assert_eq!(q.owner_role.as_deref(), Some("qa"));
+        assert!(q.required);
+        assert!(q.exhaustive);
+        assert!(!q.allow_static_only);
+        assert!(q.can_file_blockers);
+        assert!(q.can_file_followups);
+        assert_eq!(q.blocker_policy, BlockerPolicy::BlocksParent);
+        assert!(q.waiver_roles.is_empty());
+        assert!(q.evidence_required.tests);
+        assert!(q.evidence_required.changed_files_review);
+        assert!(q.evidence_required.acceptance_criteria_trace);
+        assert!(
+            q.evidence_required
+                .visual_or_runtime_evidence_when_applicable
+        );
+        assert!(q.rerun_after_blockers_resolved);
+    }
+
+    #[test]
+    fn qa_full_block_parses_spec_example() {
+        // Mirrors the SPEC v2 §5.12 worked example verbatim.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+qa:
+  owner_role: qa
+  required: true
+  exhaustive: true
+  allow_static_only: false
+  can_file_blockers: true
+  can_file_followups: true
+  blocker_policy: blocks_parent
+  waiver_roles: [platform_lead]
+  evidence_required:
+    tests: true
+    changed_files_review: true
+    acceptance_criteria_trace: true
+    visual_or_runtime_evidence_when_applicable: true
+  rerun_after_blockers_resolved: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let q = &parsed.qa;
+        assert_eq!(q.owner_role.as_deref(), Some("qa"));
+        assert!(q.required);
+        assert!(q.exhaustive);
+        assert!(!q.allow_static_only);
+        assert!(q.can_file_blockers);
+        assert!(q.can_file_followups);
+        assert_eq!(q.blocker_policy, BlockerPolicy::BlocksParent);
+        assert_eq!(q.waiver_roles, vec!["platform_lead".to_string()]);
+        let e = &q.evidence_required;
+        assert!(e.tests);
+        assert!(e.changed_files_review);
+        assert!(e.acceptance_criteria_trace);
+        assert!(e.visual_or_runtime_evidence_when_applicable);
+        assert!(q.rerun_after_blockers_resolved);
+    }
+
+    #[test]
+    fn qa_blocker_policy_serialises_snake_case() {
+        for (variant, literal) in [
+            (BlockerPolicy::BlocksParent, "blocks_parent"),
+            (BlockerPolicy::Advisory, "advisory"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: BlockerPolicy = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn qa_rejects_unknown_blocker_policy() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+qa:
+  blocker_policy: warns_only
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("warns_only")
+                || msg.contains("unknown variant")
+                || msg.contains("blocks_parent"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn qa_rejects_unknown_top_level_key() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+qa:
+  enabled: true
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("enabled") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn qa_rejects_unknown_evidence_key() {
+        // Typos inside `evidence_required:` must surface so a stray
+        // `test:` (singular) does not silently produce a no-op flag.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+qa:
+  evidence_required:
+    test: true
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn qa_round_trips_through_yaml() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+qa:
+  owner_role: qa
+  required: true
+  exhaustive: false
+  allow_static_only: true
+  can_file_blockers: false
+  can_file_followups: false
+  blocker_policy: advisory
+  waiver_roles: [platform_lead, release_captain]
+  evidence_required:
+    tests: false
+    changed_files_review: true
+    acceptance_criteria_trace: false
+    visual_or_runtime_evidence_when_applicable: true
+  rerun_after_blockers_resolved: false
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.qa.blocker_policy, BlockerPolicy::Advisory);
+        assert_eq!(
+            parsed.qa.waiver_roles,
+            vec!["platform_lead".to_string(), "release_captain".to_string()]
+        );
+        assert!(!parsed.qa.exhaustive);
+        assert!(parsed.qa.allow_static_only);
+        assert!(!parsed.qa.evidence_required.tests);
+        assert!(parsed.qa.evidence_required.changed_files_review);
+        assert!(!parsed.qa.evidence_required.acceptance_criteria_trace);
+        assert!(
+            parsed
+                .qa
+                .evidence_required
+                .visual_or_runtime_evidence_when_applicable
+        );
+        assert!(!parsed.qa.rerun_after_blockers_resolved);
     }
 }
