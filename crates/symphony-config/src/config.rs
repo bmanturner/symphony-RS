@@ -2383,6 +2383,149 @@ pub enum ConfigValidationError {
     /// `observability.sse.bind` must be a parseable `SocketAddr`.
     #[error("observability.sse.bind is not a valid socket address: {0}")]
     ObservabilitySseBindInvalid(String),
+
+    /// At least one role must declare `kind: integration_owner` once any
+    /// integration-owner-driven feature is active (decomposition,
+    /// integration `required_for`, or pull-request lifecycle). SPEC v2
+    /// §5.4 / §5.7 / §5.10 / §5.11.
+    #[error(
+        "workflow requires at least one role with `kind: integration_owner` because {feature} is active"
+    )]
+    MissingIntegrationOwnerRole {
+        /// Which feature triggered the requirement (for operator-facing
+        /// diagnostics — `decomposition`, `integration`, or
+        /// `pull_requests`).
+        feature: String,
+    },
+
+    /// At least one role must declare `kind: qa_gate` when QA is
+    /// required. SPEC v2 §5.4 / §5.12.
+    #[error("workflow requires at least one role with `kind: qa_gate` because qa.required is true")]
+    MissingQaGateRole,
+
+    /// A `*_role` field references a role name that is not defined in
+    /// `roles`. Covers `routing.default_role`, every `routing.rules[].assign_role`,
+    /// `decomposition.owner_role`, `integration.owner_role`,
+    /// `pull_requests.owner_role`, `qa.owner_role`, every entry in
+    /// `qa.waiver_roles`, and `followups.approval_role`.
+    #[error("{field} references role `{role}` which is not defined under `roles`")]
+    UnknownRoleReference {
+        /// Dotted-path locator of the offending field, e.g.
+        /// `routing.rules[2].assign_role`.
+        field: String,
+        /// The role name that failed to resolve.
+        role: String,
+    },
+
+    /// A `*_role` field references a role whose `kind` does not match
+    /// the kind required by that field. SPEC v2 §5.4 ties decomposition,
+    /// integration, and PR ownership to `kind: integration_owner` and
+    /// the QA owner to `kind: qa_gate`.
+    #[error("{field} references role `{role}` of kind {actual:?}, expected {expected:?}")]
+    RoleKindMismatch {
+        /// Dotted-path locator of the offending field.
+        field: String,
+        /// The configured role name.
+        role: String,
+        /// The role's declared kind.
+        actual: RoleKind,
+        /// The kind required by the field.
+        expected: RoleKind,
+    },
+
+    /// A `RoleConfig::agent` field references an agent profile that is
+    /// not defined in `agents`. SPEC v2 §5.4 / §5.5.
+    #[error("role `{role}`.agent references profile `{agent}` which is not defined under `agents`")]
+    UnknownAgentProfileReference {
+        /// Role name whose `agent` field failed to resolve.
+        role: String,
+        /// The agent profile name that was not found.
+        agent: String,
+    },
+
+    /// A composite agent profile's `lead` or `follower` references a
+    /// profile that is not defined in `agents`. SPEC v2 §5.5.
+    #[error(
+        "composite agent `{profile}`.{seat} references profile `{target}` which is not defined under `agents`"
+    )]
+    UnknownCompositeAgentReference {
+        /// Composite profile name (key in `agents`).
+        profile: String,
+        /// Seat (`lead` or `follower`) that failed to resolve.
+        seat: String,
+        /// The referenced profile name that was not found.
+        target: String,
+    },
+
+    /// A composite agent profile points at another composite profile.
+    /// SPEC v2 §5.5 forbids composite-of-composite — `lead`/`follower`
+    /// MUST resolve to concrete backend profiles.
+    #[error(
+        "composite agent `{profile}`.{seat} points at composite profile `{target}`; lead/follower must reference concrete backend profiles"
+    )]
+    NestedCompositeAgentProfile {
+        /// Outer composite profile name.
+        profile: String,
+        /// Seat (`lead` or `follower`) that nested.
+        seat: String,
+        /// The inner composite profile name.
+        target: String,
+    },
+
+    /// `workspace.default_strategy` references a strategy that is not
+    /// defined in `workspace.strategies`. SPEC v2 §5.8.
+    #[error("workspace.default_strategy `{0}` is not defined under workspace.strategies")]
+    UnknownDefaultWorkspaceStrategy(String),
+
+    /// `tracker.active_states` and `tracker.terminal_states` must be
+    /// disjoint. Comparison is case-insensitive because SPEC v2 §5.3.1
+    /// documents tracker state matching as case-insensitive.
+    #[error(
+        "tracker state `{state}` appears in both tracker.active_states and tracker.terminal_states"
+    )]
+    DuplicateTrackerState {
+        /// The offending state name (preserved in the operator's casing).
+        state: String,
+    },
+
+    /// `decomposition.max_depth` must be > 0 once decomposition is
+    /// enabled — a zero depth would forbid the integration owner from
+    /// decomposing anything, which contradicts `enabled: true`.
+    #[error("decomposition.max_depth must be > 0 when decomposition.enabled is true (got {0})")]
+    DecompositionMaxDepthZero(u32),
+
+    /// A branch template is empty or missing the required
+    /// `{{identifier}}` placeholder. SPEC v2 §5.9 documents both
+    /// `child_branch_template` and `integration_branch_template` as
+    /// per-issue templates; without `{{identifier}}` the orchestrator
+    /// would mint colliding branch names.
+    #[error("branching.{field} `{template}` is invalid: {reason}")]
+    InvalidBranchTemplate {
+        /// `child_branch_template` or `integration_branch_template`.
+        field: String,
+        /// The offending template string (preserved verbatim).
+        template: String,
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
+
+    /// `pull_requests.enabled: true` requires a GitHub-capable tracker.
+    /// SPEC v2 §5.11 only documents the GitHub PR surface today; other
+    /// trackers cannot satisfy the create/update/mark-ready mutations.
+    #[error("pull_requests.enabled requires tracker.kind = github (got {actual:?})")]
+    PullRequestsRequireGithubTracker {
+        /// The configured tracker kind that does not support PRs.
+        actual: TrackerKind,
+    },
+
+    /// Workspace strategy and branching policy disagree on shared
+    /// branch usage. SPEC v2 §5.9 chooses the safer setting by
+    /// rejecting the config rather than silently picking one side.
+    #[error("contradictory shared-branch policy: {detail}")]
+    ContradictorySharedBranchPolicy {
+        /// Human-readable description of which two settings disagree.
+        detail: String,
+    },
 }
 
 impl WorkflowConfig {
@@ -2447,6 +2590,311 @@ impl WorkflowConfig {
                     self.observability.sse.bind.clone(),
                 ));
             }
+        }
+        self.validate_tracker_states()?;
+        self.validate_branching_templates()?;
+        self.validate_decomposition_depth()?;
+        self.validate_pr_provider_pairing()?;
+        self.validate_shared_branch_consistency()?;
+        self.validate_workspace_default_strategy()?;
+        self.validate_role_and_agent_references()?;
+        self.validate_required_role_kinds()?;
+        Ok(())
+    }
+
+    /// `active_states` and `terminal_states` must be disjoint
+    /// (case-insensitive). A state name appearing in both lists would
+    /// make the runner's "needs work vs. terminal" classification
+    /// ambiguous — flag it at validate time instead of resolving the
+    /// ambiguity at dispatch.
+    fn validate_tracker_states(&self) -> Result<(), ConfigValidationError> {
+        let active_lower: Vec<String> = self
+            .tracker
+            .active_states
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        for terminal in &self.tracker.terminal_states {
+            if active_lower.contains(&terminal.to_lowercase()) {
+                return Err(ConfigValidationError::DuplicateTrackerState {
+                    state: terminal.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Branch templates MUST be non-empty and MUST contain the
+    /// `{{identifier}}` placeholder so per-issue branch names do not
+    /// collide. SPEC v2 §5.9.
+    fn validate_branching_templates(&self) -> Result<(), ConfigValidationError> {
+        for (field, template) in [
+            (
+                "child_branch_template",
+                &self.branching.child_branch_template,
+            ),
+            (
+                "integration_branch_template",
+                &self.branching.integration_branch_template,
+            ),
+        ] {
+            if template.is_empty() {
+                return Err(ConfigValidationError::InvalidBranchTemplate {
+                    field: field.to_string(),
+                    template: template.clone(),
+                    reason: "must not be empty".to_string(),
+                });
+            }
+            if !template.contains("{{identifier}}") {
+                return Err(ConfigValidationError::InvalidBranchTemplate {
+                    field: field.to_string(),
+                    template: template.clone(),
+                    reason: "must contain `{{identifier}}` placeholder".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// `decomposition.max_depth` is only meaningful when decomposition
+    /// is enabled; a zero depth there would forbid the very behaviour
+    /// the operator opted into.
+    fn validate_decomposition_depth(&self) -> Result<(), ConfigValidationError> {
+        if self.decomposition.enabled && self.decomposition.max_depth == 0 {
+            return Err(ConfigValidationError::DecompositionMaxDepthZero(
+                self.decomposition.max_depth,
+            ));
+        }
+        Ok(())
+    }
+
+    /// PR mutations require a GitHub-capable tracker — Linear and the
+    /// in-memory mock cannot satisfy the SPEC v2 §5.11 surface.
+    fn validate_pr_provider_pairing(&self) -> Result<(), ConfigValidationError> {
+        if self.pull_requests.enabled && self.tracker.kind != TrackerKind::Github {
+            return Err(ConfigValidationError::PullRequestsRequireGithubTracker {
+                actual: self.tracker.kind,
+            });
+        }
+        Ok(())
+    }
+
+    /// Workspace strategy and branching policy MUST agree on shared
+    /// branch usage. SPEC v2 §5.9 rejects the config rather than
+    /// guessing which side is authoritative.
+    fn validate_shared_branch_consistency(&self) -> Result<(), ConfigValidationError> {
+        if !self.branching.allow_same_branch_for_children {
+            if let Some((name, _)) = self
+                .workspace
+                .strategies
+                .iter()
+                .find(|(_, s)| s.kind == WorkspaceStrategyKind::SharedBranch)
+            {
+                return Err(ConfigValidationError::ContradictorySharedBranchPolicy {
+                    detail: format!(
+                        "workspace.strategies.{name} is `shared_branch` but branching.allow_same_branch_for_children is false"
+                    ),
+                });
+            }
+            if self.integration.merge_strategy == MergeStrategy::SharedBranch {
+                return Err(ConfigValidationError::ContradictorySharedBranchPolicy {
+                    detail:
+                        "integration.merge_strategy is `shared_branch` but branching.allow_same_branch_for_children is false"
+                            .to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// `workspace.default_strategy`, when set, MUST resolve to a
+    /// configured strategy. Empty `strategies` plus `default_strategy:
+    /// foo` is the most common typo path here.
+    fn validate_workspace_default_strategy(&self) -> Result<(), ConfigValidationError> {
+        if let Some(name) = &self.workspace.default_strategy
+            && !self.workspace.strategies.contains_key(name)
+        {
+            return Err(ConfigValidationError::UnknownDefaultWorkspaceStrategy(
+                name.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve every workflow-level reference to a role or agent
+    /// profile. SPEC v2 §5.4 / §5.5 / §5.6 / §5.7 / §5.10 / §5.11 /
+    /// §5.12 / §5.13.
+    fn validate_role_and_agent_references(&self) -> Result<(), ConfigValidationError> {
+        // Routing
+        if let Some(name) = &self.routing.default_role
+            && !self.roles.contains_key(name)
+        {
+            return Err(ConfigValidationError::UnknownRoleReference {
+                field: "routing.default_role".to_string(),
+                role: name.clone(),
+            });
+        }
+        for (i, rule) in self.routing.rules.iter().enumerate() {
+            if !self.roles.contains_key(&rule.assign_role) {
+                return Err(ConfigValidationError::UnknownRoleReference {
+                    field: format!("routing.rules[{i}].assign_role"),
+                    role: rule.assign_role.clone(),
+                });
+            }
+        }
+
+        // decomposition.owner_role: must resolve always; must be
+        // integration_owner when decomposition is enabled.
+        self.check_role_ref(
+            "decomposition.owner_role",
+            self.decomposition.owner_role.as_deref(),
+            self.decomposition
+                .enabled
+                .then_some(RoleKind::IntegrationOwner),
+        )?;
+
+        // integration.owner_role: must be integration_owner when
+        // `required_for` is non-empty.
+        self.check_role_ref(
+            "integration.owner_role",
+            self.integration.owner_role.as_deref(),
+            (!self.integration.required_for.is_empty()).then_some(RoleKind::IntegrationOwner),
+        )?;
+
+        // pull_requests.owner_role: must be integration_owner when
+        // PR lifecycle is enabled.
+        self.check_role_ref(
+            "pull_requests.owner_role",
+            self.pull_requests.owner_role.as_deref(),
+            self.pull_requests
+                .enabled
+                .then_some(RoleKind::IntegrationOwner),
+        )?;
+
+        // qa.owner_role: must be qa_gate when `required` is true.
+        self.check_role_ref(
+            "qa.owner_role",
+            self.qa.owner_role.as_deref(),
+            self.qa.required.then_some(RoleKind::QaGate),
+        )?;
+
+        // qa.waiver_roles: must all resolve.
+        for (i, name) in self.qa.waiver_roles.iter().enumerate() {
+            if !self.roles.contains_key(name) {
+                return Err(ConfigValidationError::UnknownRoleReference {
+                    field: format!("qa.waiver_roles[{i}]"),
+                    role: name.clone(),
+                });
+            }
+        }
+
+        // followups.approval_role: must resolve when set.
+        self.check_role_ref(
+            "followups.approval_role",
+            self.followups.approval_role.as_deref(),
+            None,
+        )?;
+
+        // role.agent must resolve in agents.
+        for (role_name, role) in &self.roles {
+            if let Some(agent) = &role.agent
+                && !self.agents.contains_key(agent)
+            {
+                return Err(ConfigValidationError::UnknownAgentProfileReference {
+                    role: role_name.clone(),
+                    agent: agent.clone(),
+                });
+            }
+        }
+
+        // composite.lead/follower must resolve to concrete backend profiles.
+        for (profile_name, profile) in &self.agents {
+            if let AgentProfileConfig::Composite(c) = profile {
+                for (seat, target) in [("lead", &c.lead), ("follower", &c.follower)] {
+                    match self.agents.get(target) {
+                        None => {
+                            return Err(ConfigValidationError::UnknownCompositeAgentReference {
+                                profile: profile_name.clone(),
+                                seat: seat.to_string(),
+                                target: target.clone(),
+                            });
+                        }
+                        Some(AgentProfileConfig::Composite(_)) => {
+                            return Err(ConfigValidationError::NestedCompositeAgentProfile {
+                                profile: profile_name.clone(),
+                                seat: seat.to_string(),
+                                target: target.clone(),
+                            });
+                        }
+                        Some(AgentProfileConfig::Backend(_)) => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cross-cutting "at least one role of kind X" requirements. Run
+    /// after [`Self::validate_role_and_agent_references`] so explicit
+    /// owner_role typos surface first with a more specific error.
+    fn validate_required_role_kinds(&self) -> Result<(), ConfigValidationError> {
+        let need_integration_owner = if self.decomposition.enabled {
+            Some("decomposition")
+        } else if !self.integration.required_for.is_empty() {
+            Some("integration")
+        } else if self.pull_requests.enabled {
+            Some("pull_requests")
+        } else {
+            None
+        };
+        if let Some(feature) = need_integration_owner {
+            let has = self
+                .roles
+                .values()
+                .any(|r| r.kind == RoleKind::IntegrationOwner);
+            if !has {
+                return Err(ConfigValidationError::MissingIntegrationOwnerRole {
+                    feature: feature.to_string(),
+                });
+            }
+        }
+        if self.qa.required {
+            let has = self.roles.values().any(|r| r.kind == RoleKind::QaGate);
+            if !has {
+                return Err(ConfigValidationError::MissingQaGateRole);
+            }
+        }
+        Ok(())
+    }
+
+    /// Helper: confirm an `Option<&str>` role reference resolves and
+    /// (optionally) matches an expected kind. Returns `Ok(())` for a
+    /// `None` reference — required-when-X enforcement lives in the
+    /// caller via the `expected_kind` argument plus the
+    /// [`Self::validate_required_role_kinds`] sweep.
+    fn check_role_ref(
+        &self,
+        field: &str,
+        name: Option<&str>,
+        expected_kind: Option<RoleKind>,
+    ) -> Result<(), ConfigValidationError> {
+        let Some(name) = name else { return Ok(()) };
+        let Some(role) = self.roles.get(name) else {
+            return Err(ConfigValidationError::UnknownRoleReference {
+                field: field.to_string(),
+                role: name.to_string(),
+            });
+        };
+        if let Some(expected) = expected_kind
+            && role.kind != expected
+        {
+            return Err(ConfigValidationError::RoleKindMismatch {
+                field: field.to_string(),
+                role: name.to_string(),
+                actual: role.kind,
+                expected,
+            });
         }
         Ok(())
     }
@@ -5028,5 +5476,505 @@ hooks:
             msg.contains("after_create") || msg.contains("sequence") || msg.contains("expected"),
             "expected sequence-shape error, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 1 cross-cutting validation (CHECKLIST_v2 phase 1)
+    // -----------------------------------------------------------------
+
+    /// Build a minimal valid Linear-tracker config that the cross-cutting
+    /// validation tests can mutate. Centralised so a future field
+    /// requirement only has to be added in one place.
+    fn minimal_linear_cfg() -> WorkflowConfig {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg
+    }
+
+    fn role(kind: RoleKind) -> RoleConfig {
+        RoleConfig {
+            kind,
+            description: None,
+            agent: None,
+            max_concurrent: None,
+            can_decompose: None,
+            can_assign: None,
+            can_request_qa: None,
+            can_close_parent: None,
+            can_file_blockers: None,
+            can_file_followups: None,
+            required_for_done: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_overlapping_tracker_states() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.tracker.active_states = vec!["Todo".into(), "In Progress".into()];
+        cfg.tracker.terminal_states = vec!["Done".into(), "in progress".into()];
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::DuplicateTrackerState {
+                state: "in progress".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_branch_template() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.branching.child_branch_template = String::new();
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigValidationError::InvalidBranchTemplate { field, reason, .. } => {
+                assert_eq!(field, "child_branch_template");
+                assert!(reason.contains("empty"), "got reason: {reason}");
+            }
+            other => panic!("expected InvalidBranchTemplate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_branch_template_missing_identifier_placeholder() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.branching.integration_branch_template = "symphony/integration".into();
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigValidationError::InvalidBranchTemplate { field, reason, .. } => {
+                assert_eq!(field, "integration_branch_template");
+                assert!(reason.contains("{{identifier}}"), "got reason: {reason}");
+            }
+            other => panic!("expected InvalidBranchTemplate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_decomposition_max_depth_when_enabled() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.decomposition.enabled = true;
+        cfg.decomposition.owner_role = Some("lead".into());
+        cfg.decomposition.max_depth = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::DecompositionMaxDepthZero(0))
+        );
+    }
+
+    #[test]
+    fn validate_ignores_zero_decomposition_max_depth_when_disabled() {
+        // When decomposition is disabled the depth field is inert; a
+        // zero value should not fail validation.
+        let mut cfg = minimal_linear_cfg();
+        cfg.decomposition.enabled = false;
+        cfg.decomposition.max_depth = 0;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_pull_requests_without_github_tracker() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.pull_requests.enabled = true;
+        cfg.pull_requests.owner_role = Some("lead".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::PullRequestsRequireGithubTracker {
+                actual: TrackerKind::Linear,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_accepts_pull_requests_with_github_tracker() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.pull_requests.enabled = true;
+        cfg.pull_requests.owner_role = Some("lead".into());
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_shared_branch_strategy_when_branching_disallows_it() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.workspace.strategies.insert(
+            "shared".into(),
+            WorkspaceStrategyConfig {
+                kind: WorkspaceStrategyKind::SharedBranch,
+                base: None,
+                branch_template: None,
+                cleanup: WorkspaceCleanupPolicy::default(),
+                path: None,
+                require_branch: Some("symphony/integration/main".into()),
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        let detail = match err {
+            ConfigValidationError::ContradictorySharedBranchPolicy { detail } => detail,
+            other => panic!("expected ContradictorySharedBranchPolicy, got {other:?}"),
+        };
+        assert!(detail.contains("shared"), "got detail: {detail}");
+    }
+
+    #[test]
+    fn validate_rejects_shared_branch_merge_strategy_when_branching_disallows_it() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.integration.merge_strategy = MergeStrategy::SharedBranch;
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigValidationError::ContradictorySharedBranchPolicy { detail } => {
+                assert!(
+                    detail.contains("integration.merge_strategy"),
+                    "got detail: {detail}"
+                );
+            }
+            other => panic!("expected ContradictorySharedBranchPolicy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_shared_branch_strategy_when_branching_allows_it() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.branching.allow_same_branch_for_children = true;
+        cfg.workspace.strategies.insert(
+            "shared".into(),
+            WorkspaceStrategyConfig {
+                kind: WorkspaceStrategyKind::SharedBranch,
+                base: None,
+                branch_template: None,
+                cleanup: WorkspaceCleanupPolicy::default(),
+                path: None,
+                require_branch: Some("symphony/integration/main".into()),
+            },
+        );
+        cfg.integration.merge_strategy = MergeStrategy::SharedBranch;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_workspace_default_strategy() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.workspace.default_strategy = Some("issue_worktree".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownDefaultWorkspaceStrategy(
+                "issue_worktree".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_routing_default_role() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.routing.default_role = Some("ghost".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "routing.default_role".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_routing_rule_assign_role() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.routing.rules.push(RoutingRule {
+            priority: None,
+            when: RoutingMatch::default(),
+            assign_role: "ghost".into(),
+        });
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "routing.rules[0].assign_role".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_decomposition_owner_role_typo() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.decomposition.enabled = true;
+        cfg.decomposition.owner_role = Some("led".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "decomposition.owner_role".into(),
+                role: "led".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_decomposition_owner_role_with_wrong_kind() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("worker".into(), role(RoleKind::Specialist));
+        cfg.roles
+            .insert("lead".into(), role(RoleKind::IntegrationOwner));
+        cfg.decomposition.enabled = true;
+        cfg.decomposition.owner_role = Some("worker".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::RoleKindMismatch {
+                field: "decomposition.owner_role".into(),
+                role: "worker".into(),
+                actual: RoleKind::Specialist,
+                expected: RoleKind::IntegrationOwner,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_qa_owner_role_with_wrong_kind() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("worker".into(), role(RoleKind::Specialist));
+        cfg.qa.required = true;
+        cfg.qa.owner_role = Some("worker".into());
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::RoleKindMismatch {
+                field: "qa.owner_role".into(),
+                role: "worker".into(),
+                actual: RoleKind::Specialist,
+                expected: RoleKind::QaGate,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_qa_waiver_role() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles.insert("qa".into(), role(RoleKind::QaGate));
+        cfg.qa.required = true;
+        cfg.qa.owner_role = Some("qa".into());
+        cfg.qa.waiver_roles = vec!["ghost".into()];
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownRoleReference {
+                field: "qa.waiver_roles[0]".into(),
+                role: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_integration_owner_when_decomposition_enabled() {
+        // No role of kind: integration_owner; decomposition is enabled
+        // with no owner_role set, so the owner_role typo check passes
+        // and the cross-cutting "must have at least one" error fires.
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("worker".into(), role(RoleKind::Specialist));
+        cfg.decomposition.enabled = false; // owner-role check off
+        cfg.integration.required_for = vec![IntegrationRequirement::DecomposedParent];
+        // need_int_owner is true via `integration.required_for`.
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::MissingIntegrationOwnerRole {
+                feature: "integration".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_qa_gate_when_qa_required() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.roles
+            .insert("worker".into(), role(RoleKind::Specialist));
+        cfg.qa.required = true;
+        // owner_role unset — required-kind sweep fires.
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::MissingQaGateRole)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_role_agent_reference() {
+        let mut cfg = minimal_linear_cfg();
+        let mut r = role(RoleKind::Specialist);
+        r.agent = Some("ghost".into());
+        cfg.roles.insert("worker".into(), r);
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownAgentProfileReference {
+                role: "worker".into(),
+                agent: "ghost".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_composite_agent_reference() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.agents.insert(
+            "tandem".into(),
+            AgentProfileConfig::Composite(AgentCompositeProfile {
+                strategy: AgentStrategy::Tandem,
+                lead: "lead".into(),
+                follower: "ghost".into(),
+                mode: TandemMode::DraftReview,
+                description: None,
+            }),
+        );
+        cfg.agents.insert(
+            "lead".into(),
+            AgentProfileConfig::Backend(Box::new(AgentBackendProfile {
+                backend: AgentBackend::Mock,
+                description: None,
+                command: None,
+                model: None,
+                system_prompt: None,
+                tools: Vec::new(),
+                env: BTreeMap::new(),
+                memory: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                max_turns: None,
+                turn_timeout_ms: None,
+                stall_timeout_ms: None,
+                token_budget: None,
+                cost_budget_usd: None,
+            })),
+        );
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigValidationError::UnknownCompositeAgentReference {
+                profile,
+                seat,
+                target,
+            } => {
+                assert_eq!(profile, "tandem");
+                assert_eq!(seat, "follower");
+                assert_eq!(target, "ghost");
+            }
+            other => panic!("expected UnknownCompositeAgentReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_nested_composite_agent_profile() {
+        let backend = AgentProfileConfig::Backend(Box::new(AgentBackendProfile {
+            backend: AgentBackend::Mock,
+            description: None,
+            command: None,
+            model: None,
+            system_prompt: None,
+            tools: Vec::new(),
+            env: BTreeMap::new(),
+            memory: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            max_turns: None,
+            turn_timeout_ms: None,
+            stall_timeout_ms: None,
+            token_budget: None,
+            cost_budget_usd: None,
+        }));
+        let inner = AgentProfileConfig::Composite(AgentCompositeProfile {
+            strategy: AgentStrategy::Tandem,
+            lead: "real".into(),
+            follower: "real".into(),
+            mode: TandemMode::DraftReview,
+            description: None,
+        });
+        let outer = AgentProfileConfig::Composite(AgentCompositeProfile {
+            strategy: AgentStrategy::Tandem,
+            lead: "inner".into(),
+            follower: "real".into(),
+            mode: TandemMode::DraftReview,
+            description: None,
+        });
+        let mut cfg = minimal_linear_cfg();
+        cfg.agents.insert("real".into(), backend);
+        cfg.agents.insert("inner".into(), inner);
+        cfg.agents.insert("outer".into(), outer);
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigValidationError::NestedCompositeAgentProfile {
+                profile,
+                seat,
+                target,
+            } => {
+                assert_eq!(profile, "outer");
+                assert_eq!(seat, "lead");
+                assert_eq!(target, "inner");
+            }
+            other => panic!("expected NestedCompositeAgentProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_full_v2_workflow_with_all_features() {
+        // Smoke test: a workflow that turns on every feature at once
+        // and wires every cross-reference correctly should validate
+        // cleanly. Catches regressions where a new check is too eager.
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.roles.insert("lead".into(), {
+            let mut r = role(RoleKind::IntegrationOwner);
+            r.agent = Some("codex_default".into());
+            r
+        });
+        cfg.roles.insert("qa".into(), {
+            let mut r = role(RoleKind::QaGate);
+            r.agent = Some("codex_default".into());
+            r
+        });
+        cfg.roles.insert("worker".into(), {
+            let mut r = role(RoleKind::Specialist);
+            r.agent = Some("codex_default".into());
+            r
+        });
+        cfg.agents.insert(
+            "codex_default".into(),
+            AgentProfileConfig::Backend(Box::new(AgentBackendProfile {
+                backend: AgentBackend::Mock,
+                description: None,
+                command: None,
+                model: None,
+                system_prompt: None,
+                tools: Vec::new(),
+                env: BTreeMap::new(),
+                memory: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                max_turns: None,
+                turn_timeout_ms: None,
+                stall_timeout_ms: None,
+                token_budget: None,
+                cost_budget_usd: None,
+            })),
+        );
+        cfg.routing.default_role = Some("worker".into());
+        cfg.routing.rules.push(RoutingRule {
+            priority: None,
+            when: RoutingMatch::default(),
+            assign_role: "lead".into(),
+        });
+        cfg.decomposition.enabled = true;
+        cfg.decomposition.owner_role = Some("lead".into());
+        cfg.integration.owner_role = Some("lead".into());
+        cfg.integration.required_for = vec![IntegrationRequirement::DecomposedParent];
+        cfg.pull_requests.enabled = true;
+        cfg.pull_requests.owner_role = Some("lead".into());
+        cfg.qa.required = true;
+        cfg.qa.owner_role = Some("qa".into());
+        cfg.qa.waiver_roles = vec!["lead".into()];
+        cfg.followups.enabled = true;
+        cfg.followups.approval_role = Some("lead".into());
+        assert_eq!(cfg.validate(), Ok(()));
     }
 }
