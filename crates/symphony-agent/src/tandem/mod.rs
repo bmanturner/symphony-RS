@@ -33,6 +33,17 @@
 //! signal terminal once *both* are done. The hand-rolled state machine
 //! in `TandemStream` is small enough that pulling in `async-stream`
 //! solely for `stream! { ... }` would not be a net win.
+//!
+//! # Strategy dispatch
+//!
+//! [`TandemStrategy::Consensus`] uses the parallel poll-merge baseline
+//! defined in this file. [`TandemStrategy::DraftReview`] is sequential
+//! (lead drafts, then follower reviews) and is implemented in the
+//! private `draft_review` submodule. [`TandemStrategy::SplitImplement`]
+//! currently falls through to the baseline pending its own checklist
+//! item.
+
+mod draft_review;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -135,6 +146,15 @@ impl TandemRunner {
 #[async_trait]
 impl AgentRunner for TandemRunner {
     async fn start_session(&self, params: StartSessionParams) -> AgentResult<AgentSession> {
+        // Strategy-specific dispatch. Draft-review is sequential (lead
+        // first, follower reviews after) and lives in its own module.
+        // Consensus and split-implement currently share the parallel
+        // poll-merge baseline below; split-implement gets its own commit
+        // once the orchestrator-side subtask routing lands.
+        if matches!(self.strategy, TandemStrategy::DraftReview) {
+            return draft_review::start(self.lead.clone(), self.follower.clone(), params).await;
+        }
+
         // Lead first so a follower-launch failure can clean up by aborting
         // the already-started lead instead of leaving an orphan subprocess.
         let lead_session = self.lead.start_session(params.clone()).await?;
@@ -491,12 +511,18 @@ mod tests {
         // observe the lead's abort directly here without a richer stub,
         // so this test covers the error-propagation path; lead-abort
         // wiring is exercised by the lead-side abort assertions.
+        //
+        // Pinned to `Consensus` because the baseline parallel-start path
+        // is what surfaces follower-spawn errors synchronously.
+        // Draft-review is sequential — it starts the follower only after
+        // the lead's draft completes, so its follower-failure path is
+        // covered by the in-stream `Failed` test in `draft_review`.
         let lead = StubRunner::new("lead-1", vec![done("lead-1")]);
         let follower = StubRunner::failing();
         let runner = TandemRunner::new(
             lead.clone() as Arc<dyn AgentRunner>,
             follower as Arc<dyn AgentRunner>,
-            TandemStrategy::DraftReview,
+            TandemStrategy::Consensus,
         );
 
         let err = match runner.start_session(params()).await {
