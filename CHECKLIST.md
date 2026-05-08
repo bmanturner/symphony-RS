@@ -85,7 +85,7 @@ under their phase header and are added or refined as the project evolves.
 
 ## Phase 3 — Workspace manager
 
-- [ ] `WorkspaceManager` trait + `LocalFsWorkspace` implementation
+- [x] `WorkspaceManager` trait + `LocalFsWorkspace` implementation
 - [ ] Sanitization rule (`[A-Za-z0-9._-]` → `_`) with property tests
 - [ ] Containment check rejecting `..`, absolute, and Unicode-look-alike
       attacks [sanitization]
