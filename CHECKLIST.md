@@ -97,7 +97,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] Define `AgentRunner` trait + `AgentEvent` enum + `SessionId`
 - [x] Codex JSONL protocol decoder; `CodexRunner` spawning `codex
       app-server` [AgentRunner trait]
-- [ ] Claude stream-json decoder; `ClaudeRunner` spawning `claude -p
+- [x] Claude stream-json decoder; `ClaudeRunner` spawning `claude -p
       --output-format stream-json --permission-mode bypassPermissions
       --session-id <uuid>` [AgentRunner trait]
 - [ ] Subprocess tests with a fake binary in `tests/fixtures/`
