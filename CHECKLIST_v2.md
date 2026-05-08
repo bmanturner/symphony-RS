@@ -6,15 +6,15 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Add `SPEC_v2.md`, `ARCHITECTURE_v2.md`, `PLAN_v2.md`, `CHECKLIST_v2.md`, and `PROMPT_v2.md` to the repo root.
 - [ ] Add README note that v2 files are the product direction and existing implementation docs should be updated as the code moves to that direction.
-- [ ] Add a `version: 2` fixture workflow under `tests/fixtures/v2-workflow/WORKFLOW.md` with roles, routing, integration, and QA sections.
+- [ ] Add a target workflow fixture under `tests/fixtures/workflow/WORKFLOW.md` with roles, routing, integration, PR, and QA sections.
 
-## Phase 1 — Config v2 Schema
+## Phase 1 — Workflow Config Schema
 
-- [ ] Add `WorkflowConfigV2` behind `version: 2` detection in `symphony-config`.
+- [ ] Replace the current workflow config shape with `WorkflowConfig`; use `schema_version` only as an optional file-format guard, not as a parallel implementation type.
 - [ ] Add typed `RoleConfig` with `kind = integration_owner | qa_gate | specialist | reviewer | operator | custom`; `custom` is a role kind, not an adapter extension point.
 - [ ] Add typed `AgentProfileConfig` decoupled from role names.
 - [ ] Add typed `RoutingConfig` and `RoutingRule` with deterministic first-match behavior.
-- [ ] Add `DecompositionConfig`, `IntegrationConfig`, `QaConfig`, and `FollowupConfig`.
+- [ ] Add `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, and `FollowupConfig`.
 - [ ] Add `WorkspacePolicyConfig` and `BranchPolicyConfig` for worktree/shared-branch strategies.
 - [ ] Add v2 validation errors: missing integration owner role, missing QA role when QA required, unknown role/agent references, invalid max depth, invalid branch template.
 - [ ] Add round-trip tests for a full v2 workflow fixture.
@@ -54,7 +54,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 5 — Routing and Decomposition
 
-- [ ] Implement routing engine that maps normalized work items to roles from v2 config.
+- [ ] Implement routing engine that maps normalized work items to roles from workflow config.
 - [ ] Add tests for first-match and priority-based routing.
 - [ ] Add decomposition proposal type with child scopes, role assignments, dependencies, and acceptance criteria.
 - [ ] Implement integration-owner decomposition runner path.
@@ -89,13 +89,13 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add integration record persistence.
 - [ ] Add git integration operation abstraction: merge/cherry-pick/shared-branch verification.
 - [ ] Add gate requiring all child issues terminal before integration unless explicitly waived.
-- [ ] Add gate requiring no open blockers before QA request.
-- [ ] Add tests for child completion, blocker prevention, successful integration handoff, and conflict/rework path.
+- [ ] Add gate requiring no open blockers before draft PR creation and QA request.
+- [ ] Add tests for child completion, blocker prevention, draft PR creation, successful integration handoff, and conflict/rework path.
 
 ## Phase 9 — QA Gate Flow
 
-- [ ] Add QA queue fed by integration handoffs or direct specialist handoffs for simple issues.
-- [ ] Implement QA run request with final branch/workspace, acceptance trace, changed files, and prior handoffs.
+- [ ] Add QA queue fed by draft PRs/integration handoffs or direct specialist handoffs for simple issues.
+- [ ] Implement QA run request with draft PR ref, final branch/workspace, acceptance trace, changed files, CI/check status, and prior handoffs.
 - [ ] Add QA verdict persistence.
 - [ ] Add blocker creation from QA verdict when failures are found.
 - [ ] Add policy: QA blockers block parent completion by default.
@@ -143,7 +143,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 14 — Documentation and Productization
 
-- [ ] Write `docs/workflow-v2.md` with full schema examples.
+- [ ] Write `docs/workflow.md` with full schema examples.
 - [ ] Write `docs/roles.md` explaining integration owner, QA gate, and configurable specialists.
 - [ ] Write `docs/workspaces.md` explaining worktree/shared-branch policies.
 - [ ] Write `docs/qa.md` explaining verdicts, blockers, evidence, and waivers.

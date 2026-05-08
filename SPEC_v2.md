@@ -112,6 +112,7 @@ Optional structured fields:
 - `acceptance_criteria`.
 - `qa_requirements`.
 - `integration_target`.
+- `pull_request`.
 - `related_prs`.
 - `run_summary`.
 
@@ -267,12 +268,12 @@ Agents MAY:
 - attach to current issue as non-blocking follow-up;
 - attach as blocking if it invalidates acceptance.
 
-## 5. WORKFLOW.md v2 Schema
+## 5. WORKFLOW.md Schema
 
 Top-level keys:
 
 ```yaml
-version: 2
+schema_version: 1
 tracker: {}
 persistence: {}
 roles: {}
@@ -456,10 +457,46 @@ Integration owner responsibilities:
 - consolidate changes into the canonical integration branch/worktree;
 - resolve conflicts;
 - run integration tests;
+- open or refresh the draft PR when PR policy requires it;
 - produce handoff for QA;
 - request QA only when ready.
 
-### 5.10 `qa`
+### 5.10 `pull_requests`
+
+```yaml
+pull_requests:
+  enabled: true
+  owner_role: platform_lead
+  provider: github
+  open_stage: after_integration_verification
+  initial_state: draft
+  mark_ready_stage: after_qa_passes
+  title_template: "{{identifier}}: {{title}}"
+  body_template: |
+    ## Summary
+    {{integration.summary}}
+
+    ## QA
+    {{qa.status}}
+
+    ## Linked work
+    {{links}}
+  link_tracker_issues: true
+  require_ci_green_before_ready: true
+```
+
+PR lifecycle rules:
+
+- Specialists do not open PRs by default.
+- The integration owner owns PR creation and final PR state.
+- `git` prepares and pushes the canonical branch; GitHub opens, updates, marks ready, and reports checks for the PR.
+- The default PR is a draft opened after integration verification passes.
+- QA runs against the draft PR branch and records CI/check status as evidence.
+- QA blockers keep the PR draft/blocked until resolved.
+- After QA passes, the integration owner marks the PR ready for review or hands it off according to workflow policy.
+- The tracker is updated with the PR URL/ref, and follow-up/blocker issues should link back to the PR when relevant.
+
+### 5.11 `qa`
 
 ```yaml
 qa:
@@ -480,7 +517,7 @@ qa:
 
 QA MUST verify acceptance criteria against the final integration branch/worktree, not only child branches. QA MAY file blockers that route back to specialists or the integration owner.
 
-### 5.11 `followups`
+### 5.12 `followups`
 
 ```yaml
 followups:
@@ -492,7 +529,7 @@ followups:
   require_acceptance_criteria: true
 ```
 
-### 5.12 `observability`
+### 5.13 `observability`
 
 ```yaml
 observability:
@@ -506,7 +543,7 @@ observability:
   dashboard: optional
 ```
 
-### 5.13 `budgets`
+### 5.14 `budgets`
 
 ```yaml
 budgets:
@@ -518,7 +555,7 @@ budgets:
 
 Budget exhaustion MUST produce a structured pause/block, not silent failure.
 
-### 5.14 `security`
+### 5.15 `security`
 
 ```yaml
 security:
@@ -561,8 +598,9 @@ security:
 2. Consolidates changes into canonical integration branch/worktree.
 3. Runs integration verification.
 4. Resolves conflicts and regressions.
-5. Produces integration handoff.
-6. Requests QA.
+5. Opens or refreshes the draft PR when PR policy requires it.
+6. Produces integration handoff.
+7. Requests QA.
 
 ### 6.5 QA
 
@@ -622,8 +660,8 @@ The supported source-control adapter is `git`.
 - verify cwd and branch;
 - diff/status;
 - merge/cherry-pick/rebase if policy allows;
-- open or attach PR if configured;
-- fetch CI status if configured.
+- push branches for PR creation;
+- expose branch/ref data to the GitHub adapter for PR creation.
 
 ### 7.4 AgentRuntime
 

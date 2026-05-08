@@ -97,9 +97,9 @@ QA is a first-class state transition. QA has authority to reject, file blockers,
 
 ### 4.1 `symphony-config`
 
-Add typed v2 workflow config:
+Add typed workflow config:
 
-- `WorkflowConfigV2`;
+- `WorkflowConfig`;
 - `RoleConfig`;
 - `AgentProfileConfig`;
 - `RoutingRule`;
@@ -112,7 +112,7 @@ Add typed v2 workflow config:
 - `PersistenceConfig`;
 - `BudgetConfig`.
 
-Make the target workflow schema the product direction. The loader should parse `version: 2` strictly and existing config should be changed as necessary rather than protected indefinitely.
+Make the target workflow schema the product direction. The loader should parse the current `WorkflowConfig` strictly and existing config should be changed as necessary rather than protected indefinitely. Use an optional `schema_version` field only as a file-format guard, not as a parallel Rust type hierarchy.
 
 ### 4.2 `symphony-core`
 
@@ -213,7 +213,7 @@ pub trait GitProvider {
     async fn prepare_branch(&self, req: BranchRequest) -> Result<BranchClaim>;
     async fn verify_claim(&self, claim: &WorkspaceClaim) -> Result<VerificationReport>;
     async fn integrate_child(&self, req: IntegrateChildRequest) -> Result<IntegrationStep>;
-    async fn open_pr(&self, req: PullRequestRequest) -> Result<PullRequestRef>;
+    async fn push_branch(&self, req: PushBranchRequest) -> Result<PushedBranchRef>;
 }
 ```
 
@@ -428,7 +428,26 @@ Responsibilities:
 
 A workflow MAY allow the integration owner to implement directly, but it SHOULD require a written rationale on broad work.
 
-## 10. QA Protocol
+## 10. PR Protocol
+
+PR opening is owned by the integration owner, not by specialist agents.
+
+Responsibilities:
+
+1. Use the git adapter to prepare and push the canonical branch.
+2. Use the GitHub adapter to open or update a draft PR.
+3. Attach parent/child issue links and integration handoff evidence to the PR body.
+4. Sync the PR URL/ref back to GitHub issues or Linear issues through tracker mutations.
+5. Keep the PR draft while QA blockers or unresolved integration blockers exist.
+6. Mark the PR ready for review only after QA passes and required checks are green, unless workflow policy explicitly allows a different gate.
+
+Architectural split:
+
+- `GitProvider` owns local git and branch operations.
+- `GitHubProvider` owns PR creation, PR body updates, draft/ready state, and check-run/status lookup.
+- Tracker adapters own linking the PR back to issues and external work records.
+
+## 11. QA Protocol
 
 QA receives the final integrated artifact.
 
@@ -444,7 +463,7 @@ QA responsibilities:
 
 QA must not sign off solely from implementation summaries unless workflow explicitly allows static-only QA for that issue class.
 
-## 11. Observability Architecture
+## 12. Observability Architecture
 
 Emit `OrchestratorEventV2` for:
 
@@ -468,7 +487,7 @@ Events go to:
 - optional SSE stream;
 - optional TUI/dashboard.
 
-## 12. ADRs
+## 13. ADRs
 
 ### 2026-05-08 — v2 centers integration ownership and QA gates
 

@@ -18,9 +18,9 @@ intake -> decompose -> specialist execution -> integration owner -> exhaustive Q
 
 Create v2 state files and fixtures. Treat v2 documents as the product direction and update existing implementation docs/code as needed.
 
-### Phase 1 — Config v2 Schema
+### Phase 1 — Workflow Config Schema
 
-Parse `version: 2` workflows with roles, agents, routing, decomposition, workspace, branching, integration, QA, follow-up, observability, and budgets.
+Parse workflow files with roles, agents, routing, decomposition, workspace, branching, PR policy, integration, QA, follow-up, observability, and budgets.
 
 Success bar: a full v2 fixture validates and negative fixtures fail loudly.
 
@@ -62,9 +62,9 @@ Success bar: malformed output is caught and either repaired or failed.
 
 ### Phase 8 — Integration Owner Flow
 
-Implement the platform-lead/integration-owner protocol: wait for children, consolidate branches, run integration verification, produce handoff, request QA.
+Implement the platform-lead/integration-owner protocol: wait for children, consolidate branches, run integration verification, open/refresh the draft PR, produce handoff, and request QA.
 
-Success bar: broad parent work cannot skip integration.
+Success bar: broad parent work cannot skip integration or the configured PR gate.
 
 ### Phase 9 — QA Gate Flow
 
@@ -98,7 +98,7 @@ Success bar: broad issue -> decomposition -> child execution -> integration -> Q
 
 ### Phase 14 — Documentation and Productization
 
-Document workflow schema, role semantics, workspace policy, QA protocol, and the upgrade path from the current implementation.
+Document workflow schema, role semantics, workspace policy, PR lifecycle, QA protocol, and the upgrade path from the current implementation.
 
 ## Design Constraints
 
@@ -122,5 +122,5 @@ Document workflow schema, role semantics, workspace policy, QA protocol, and the
 
 1. Persistence crate choice: `sqlx` vs `rusqlite`.
 2. Whether tracker mutations should be direct adapter methods or exposed as agent tools plus audited orchestrator wrappers.
-3. Whether integration branch operations should live in core orchestration or the git adapter.
+3. Whether GitHub PR operations should live in the GitHub tracker adapter or a separate GitHub repository adapter. Git branch operations belong in the git adapter.
 4. How much of the live dashboard should ship before the durable CLI status is excellent.
