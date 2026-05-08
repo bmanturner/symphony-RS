@@ -8,9 +8,10 @@ drift). We deviate from it in two ways:
 1. The Agent Runner is **agent-agnostic** — pluggable backends for both
    `codex` and `claude` (Claude Code), plus an experimental **Tandem** mode
    that runs both concurrently with a configurable lead.
-2. The Issue Tracker is **abstracted behind a trait** — Linear is the only
-   shipped adapter, but the trait must be designed so a second adapter
-   (GitHub Issues, Jira, Plane, etc.) could be added without touching the
+2. The Issue Tracker is **abstracted behind a trait** — Linear and GitHub
+   Issues are both v1 adapters, exercised by a shared conformance test
+   suite parameterised over the trait. The trait must be designed so a
+   third adapter (Jira, Plane, etc.) can be added without touching the
    orchestrator.
 
 This file is read fresh at the start of every loop iteration. It is the
@@ -90,7 +91,7 @@ Do this **and only this** for the first iteration. Then commit and exit.
    (empty stubs, each with a one-line `lib.rs` doc comment):
    - `crates/symphony-core` — orchestrator, state machine, traits
    - `crates/symphony-config` — `WORKFLOW.md` parsing, typed config
-   - `crates/symphony-tracker` — `IssueTracker` trait + Linear adapter
+   - `crates/symphony-tracker` — `IssueTracker` trait + Linear and GitHub adapters
    - `crates/symphony-agent` — `AgentRunner` trait + Codex + Claude + Tandem
    - `crates/symphony-workspace` — per-issue workspace lifecycle
    - `crates/symphony-cli` — `symphony` binary
@@ -101,7 +102,7 @@ Do this **and only this** for the first iteration. Then commit and exit.
    under `[workspace.dependencies]` (versions resolved with `cargo add`):
    - Async / runtime: `tokio` (full), `async-trait`, `futures`, `tokio-stream`
    - Serde: `serde`, `serde_json`, `serde_yaml`, `gray_matter`
-   - HTTP / GraphQL: `reqwest` (rustls), `graphql_client`, `url`
+   - HTTP / GraphQL: `reqwest` (rustls), `graphql_client`, `octocrab`, `url`
    - CLI / config: `clap` (derive), `dotenvy`, `secrecy`, `figment`
    - Logging: `tracing`, `tracing-subscriber` (env-filter, json)
    - Errors / IDs: `anyhow`, `thiserror`, `uuid` (v4)
@@ -135,12 +136,25 @@ Do this **and only this** for the first iteration. Then commit and exit.
    - `gray_matter` parser for `WORKFLOW.md` front matter + body
    - Round-trip tests for the workflow loader (valid, missing, malformed)
 
-   **Phase 2 — IssueTracker abstraction + Linear**
-   - `IssueTracker` trait (async, returns normalized `Issue` per SPEC §4.1.1)
+   **Phase 2 — IssueTracker abstraction + Linear + GitHub Issues**
+   - `IssueTracker` trait (async, returns normalized `Issue` per SPEC §4.1.1).
+     `branch_name`, `priority`, and `blocked_by` are `Option`s that adapters
+     **never fabricate** when the source backend lacks the data.
    - In-memory `MockTracker` for tests
-   - Linear adapter using `graphql_client` against Linear's GraphQL API
-   - `wiremock` integration tests for the Linear adapter
-   - Reconciliation queries (state refresh, terminal cleanup)
+   - Tracker **conformance suite** parameterised over `dyn IssueTracker`:
+     asserts active-state filtering, lowercase state normalisation, no
+     fabricated optional fields. Runs against `MockTracker` immediately;
+     re-runs against each real adapter as it lands.
+   - **Linear adapter** using `graphql_client` against Linear's GraphQL API,
+     with `wiremock` integration tests covering happy path, 4xx, 5xx,
+     malformed responses
+   - **GitHub Issues adapter** using `octocrab` (REST for mutations, GraphQL
+     for batched polling). Maps issue number → `identifier`, derives
+     `branch_name` from linked-PR head ref when present, parses
+     `blocked_by` from "blocked by #N" / "depends on #N" body refs.
+     `wiremock` integration tests covering the same scenarios as Linear.
+   - Reconciliation queries (state refresh, terminal cleanup) implemented
+     for both adapters and exercised through the conformance suite
 
    **Phase 3 — Workspace manager**
    - Sanitization rule (SPEC §4.2: `[A-Za-z0-9._-]` → `_`)

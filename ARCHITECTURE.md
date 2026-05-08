@@ -23,9 +23,12 @@ We track the upstream spec verbatim with two explicit deviations:
    tandem with a configurable lead/follower strategy).
 
 2. **Tracker abstracted behind a trait.** Where SPEC §3.1 names Linear,
-   we expose an `IssueTracker` trait with a Linear adapter as the only
-   shipped implementation. A second adapter (GitHub Issues, Jira, …)
-   must be addable without touching `symphony-core`.
+   we expose an `IssueTracker` trait with two v1 adapters: Linear (via
+   `graphql_client` + Linear's GraphQL) and GitHub Issues (via
+   `octocrab`, REST for writes and GraphQL for batched polling). A
+   shared conformance suite parameterised over the trait keeps both
+   implementations honest. A third adapter (Jira, Plane, …) must be
+   addable without touching `symphony-core`.
 
 **Non-goals** match SPEC §2.2 unchanged: no GUI, no general workflow
 engine, no built-in PR-editing logic, no mandatory sandbox policy.
@@ -46,7 +49,7 @@ engine, no built-in PR-editing logic, no mandatory sandbox policy.
 │                                          WorkspaceManager, AgentEvent│
 ├──────────────────────────────────────────────────────────────────────┤
 │ Adapter Layer                                                        │
-│   symphony-tracker   : Linear (GraphQL), Mock                        │
+│   symphony-tracker   : Linear (GraphQL), GitHub (REST+GraphQL), Mock │
 │   symphony-agent     : Codex, Claude, Tandem                  ◀──── deviation
 │   symphony-workspace : LocalFs                                       │
 ├──────────────────────────────────────────────────────────────────────┤
@@ -102,6 +105,28 @@ pub enum AgentEvent {
 The trait surface is intentionally narrow: the orchestrator only ever
 consumes the normalized `AgentEvent` stream — never raw JSON.
 
+### Per-adapter `Issue` conventions
+
+Both v1 trackers return the same `Issue` shape, but each backend models
+some fields differently. Adapters do the translation work; the
+orchestrator never branches on tracker kind. Optional fields are
+**never fabricated** when the source backend lacks the data.
+
+| Field         | Linear                           | GitHub Issues                                                  |
+|---------------|----------------------------------|----------------------------------------------------------------|
+| `id`          | Linear UUID                      | `<owner>/<repo>#<number>` (composite, stable per repo)         |
+| `identifier`  | `ABC-123` (Linear's identifier)  | `#42` (issue number)                                           |
+| `state`       | Workflow state name, lowercased  | `open` / `closed`, *or* a configured label name, lowercased    |
+| `priority`    | Linear 0–4                       | Mapped from configured priority labels (else `None`)           |
+| `branch_name` | Linear's `branchName` field      | Linked-PR head ref if present (else `None`)                    |
+| `blocked_by`  | `blockedByIssues` relation       | Parsed from "blocked by #N" / "depends on #N" body refs        |
+| `labels`      | Lowercased label names           | Lowercased label names                                         |
+
+Active-state matching is config-driven (`tracker.active_states`). For
+Linear those are workflow state names; for GitHub they are the literal
+`open` / `closed` enum or label names. The conformance suite asserts
+that each adapter's interpretation matches this contract.
+
 ## Decisions
 
 ADRs append here over time. Each entry: date, context, decision, and a
@@ -114,7 +139,25 @@ Decision : …
 Consequence: …
 ```
 
-(no decisions yet)
+### 2026-05-08 — Ship Linear *and* GitHub Issues at v1
+**Context.** A single shipped adapter (Linear) would force every adopter
+to bridge ticket-system ↔ code-system. Co-locating tickets with the code
+collapses that bridge for the largest possible audience and gives us a
+second backend with meaningfully different semantics — open/closed-only
+states, labels-as-priority, PR-derived branch names — to keep the trait
+honest.
+
+**Decision.** Phase 2 ships two adapters: Linear via `graphql_client`,
+and GitHub Issues via `octocrab` (REST for mutations, GraphQL for
+batched polling). Both must pass an identical conformance suite
+parameterised over `IssueTracker`. The trait surface is unchanged from
+the SPEC abstraction; the per-adapter conventions table above is the
+contract for how each backend's quirks map to the normalised `Issue`.
+
+**Consequence.** All fields one backend can express natively but the
+other infers stay `Option<…>`, and adapters never fabricate them. A
+third adapter can be added without touching `symphony-core` by
+implementing the trait and the conformance suite.
 
 ## Dependencies
 
@@ -129,6 +172,8 @@ justifications follow. Anything added beyond this list requires a new ADR.
 - **gray_matter** — splits front matter from prompt body in one pass.
 - **reqwest (rustls)** — Linear HTTP client without a system OpenSSL.
 - **graphql_client** — typed Linear queries from `.graphql` files.
+- **octocrab** — established Rust GitHub client; one auth surface for
+  both REST mutations and GraphQL batched polling.
 - **url** — robust URL parsing for tracker base URLs.
 - **clap (derive)** — subcommand surface with auto-generated help/env vars.
 - **figment** — layered config (defaults → env → WORKFLOW.md).

@@ -12,9 +12,11 @@ parsing. Goal: a `symphony validate path/to/WORKFLOW.md` invocation
 parses front matter and prompt body and exits 0 / non-zero on a
 malformed file.
 
-### Phase 2 — IssueTracker abstraction + Linear
-Trait, in-memory mock, Linear GraphQL adapter, `wiremock` integration
-tests, reconciliation queries.
+### Phase 2 — IssueTracker abstraction + Linear + GitHub Issues
+Trait, in-memory mock, shared conformance suite parameterised over
+`dyn IssueTracker`, Linear GraphQL adapter, GitHub Issues adapter
+(`octocrab`, REST + GraphQL), `wiremock` integration tests for both,
+reconciliation queries.
 
 ### Phase 3 — Workspace manager
 Sanitization, containment-checked path mapping, lifecycle hooks

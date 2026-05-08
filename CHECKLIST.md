@@ -27,21 +27,43 @@ under their phase header and are added or refined as the project evolves.
 - [ ] Add `tests/fixtures/sample-workflow/WORKFLOW.md` for downstream
       tests and the `symphony validate` smoke test
 
-## Phase 2 — IssueTracker abstraction + Linear
+## Phase 2 — IssueTracker abstraction + Linear + GitHub Issues
 
 - [ ] Define `Issue`, `IssueId`, `IssueState` per SPEC §4.1.1 in
-      `symphony-core::tracker`
+      `symphony-core::tracker`. Doc comments must spell out that
+      `branch_name`, `priority`, and `blocked_by` are `Option`s and that
+      adapters **never fabricate** these when the source backend lacks
+      the data.
 - [ ] Define the `IssueTracker` async trait with `fetch_active`,
       `fetch_state`, `fetch_terminal_recent` [Issue model]
 - [ ] Implement `MockTracker` in `symphony-tracker::mock` with a
       programmable script for tests [IssueTracker trait]
+- [ ] Tracker **conformance suite** parameterised over `dyn IssueTracker`
+      using `rstest`: asserts active-state filtering against
+      `tracker.active_states`, lowercase normalisation of state names,
+      stable ordering, and that no adapter fabricates `branch_name` /
+      `priority` / `blocked_by`. Runs against `MockTracker` immediately;
+      gets re-run against each real adapter as it lands.
+      [IssueTracker trait, MockTracker]
+- [ ] Add `octocrab` to the workspace crate budget via `cargo add -p
+      symphony-tracker octocrab` (or workspace-level if other crates need
+      it later). Record the rationale as a one-paragraph ADR.
 - [ ] Generate Linear GraphQL bindings via `graphql_client` from a
       checked-in `.graphql` query set [IssueTracker trait]
-- [ ] Implement `LinearTracker` translating GraphQL → `Issue`; `wiremock`
-      integration tests covering happy path, 4xx, 5xx, malformed [Linear
-      bindings]
-- [ ] Reconciliation queries: state refresh by id, terminal cleanup
-      [LinearTracker]
+- [ ] Implement `LinearTracker` translating GraphQL → `Issue`. `wiremock`
+      integration tests covering happy path, 4xx, 5xx, malformed
+      responses; passes the conformance suite. [Linear bindings,
+      conformance suite]
+- [ ] Implement `GitHubTracker` using `octocrab` (REST for mutations,
+      GraphQL for batched polling). Maps issue number → `identifier`,
+      derives `branch_name` from linked-PR head ref when present, parses
+      `blocked_by` from "blocked by #N" / "depends on #N" body refs.
+      `wiremock` integration tests covering the same scenarios as Linear;
+      passes the conformance suite. [octocrab in budget, conformance
+      suite]
+- [ ] Reconciliation queries: state refresh by id, terminal cleanup —
+      implemented for both adapters and exercised via the conformance
+      suite. [LinearTracker, GitHubTracker]
 
 ## Phase 3 — Workspace manager
 
