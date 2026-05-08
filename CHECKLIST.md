@@ -134,8 +134,33 @@ under their phase header and are added or refined as the project evolves.
 - [x] `symphony status` snapshot output (point-in-time; distinct from
       Phase 8's `symphony watch` live TUI)
 - [x] Graceful SIGINT shutdown that drains in-flight turns
-- [ ] README "Quickstart" section ending with a first dispatched mock
-      issue
+- [x] **Decompose Quickstart** — split the original "README
+      Quickstart ending in a dispatched mock issue" item into four
+      sub-items: mock tracker kind, mock agent kind, quickstart
+      fixture + smoke test, README prose. Picked because the original
+      single line bundled config, runtime, fixtures, and docs into a
+      task far larger than the ~200-LOC iteration budget; each new
+      sub-item is independently testable and commitable.
+- [ ] Add a `mock` variant to `TrackerKind` in `symphony-config` with a
+      `tracker.fixtures` YAML path; `build_tracker` in `symphony-cli`
+      loads the fixtures into a `MockTracker`. Round-trip tests for the
+      config parsing + a unit test for the CLI factory path.
+      [Decompose Quickstart]
+- [ ] Add a `mock` variant to `AgentKind` driving a no-op
+      `MockAgentRunner` (returns a scripted `Started → Message →
+      Completed` sequence per turn). Lets `symphony run` dispatch
+      against a fixture without `codex` or `claude` installed. Unit
+      tests on the runner and CLI factory wiring.
+      [Decompose Quickstart]
+- [ ] Add `tests/fixtures/quickstart-workflow/WORKFLOW.md` and
+      `issues.yaml` exercising both new mock kinds; `assert_cmd` smoke
+      test that `symphony run` against them dispatches at least one
+      issue and exits cleanly on SIGINT.
+      [mock tracker kind, mock agent kind]
+- [ ] README "Quickstart" section walking from `cargo install --path
+      crates/symphony-cli` through `symphony validate`, `symphony
+      status`, and `symphony run` against the quickstart fixture, with
+      a copy-pasteable command block. [quickstart fixture]
 
 ## Phase 8 — Status Surface (out-of-process live TUI via HTTP SSE)
 
