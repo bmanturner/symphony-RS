@@ -517,6 +517,116 @@ pub async fn assert_terminal_recent_filters_by_states(
     );
 }
 
+/// Reconciliation contract: `fetch_state` on a *terminal* issue id MUST
+/// return that issue with its terminal state — not silently drop it, and
+/// not re-apply active-state filtering that would mask the transition.
+///
+/// SPEC §16.3 reconciles in-flight workers against the tracker by calling
+/// `fetch_issue_states_by_ids` (our [`IssueTracker::fetch_state`]) every
+/// tick: any worker whose issue has left the active states gets released.
+/// An adapter that mistakenly filters `fetch_state` by `active_states`
+/// would silently neuter that release, leaving the orchestrator running
+/// against an issue the operator already moved to Done. This assertion
+/// catches that whole family of regressions.
+///
+/// We probe by asking for *every terminal* id the scenario knows about,
+/// then asserting:
+/// 1. **No silent drops** — every requested id appears in the response.
+///    The trait contract on [`IssueTracker::fetch_state`] is explicit
+///    about this; a partial-result response would let a "deleted" issue
+///    masquerade as still-running.
+/// 2. **Correct state** — each returned issue's state normalizes into
+///    one of `scenario.terminal_states`. (We compare case-insensitively
+///    because `IssueState` preserves source casing — see SPEC §11.3.)
+pub async fn assert_state_refresh_reports_terminal_state_for_terminal_ids(
+    tracker: &dyn IssueTracker,
+    scenario: &Scenario,
+) {
+    if scenario.terminal_issues.is_empty() {
+        // Defensive: a scenario with no terminal bucket can't exercise
+        // this rule. Skip silently rather than vacuously passing — a
+        // real scenario should always populate both buckets.
+        return;
+    }
+    let ids: Vec<IssueId> = scenario
+        .terminal_issues
+        .iter()
+        .map(|i| i.id.clone())
+        .collect();
+    let refreshed = tracker
+        .fetch_state(&ids)
+        .await
+        .expect("fetch_state must succeed for terminal ids — the reconcile pass depends on it");
+
+    assert_eq!(
+        refreshed.len(),
+        ids.len(),
+        "fetch_state silently dropped terminal ids — got {} responses for {} requested. \
+         Adapter is over-filtering or skipping unknowns; the orchestrator's reconcile pass \
+         (SPEC §16.3) would mistake the dropped issues for still-running.",
+        refreshed.len(),
+        ids.len(),
+    );
+
+    let allowed: HashSet<String> = scenario
+        .terminal_states
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    for issue in &refreshed {
+        assert!(
+            allowed.contains(&issue.state.normalized()),
+            "fetch_state on terminal id {} returned state {:?} which is not one of the \
+             scenario's terminal_states {:?}. Reconcile would not detect the transition.",
+            issue.identifier,
+            issue.state.as_str(),
+            scenario.terminal_states,
+        );
+    }
+}
+
+/// Terminal-cleanup contract: when called with the scenario's full
+/// terminal-state list, `fetch_terminal_recent` MUST return every issue
+/// in the scenario's terminal bucket.
+///
+/// Used at startup to clean up workspaces for issues that finished while
+/// Symphony was offline (SPEC §16.3 terminal cleanup). An adapter that
+/// quietly drops some terminal issues — e.g. because it forgets to
+/// paginate, or applies an extra label filter — would leave orphaned
+/// workspaces. This assertion catches that.
+///
+/// Companion to [`assert_terminal_recent_filters_by_states`], which
+/// covers the *exclusion* direction (no non-terminal leakage) and the
+/// empty-filter rule. Together they pin down both sides of the contract.
+pub async fn assert_terminal_recent_returns_all_known_terminal_issues(
+    tracker: &dyn IssueTracker,
+    scenario: &Scenario,
+) {
+    if scenario.terminal_issues.is_empty() {
+        return;
+    }
+    let states: Vec<IssueState> = scenario
+        .terminal_states
+        .iter()
+        .map(IssueState::new)
+        .collect();
+    let returned = tracker
+        .fetch_terminal_recent(&states)
+        .await
+        .expect("fetch_terminal_recent must succeed for the scenario's terminal_states");
+
+    let returned_ids: HashSet<&IssueId> = returned.iter().map(|i| &i.id).collect();
+    for fixture in &scenario.terminal_issues {
+        assert!(
+            returned_ids.contains(&fixture.id),
+            "fetch_terminal_recent dropped fixture terminal issue {:?} ({}) — \
+             startup cleanup would leak its workspace",
+            fixture.identifier,
+            fixture.id,
+        );
+    }
+}
+
 /// Run every assertion in the suite, in a deterministic order.
 ///
 /// Adapter integration tests typically call this once per scenario after
@@ -529,6 +639,8 @@ pub async fn run_full_suite(tracker: &dyn IssueTracker, scenario: &Scenario) {
     assert_no_fabricated_optionals(tracker, scenario).await;
     assert_fetch_state_preserves_caller_ordering(tracker, scenario).await;
     assert_terminal_recent_filters_by_states(tracker, scenario).await;
+    assert_state_refresh_reports_terminal_state_for_terminal_ids(tracker, scenario).await;
+    assert_terminal_recent_returns_all_known_terminal_issues(tracker, scenario).await;
 }
 
 #[cfg(test)]

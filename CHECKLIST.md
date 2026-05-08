@@ -79,7 +79,7 @@ under their phase header and are added or refined as the project evolves.
       cross-referenced PR events; take the most-recently-opened PR's
       `head.ref`. Extend `github_canonical_scenario()` to cover this and
       re-run the conformance suite. [GitHubTracker (c)]
-- [ ] Reconciliation queries: state refresh by id, terminal cleanup —
+- [x] Reconciliation queries: state refresh by id, terminal cleanup —
       implemented for both adapters and exercised via the conformance
       suite. [LinearTracker, GitHubTracker]
 

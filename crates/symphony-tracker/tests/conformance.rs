@@ -24,8 +24,11 @@ use symphony_tracker::IssueTracker;
 use symphony_tracker::conformance::{
     Scenario, assert_active_returns_only_active_states,
     assert_fetch_state_preserves_caller_ordering, assert_no_fabricated_optionals,
-    assert_state_normalization_is_lowercase, assert_terminal_recent_filters_by_states,
-    canonical_scenario, populate_mock, run_full_suite,
+    assert_state_normalization_is_lowercase,
+    assert_state_refresh_reports_terminal_state_for_terminal_ids,
+    assert_terminal_recent_filters_by_states,
+    assert_terminal_recent_returns_all_known_terminal_issues, canonical_scenario, populate_mock,
+    run_full_suite,
 };
 
 /// One adapter under test, packaged as a name + a builder closure.
@@ -108,6 +111,24 @@ async fn fetch_terminal_recent_respects_caller_state_list(#[case] build: Adapter
     assert_terminal_recent_filters_by_states(tracker.as_ref(), &scenario).await;
 }
 
+#[rstest]
+#[case::mock(build_mock)]
+#[tokio::test]
+async fn fetch_state_reports_terminal_state_after_transition(#[case] build: AdapterBuilder) {
+    let scenario = canonical_scenario();
+    let tracker = build(&scenario);
+    assert_state_refresh_reports_terminal_state_for_terminal_ids(tracker.as_ref(), &scenario).await;
+}
+
+#[rstest]
+#[case::mock(build_mock)]
+#[tokio::test]
+async fn fetch_terminal_recent_surfaces_every_known_terminal_issue(#[case] build: AdapterBuilder) {
+    let scenario = canonical_scenario();
+    let tracker = build(&scenario);
+    assert_terminal_recent_returns_all_known_terminal_issues(tracker.as_ref(), &scenario).await;
+}
+
 // ---------------------------------------------------------------------------
 // Negative tests: these confirm the suite *catches* contract violations.
 // They construct intentionally-broken scenarios against the mock and assert
@@ -174,6 +195,70 @@ async fn suite_rejects_an_adapter_that_fabricates_a_priority() {
     assert!(
         panicked,
         "suite must panic when an adapter mutates the priority field"
+    );
+}
+
+#[tokio::test]
+async fn suite_rejects_an_adapter_whose_fetch_state_silently_drops_terminal_ids() {
+    // Build an adapter that "knows" only the active fixture issues —
+    // exactly the shape of an over-eager adapter that refuses to return
+    // anything outside `active_states` from `fetch_state`. Reconcile
+    // would mistake the missing terminal ids for "still running" and
+    // never release the workspace.
+    let scenario = canonical_scenario();
+    let m = MockTracker::new();
+    m.set_active(scenario.active_issues.clone());
+    // Note: deliberately *not* calling set_terminal — terminal ids are
+    // unknown to this mock, mirroring a buggy adapter.
+
+    let tracker: Arc<dyn IssueTracker> = Arc::new(m);
+    let scenario_for_task = scenario.clone();
+    let panicked = tokio::task::spawn(async move {
+        assert_state_refresh_reports_terminal_state_for_terminal_ids(
+            tracker.as_ref(),
+            &scenario_for_task,
+        )
+        .await;
+    })
+    .await
+    .is_err();
+    assert!(
+        panicked,
+        "suite must panic when fetch_state silently drops terminal ids"
+    );
+}
+
+#[tokio::test]
+async fn suite_rejects_an_adapter_whose_terminal_recent_drops_known_terminal_issues() {
+    // Adapter under-returns terminal_recent — only one of the two
+    // terminal fixtures comes back. Startup cleanup would orphan the
+    // workspace for the dropped issue.
+    let scenario = canonical_scenario();
+    let m = MockTracker::new();
+    m.set_active(scenario.active_issues.clone());
+    // Drop the second terminal issue on the floor.
+    let truncated = scenario
+        .terminal_issues
+        .iter()
+        .take(1)
+        .cloned()
+        .collect::<Vec<_>>();
+    m.set_terminal(truncated);
+
+    let tracker: Arc<dyn IssueTracker> = Arc::new(m);
+    let scenario_for_task = scenario.clone();
+    let panicked = tokio::task::spawn(async move {
+        assert_terminal_recent_returns_all_known_terminal_issues(
+            tracker.as_ref(),
+            &scenario_for_task,
+        )
+        .await;
+    })
+    .await
+    .is_err();
+    assert!(
+        panicked,
+        "suite must panic when fetch_terminal_recent under-returns known terminal issues"
     );
 }
 
