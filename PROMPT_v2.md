@@ -8,9 +8,9 @@ Read these files first, in this order:
 2. `ARCHITECTURE_v2.md` — target architecture.
 3. `PLAN_v2.md` — strategic phase plan.
 4. `CHECKLIST_v2.md` — executable iteration queue.
-5. Existing v1 files (`SPEC.md`, `ARCHITECTURE.md`, `PLAN.md`, `CHECKLIST.md`) only as implementation history.
+5. Existing implementation files (`SPEC.md`, `ARCHITECTURE.md`, `PLAN.md`, `CHECKLIST.md`) as current-state context to reshape, not preserve.
 
-The goal is not to preserve v1. The goal is to shape Symphony-RS into a product that reliably turns issues into integrated, QA-verified changes through configurable specialist agents.
+The goal is to shape Symphony-RS directly into a product that reliably turns issues into integrated, QA-verified changes through configurable specialist agents.
 
 ## North Star
 
@@ -74,11 +74,11 @@ One checklist item = one commit.
 Rules:
 
 - Write tests with the implementation.
-- Prefer pure domain/state tests before adapter integration tests.
+- Prefer pure domain/state tests before live adapter integration tests.
 - Keep public APIs documented.
 - Do not paper over workflow invariants in prompts when they belong in state or typed config.
 - Do not add a dependency without an ADR in `ARCHITECTURE_v2.md`.
-- Do not delete existing v1 behavior unless the checklist item explicitly says to migrate/remove it.
+- Change existing behavior when the v2 product direction requires it; keep removals scoped and tested.
 
 ### Step 4 — Verify
 

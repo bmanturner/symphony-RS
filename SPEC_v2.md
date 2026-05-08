@@ -53,13 +53,13 @@ Workflow state, dependencies, assignments, approvals, QA verdicts, and run evide
 
 ## 3. Non-Goals
 
-Symphony-RS v2 does not need to preserve Paperclip’s exact organization, schemas, labels, statuses, or UI.
+Symphony-RS is still pre-adoption software, so v2 should make the right product changes directly instead of preserving old internal shapes.
 
-It also does not aim to be:
+It does not aim to be:
 
 - a generic BPM engine;
 - a human project-management suite;
-- a replacement for GitHub/GitLab/Linear/Jira;
+- a replacement for GitHub or Linear as external issue/product systems;
 - a mandatory web dashboard before the headless core is correct;
 - a one-size-fits-all org chart.
 
@@ -71,7 +71,9 @@ A workflow is a repo-owned contract, normally `WORKFLOW.md`, with YAML front mat
 
 In v2, `WORKFLOW.md` configures:
 
-- tracker adapters;
+- GitHub/Linear tracker adapters;
+- git source-control adapter;
+- Codex/Claude/Hermes agent adapters;
 - role definitions;
 - routing rules;
 - decomposition policy;
@@ -163,7 +165,7 @@ Role kinds:
 - `specialist`: implements scoped work and reports evidence.
 - `reviewer`: reviews design/security/performance/content without owning implementation.
 - `operator`: performs runtime/deployment/data tasks.
-- `custom`: workflow-defined behavior.
+- `custom`: workflow-defined behavior, not a new adapter type.
 
 Only `integration_owner` and `qa_gate` are semantically special in core v2. All other roles are configurable.
 
@@ -171,18 +173,16 @@ Only `integration_owner` and `qa_gate` are semantically special in core v2. All 
 
 An agent is an executable backend plus runtime policy.
 
-Supported backend classes SHOULD include:
+Supported agent backend classes are deliberately limited to:
 
 - `codex`;
 - `claude`;
-- `hermes` or another ACP/tool-calling adapter, if implemented;
-- `mock` for tests;
-- `tandem` for multi-agent strategies.
+- `hermes`.
 
 Agent config MAY define:
 
 - command/backend;
-- model/provider;
+- model configuration;
 - system prompt or profile;
 - tools/toolsets;
 - environment;
@@ -290,13 +290,13 @@ security: {}
 hooks: {}
 ```
 
-Unknown top-level keys MAY be ignored for forward compatibility. Unknown nested keys in known sections SHOULD be rejected.
+Unknown top-level and nested keys SHOULD be rejected. The schema should stay strict while the product is new.
 
 ### 5.1 `tracker`
 
 ```yaml
 tracker:
-  kind: github | linear | paperclip | mock | custom
+  kind: github | linear
   repository: owner/repo
   project_slug: ENG
   active_states: [Todo, In Progress]
@@ -353,13 +353,13 @@ agents:
     backend: codex
     command: codex app-server
     model: configured-by-backend
-    tools: [git, shell, tracker, github]
+    tools: [git, github, tracker]
     memory: persistent
     approval_policy: workflow-default
   qa_agent:
     backend: claude
     command: claude -p --output-format stream-json --permission-mode bypassPermissions
-    tools: [git, shell, tracker, browser, harness]
+    tools: [git, github, tracker]
 ```
 
 ### 5.5 `routing`
@@ -589,6 +589,8 @@ A follow-up must include:
 
 ## 7. Required Adapter Capabilities
 
+The supported adapter set is limited to: `git`, `github`, `linear`, `codex`, `claude`, and `hermes`. Tests may use fakes, but fakes are not product adapters.
+
 ### 7.1 TrackerRead
 
 - fetch active issues;
@@ -612,7 +614,9 @@ Required for autonomous v2 workflows:
 
 If a tracker lacks mutation support, workflow MUST run in advisory/proposal mode.
 
-### 7.3 VCS
+### 7.3 Git
+
+The supported source-control adapter is `git`.
 
 - create branch/worktree;
 - verify cwd and branch;
@@ -685,7 +689,7 @@ Minimum surfaces:
 
 ## 10. Migration Posture
 
-Symphony-RS v2 should learn from Paperclip without cloning it.
+Symphony-RS v2 should absorb the operating lessons learned from prior orchestration work while building directly on this codebase.
 
 Preserve these lessons:
 
@@ -702,7 +706,6 @@ Do not hardcode:
 
 - a fixed org chart beyond semantic role kinds;
 - Foglet-specific workflows;
-- Paperclip-specific table/state names;
-- one tracker;
-- one model/provider;
+- prior-system-specific table/state names;
+- adapters beyond git, GitHub, Linear, Codex, Claude, and Hermes;
 - one branch strategy.
