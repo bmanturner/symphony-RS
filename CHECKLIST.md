@@ -202,7 +202,7 @@ keep one-task-per-iteration discipline.
 - [x] TUI scaffold with `ratatui` + `crossterm`: alternate screen,
       raw mode, terminal-resize-safe, hotkey `q` to quit. Renders a
       placeholder layout. [symphony watch, ratatui in budget]
-- [ ] TUI panel — **active issues** table: identifier, state, elapsed,
+- [x] TUI panel — **active issues** table: identifier, state, elapsed,
       agent backend. Updates from `StateChanged` and `Dispatched`.
       [TUI scaffold]
 - [ ] TUI panel — **cost summary**: tokens (input/output/cached),

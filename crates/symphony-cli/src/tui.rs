@@ -31,16 +31,20 @@
 //! iterations — running a real raw-mode terminal in `cargo test` is
 //! flaky and not worth the maintenance.
 
+use std::collections::HashMap;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::{Stream, StreamExt};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use symphony_core::events::OrchestratorEvent;
+use symphony_core::state_machine::ClaimState;
+use symphony_core::tracker::IssueId;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -78,20 +82,60 @@ pub enum ConnectionStatus {
     },
 }
 
+/// One row of the active-issues table.
+///
+/// An "active" issue is one the orchestrator currently holds a claim
+/// for. Rows are inserted on the first
+/// [`OrchestratorEvent::StateChanged`] for an issue, mutated by
+/// subsequent `StateChanged` and [`OrchestratorEvent::Dispatched`]
+/// events, and removed on [`OrchestratorEvent::Released`]. We
+/// deliberately do **not** drop rows on `Reconciled` because the
+/// orchestrator follows up with one `Released` per dropped claim — and
+/// listening to both would double-remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveIssue {
+    /// Best-effort tracker identifier (`ENG-123`) snapshot from the
+    /// most recent event. Carried so the table can render without
+    /// joining against the tracker.
+    pub identifier: String,
+    /// Latest [`ClaimState`] observed for this issue.
+    pub state: ClaimState,
+    /// Wall-clock instant of the most recent
+    /// [`OrchestratorEvent::Dispatched`] for this issue. Used to render
+    /// the *elapsed* column. `None` until the first dispatch — between
+    /// initial claim and first dispatch the row exists but elapsed is
+    /// blank, which is correct: nothing has been "running" yet.
+    pub dispatched_at: Option<Instant>,
+    /// Agent backend reported by the most recent
+    /// [`OrchestratorEvent::Dispatched`] (`"claude"`, `"codex"`,
+    /// `"tandem"`, `"mock"`). `None` until the first dispatch.
+    pub backend: Option<String>,
+    /// 1-based attempt number from the most recent dispatch. `1` until
+    /// proven otherwise; updated by `Dispatched`.
+    pub attempt: u32,
+}
+
 /// All state the TUI needs to render a frame.
 ///
-/// Future panels (active issues, cost summary, recent-events log) push
-/// their own fields onto this struct. Keeping a single owning struct
-/// (rather than a tangle of `Arc<Mutex<…>>` per panel) means the render
-/// pipeline is `&AppState → Frame`, which is trivial to snapshot-test.
+/// Future panels (cost summary, recent-events log, tandem activity)
+/// push their own fields onto this struct. Keeping a single owning
+/// struct (rather than a tangle of `Arc<Mutex<…>>` per panel) means
+/// the render pipeline is `(&AppState, Instant) → Frame`, which is
+/// trivial to snapshot-test.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
     /// Current SSE connection status, drives the header banner.
     pub connection: ConnectionStatus,
+    /// Issues the orchestrator currently has claimed, keyed by the
+    /// tracker's stable [`IssueId`]. We use a [`HashMap`] for O(1)
+    /// lookup on `apply` and sort by `identifier` at render time so
+    /// the visual order is deterministic regardless of insertion
+    /// order — important for ratatui snapshot tests.
+    pub active_issues: HashMap<IssueId, ActiveIssue>,
     /// One-line summary of the most recently observed event, shown in
-    /// the placeholder body until panels land. Once the recent-events
-    /// log panel exists this field becomes redundant and is removed in
-    /// the same commit.
+    /// the placeholder body until the recent-events panel lands. Once
+    /// that panel exists this field becomes redundant and is removed
+    /// in the same commit.
     pub last_event_summary: Option<String>,
     /// Set true when the user pressed `q` (or `Ctrl+C`); the run loop
     /// terminates on the next iteration. Tests inspect this directly.
@@ -122,6 +166,7 @@ impl AppState {
                 self.last_event_summary = Some(format!("lagged: missed {missed} events"));
             }
             WatchEvent::Event(orch) => {
+                self.apply_orchestrator_event(orch);
                 // Render the event's serde tag rather than its full
                 // payload — the body panel is a one-liner today, and the
                 // dedicated recent-events panel (next iteration) is
@@ -133,6 +178,92 @@ impl AppState {
                         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
                         .unwrap_or_else(|| "(unknown)".into())
                 ));
+            }
+        }
+    }
+
+    /// Update [`AppState::active_issues`] from one orchestrator event.
+    ///
+    /// Folded out of [`AppState::apply`] so unit tests can drive table
+    /// state without constructing a [`WatchEvent`] wrapper. Pure: no
+    /// I/O, no clock dependency — `dispatched_at` is stamped with
+    /// `Instant::now()` only when a `Dispatched` event arrives,
+    /// matching the wall-clock semantics of the SSE feed.
+    ///
+    /// # Routing rules
+    ///
+    /// - `StateChanged` upserts the row's `identifier` and `state`.
+    ///   For the [`ClaimState::RetryQueued`] branch we lift the
+    ///   `attempt` onto the row so the table can show "retry(3)" even
+    ///   before the next `Dispatched` lands.
+    /// - `Dispatched` upserts the row (in case the table missed the
+    ///   prior `StateChanged`, which can happen when the TUI starts
+    ///   mid-flight) and stamps `dispatched_at`, `backend`, `attempt`.
+    /// - `Released` removes the row. We trust `Released` rather than
+    ///   the bulk `Reconciled` summary because the orchestrator emits
+    ///   one `Released` per dropped claim (see [`symphony_core::events`]),
+    ///   and reacting to both would double-remove.
+    /// - All other variants are presentation-only here (the table
+    ///   panel does not care about agent re-emissions or retry
+    ///   schedules — the cost-summary and retry panels in later
+    ///   iterations do).
+    pub fn apply_orchestrator_event(&mut self, ev: &OrchestratorEvent) {
+        match ev {
+            OrchestratorEvent::StateChanged {
+                issue,
+                identifier,
+                current,
+                ..
+            } => {
+                let row = self
+                    .active_issues
+                    .entry(issue.clone())
+                    .or_insert_with(|| ActiveIssue {
+                        identifier: identifier.clone(),
+                        state: *current,
+                        dispatched_at: None,
+                        backend: None,
+                        attempt: 1,
+                    });
+                row.identifier = identifier.clone();
+                row.state = *current;
+                if let ClaimState::RetryQueued { attempt } = current {
+                    row.attempt = *attempt;
+                }
+            }
+            OrchestratorEvent::Dispatched {
+                issue,
+                identifier,
+                backend,
+                attempt,
+                ..
+            } => {
+                let row = self
+                    .active_issues
+                    .entry(issue.clone())
+                    .or_insert_with(|| ActiveIssue {
+                        identifier: identifier.clone(),
+                        state: ClaimState::Running,
+                        dispatched_at: None,
+                        backend: None,
+                        attempt: *attempt,
+                    });
+                row.identifier = identifier.clone();
+                row.state = ClaimState::Running;
+                row.backend = Some(backend.clone());
+                row.attempt = *attempt;
+                row.dispatched_at = Some(Instant::now());
+            }
+            OrchestratorEvent::Released { issue, .. } => {
+                self.active_issues.remove(issue);
+            }
+            OrchestratorEvent::Agent { .. }
+            | OrchestratorEvent::RetryScheduled { .. }
+            | OrchestratorEvent::Reconciled { .. } => {
+                // Other variants do not change *which* issues are
+                // active or *what state* they are in; later panels
+                // hook in here without touching the active-issues
+                // table.
             }
         }
     }
@@ -166,20 +297,29 @@ impl AppState {
     }
 }
 
-/// Render the TUI's placeholder layout against any backend.
+/// Render the TUI layout against any backend.
 ///
-/// Layout: a 3-line header showing connection status, a flexible body
-/// containing the most-recent-event summary (a placeholder until the
-/// panel iterations land), and a 1-line footer listing key bindings.
-/// The signature takes `&mut Frame` so this same function works for
-/// both the live `CrosstermBackend` and `TestBackend` in unit tests.
-pub fn render(state: &AppState, frame: &mut Frame<'_>) {
+/// Layout, top to bottom:
+///
+/// 1. **Header** (3 lines, bordered) — connection status banner.
+/// 2. **Active issues table** (flex, bordered) — one row per
+///    currently-claimed issue with identifier, state, elapsed,
+///    backend.
+/// 3. **Recent activity** (3 lines, bordered) — placeholder one-liner
+///    until the recent-events log panel lands in the next iteration.
+/// 4. **Footer** (1 line, no border) — key bindings.
+///
+/// Taking `now: Instant` as a parameter (rather than calling
+/// [`Instant::now`] internally) lets unit tests pin elapsed-time
+/// rendering deterministically.
+pub fn render(state: &AppState, now: Instant, frame: &mut Frame<'_>) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
@@ -201,6 +341,8 @@ pub fn render(state: &AppState, frame: &mut Frame<'_>) {
         chunks[0],
     );
 
+    render_active_issues(state, now, frame, chunks[1]);
+
     let body = state
         .last_event_summary
         .clone()
@@ -211,14 +353,142 @@ pub fn render(state: &AppState, frame: &mut Frame<'_>) {
                 .borders(Borders::ALL)
                 .title("recent activity (placeholder)"),
         ),
-        chunks[2 - 1],
+        chunks[2],
     );
 
     let footer = Line::from(vec![
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" quit"),
     ]);
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
+    frame.render_widget(Paragraph::new(footer), chunks[3]);
+}
+
+/// Render the active-issues table into `area`.
+///
+/// Sorted by tracker `identifier` so the visual order is deterministic
+/// independent of HashMap iteration order — required for ratatui
+/// `TestBackend` snapshot tests in later iterations. When the table is
+/// empty we render a placeholder line rather than collapsing the
+/// border, so a quiet system still looks like the right kind of UI
+/// (an empty table) instead of a missing panel.
+fn render_active_issues(
+    state: &AppState,
+    now: Instant,
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("active issues ({})", state.active_issues.len()));
+
+    if state.active_issues.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "(no active issues)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))
+            .block(block),
+            area,
+        );
+        return;
+    }
+
+    // Sort rows by identifier so two AppStates with identical content
+    // render identical frames — the foundation for snapshot testing.
+    let mut rows: Vec<(&IssueId, &ActiveIssue)> = state.active_issues.iter().collect();
+    rows.sort_by(|a, b| a.1.identifier.cmp(&b.1.identifier));
+
+    let header = Row::new(vec![
+        Cell::from("identifier"),
+        Cell::from("state"),
+        Cell::from("elapsed"),
+        Cell::from("backend"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .height(1);
+
+    let body_rows: Vec<Row> = rows
+        .into_iter()
+        .map(|(_, ai)| {
+            let state_label = format_state(&ai.state);
+            let state_cell = Cell::from(state_label).style(state_colour(&ai.state));
+            let elapsed = ai
+                .dispatched_at
+                .map(|d| format_elapsed(now.saturating_duration_since(d)))
+                .unwrap_or_else(|| "—".to_string());
+            let backend = ai.backend.clone().unwrap_or_else(|| "—".to_string());
+            Row::new(vec![
+                Cell::from(ai.identifier.clone()),
+                state_cell,
+                Cell::from(elapsed),
+                Cell::from(backend),
+            ])
+        })
+        .collect();
+
+    // Column widths chosen to match the longest realistic value:
+    // identifiers are typically `ABC-1234` (≤ 12 chars), states fit
+    // in 12 chars including `retry(99)`, elapsed renders as `99h59m`
+    // at most (we cap formatting), and backend is one of four short
+    // tokens. The remainder flexes via `Min`.
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(8),
+        Constraint::Min(8),
+    ];
+    let table = Table::new(body_rows, widths).header(header).block(block);
+    frame.render_widget(table, area);
+}
+
+/// Stringify a [`ClaimState`] for the state column.
+///
+/// Kept separate from `ClaimState`'s serde tag so the *display* form
+/// can diverge from the wire form without breaking the SSE contract:
+/// today they happen to agree (`"running"`, `"retry(N)"`), but a
+/// future variant might serialise differently from how it should
+/// render in a 12-column cell.
+fn format_state(state: &ClaimState) -> String {
+    match state {
+        ClaimState::Running => "running".to_string(),
+        ClaimState::RetryQueued { attempt } => format!("retry({attempt})"),
+    }
+}
+
+/// Foreground colour for a state cell.
+///
+/// Running is green (steady-state happy path), retries are yellow
+/// (something went wrong but the orchestrator is handling it). Future
+/// states (e.g. a `Stuck` variant) get a colour at the same time they
+/// land so the table never silently downgrades to default white.
+fn state_colour(state: &ClaimState) -> Style {
+    match state {
+        ClaimState::Running => Style::default().fg(Color::Green),
+        ClaimState::RetryQueued { .. } => Style::default().fg(Color::Yellow),
+    }
+}
+
+/// Format a [`Duration`] into a tight 1–6-char label.
+///
+/// We render `Ns`, `NmMs`, `NhMm` rather than `H:MM:SS` because the
+/// elapsed column is 8 characters wide and many sessions run into
+/// hours. Above 99h we clamp to `99h+` so the column never overflows.
+fn format_elapsed(d: Duration) -> String {
+    let total = d.as_secs();
+    if total < 60 {
+        return format!("{total}s");
+    }
+    if total < 3_600 {
+        let m = total / 60;
+        let s = total % 60;
+        return format!("{m}m{s:02}s");
+    }
+    let h = total / 3_600;
+    if h >= 100 {
+        return "99h+".to_string();
+    }
+    let m = (total % 3_600) / 60;
+    format!("{h}h{m:02}m")
 }
 
 /// Drive the TUI: own stdout in alternate-screen + raw mode, render on
@@ -265,7 +535,7 @@ where
     // Initial frame so the operator sees *something* before the first
     // SSE byte arrives — the SSE dial may take a few hundred ms over
     // a slow network and a blank terminal looks broken.
-    terminal.draw(|f| render(&state, f))?;
+    terminal.draw(|f| render(&state, Instant::now(), f))?;
 
     loop {
         tokio::select! {
@@ -321,7 +591,7 @@ where
         if state.should_quit {
             break;
         }
-        terminal.draw(|f| render(&state, f))?;
+        terminal.draw(|f| render(&state, Instant::now(), f))?;
     }
     Ok(())
 }
@@ -373,8 +643,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use symphony_core::agent::{SessionId, ThreadId, TurnId};
     use symphony_core::events::OrchestratorEvent;
-    use symphony_core::state_machine::ClaimState;
+    use symphony_core::state_machine::{ClaimState, ReleaseReason};
     use symphony_core::tracker::IssueId;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -486,7 +757,9 @@ mod tests {
         let backend = TestBackend::new(60, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let state = AppState::default();
-        terminal.draw(|f| render(&state, f)).unwrap();
+        terminal
+            .draw(|f| render(&state, Instant::now(), f))
+            .unwrap();
         let buf = terminal.backend().to_string();
         assert!(buf.contains("connecting"), "buffer was: {buf}");
         assert!(buf.contains("symphony watch"), "buffer was: {buf}");
@@ -501,7 +774,9 @@ mod tests {
         state.apply(&WatchEvent::Connected {
             url: "http://h/e".into(),
         });
-        terminal.draw(|f| render(&state, f)).unwrap();
+        terminal
+            .draw(|f| render(&state, Instant::now(), f))
+            .unwrap();
         let buf = terminal.backend().to_string();
         assert!(buf.contains("http://h/e"), "buffer: {buf}");
     }
@@ -515,7 +790,217 @@ mod tests {
         let mut t1 = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut t2 = Terminal::new(TestBackend::new(20, 5)).unwrap();
         let state = AppState::default();
-        t1.draw(|f| render(&state, f)).unwrap();
-        t2.draw(|f| render(&state, f)).unwrap();
+        t1.draw(|f| render(&state, Instant::now(), f)).unwrap();
+        t2.draw(|f| render(&state, Instant::now(), f)).unwrap();
+    }
+
+    fn session(t: &str, u: &str) -> SessionId {
+        SessionId::new(&ThreadId::new(t), &TurnId::new(u))
+    }
+
+    #[test]
+    fn state_changed_inserts_active_issue_row() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("ENG-1"),
+            identifier: "ENG-1".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        let row = s.active_issues.get(&IssueId::new("ENG-1")).unwrap();
+        assert_eq!(row.identifier, "ENG-1");
+        assert_eq!(row.state, ClaimState::Running);
+        assert!(row.dispatched_at.is_none());
+        assert!(row.backend.is_none());
+    }
+
+    #[test]
+    fn dispatched_stamps_backend_and_attempt() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("ENG-2"),
+            identifier: "ENG-2".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-2"),
+            identifier: "ENG-2".into(),
+            session: session("t", "u"),
+            backend: "claude".into(),
+            attempt: 2,
+        });
+        let row = s.active_issues.get(&IssueId::new("ENG-2")).unwrap();
+        assert_eq!(row.backend.as_deref(), Some("claude"));
+        assert_eq!(row.attempt, 2);
+        assert!(row.dispatched_at.is_some());
+        assert_eq!(row.state, ClaimState::Running);
+    }
+
+    #[test]
+    fn dispatched_without_prior_state_change_still_inserts_row() {
+        // The TUI may attach mid-flight, after the orchestrator has
+        // already moved past the initial StateChanged. The table still
+        // needs a row so the operator sees the work-in-progress.
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-7"),
+            identifier: "ENG-7".into(),
+            session: session("t", "u"),
+            backend: "tandem".into(),
+            attempt: 1,
+        });
+        assert!(s.active_issues.contains_key(&IssueId::new("ENG-7")));
+    }
+
+    #[test]
+    fn retry_queued_state_change_lifts_attempt() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("ENG-3"),
+            identifier: "ENG-3".into(),
+            previous: Some(ClaimState::Running),
+            current: ClaimState::RetryQueued { attempt: 4 },
+        });
+        let row = s.active_issues.get(&IssueId::new("ENG-3")).unwrap();
+        assert_eq!(row.attempt, 4);
+        assert_eq!(row.state, ClaimState::RetryQueued { attempt: 4 });
+    }
+
+    #[test]
+    fn released_removes_active_issue_row() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("ENG-4"),
+            identifier: "ENG-4".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        assert!(s.active_issues.contains_key(&IssueId::new("ENG-4")));
+        s.apply_orchestrator_event(&OrchestratorEvent::Released {
+            issue: IssueId::new("ENG-4"),
+            identifier: "ENG-4".into(),
+            reason: ReleaseReason::Completed,
+            final_state: None,
+        });
+        assert!(!s.active_issues.contains_key(&IssueId::new("ENG-4")));
+    }
+
+    #[test]
+    fn reconciled_does_not_remove_rows() {
+        // Released does the per-issue cleanup; if Reconciled also did,
+        // the orchestrator's emission of both would double-remove.
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("ENG-5"),
+            identifier: "ENG-5".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Reconciled {
+            dropped: vec![IssueId::new("ENG-5")],
+        });
+        assert!(s.active_issues.contains_key(&IssueId::new("ENG-5")));
+    }
+
+    #[test]
+    fn format_elapsed_compact_branches() {
+        assert_eq!(format_elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(format_elapsed(Duration::from_secs(45)), "45s");
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+        assert_eq!(format_elapsed(Duration::from_secs(3_600)), "1h00m");
+        assert_eq!(format_elapsed(Duration::from_secs(3_660)), "1h01m");
+        // Cap so an 8-char elapsed column never overflows.
+        assert_eq!(format_elapsed(Duration::from_secs(100 * 3_600)), "99h+");
+    }
+
+    #[test]
+    fn format_state_renders_running_and_retry() {
+        assert_eq!(format_state(&ClaimState::Running), "running");
+        assert_eq!(
+            format_state(&ClaimState::RetryQueued { attempt: 7 }),
+            "retry(7)"
+        );
+    }
+
+    #[test]
+    fn render_active_issues_panel_shows_rows_sorted_by_identifier() {
+        // Insert ENG-2 first so HashMap iteration order is unlikely to
+        // match identifier order without our explicit sort.
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("id-2"),
+            identifier: "ENG-2".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::StateChanged {
+            issue: IssueId::new("id-1"),
+            identifier: "ENG-1".into(),
+            previous: None,
+            current: ClaimState::Running,
+        });
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("id-1"),
+            identifier: "ENG-1".into(),
+            session: session("t", "u"),
+            backend: "claude".into(),
+            attempt: 1,
+        });
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let now = Instant::now();
+        terminal.draw(|f| render(&s, now, f)).unwrap();
+        let buf = terminal.backend().to_string();
+
+        assert!(buf.contains("active issues (2)"), "buf: {buf}");
+        assert!(buf.contains("identifier"), "buf: {buf}");
+        assert!(buf.contains("ENG-1"), "buf: {buf}");
+        assert!(buf.contains("ENG-2"), "buf: {buf}");
+        assert!(buf.contains("running"), "buf: {buf}");
+        assert!(buf.contains("claude"), "buf: {buf}");
+        // Sorted: ENG-1 must appear earlier in the buffer than ENG-2.
+        let p1 = buf.find("ENG-1").unwrap();
+        let p2 = buf.find("ENG-2").unwrap();
+        assert!(p1 < p2, "rows not sorted by identifier: {buf}");
+    }
+
+    #[test]
+    fn render_active_issues_panel_shows_placeholder_when_empty() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let s = AppState::default();
+        terminal.draw(|f| render(&s, Instant::now(), f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("active issues (0)"), "buf: {buf}");
+        assert!(buf.contains("no active issues"), "buf: {buf}");
+    }
+
+    #[test]
+    fn render_active_issues_shows_elapsed_for_dispatched_row() {
+        let mut s = AppState::default();
+        s.apply_orchestrator_event(&OrchestratorEvent::Dispatched {
+            issue: IssueId::new("ENG-9"),
+            identifier: "ENG-9".into(),
+            session: session("t", "u"),
+            backend: "codex".into(),
+            attempt: 1,
+        });
+        // Simulate a 90-second-old dispatch by rewinding the row's
+        // timestamp before we render against a fixed `now`.
+        let dispatched = Instant::now();
+        s.active_issues
+            .get_mut(&IssueId::new("ENG-9"))
+            .unwrap()
+            .dispatched_at = Some(dispatched);
+        let now = dispatched + Duration::from_secs(90);
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&s, now, f)).unwrap();
+        let buf = terminal.backend().to_string();
+        assert!(buf.contains("1m30s"), "elapsed missing in buf: {buf}");
     }
 }
