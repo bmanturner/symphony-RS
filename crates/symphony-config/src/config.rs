@@ -112,6 +112,14 @@ pub struct TrackerConfig {
     #[serde(default)]
     pub repository: Option<String>,
 
+    /// Path to a YAML file of canned issues. REQUIRED when
+    /// `kind == Mock`; ignored otherwise. Used by the Quickstart fixture
+    /// flow so an operator can run `symphony run` end-to-end without a
+    /// Linear or GitHub credential. Path is interpreted relative to the
+    /// `WORKFLOW.md` file when the CLI loads it.
+    #[serde(default)]
+    pub fixtures: Option<PathBuf>,
+
     /// State names that count as "needs work". Stored case-sensitive
     /// because operators write them naturally; conformance tests assert
     /// adapters do the lowercase comparison.
@@ -131,6 +139,7 @@ impl Default for TrackerConfig {
             api_key: None,
             project_slug: None,
             repository: None,
+            fixtures: None,
             active_states: default_active_states(),
             terminal_states: default_terminal_states(),
         }
@@ -146,6 +155,11 @@ pub enum TrackerKind {
     Linear,
     /// GitHub Issues via REST + GraphQL.
     Github,
+    /// In-memory `MockTracker` populated from a YAML fixture file. Used
+    /// by the Quickstart so the binary can be exercised without a real
+    /// tracker credential. Not intended for production use — the runtime
+    /// keeps the canned set in memory and never refreshes it.
+    Mock,
 }
 
 fn default_active_states() -> Vec<String> {
@@ -435,6 +449,10 @@ pub enum ConfigValidationError {
     /// `tracker.kind == Github` requires `tracker.repository`.
     #[error("tracker.repository is required when tracker.kind = github")]
     GithubMissingRepository,
+
+    /// `tracker.kind == Mock` requires `tracker.fixtures`.
+    #[error("tracker.fixtures is required when tracker.kind = mock")]
+    MockMissingFixtures,
 }
 
 impl WorkflowConfig {
@@ -466,6 +484,11 @@ impl WorkflowConfig {
             TrackerKind::Github => {
                 if self.tracker.repository.is_none() {
                     return Err(ConfigValidationError::GithubMissingRepository);
+                }
+            }
+            TrackerKind::Mock => {
+                if self.tracker.fixtures.is_none() {
+                    return Err(ConfigValidationError::MockMissingFixtures);
                 }
             }
         }
@@ -614,6 +637,43 @@ polling:
         let mut cfg = WorkflowConfig::default();
         cfg.tracker.project_slug = Some("ENG".into());
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_requires_fixtures_for_mock() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Mock;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::MockMissingFixtures)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_minimal_mock_config() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Mock;
+        cfg.tracker.fixtures = Some(PathBuf::from("issues.yaml"));
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn yaml_roundtrip_preserves_mock_kind_and_fixtures() {
+        let yaml = r#"
+tracker:
+  kind: mock
+  fixtures: ./quickstart/issues.yaml
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.tracker.kind, TrackerKind::Mock);
+        assert_eq!(
+            parsed.tracker.fixtures.as_deref(),
+            Some(std::path::Path::new("./quickstart/issues.yaml"))
+        );
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
     }
 
     #[test]

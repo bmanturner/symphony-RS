@@ -141,7 +141,7 @@ under their phase header and are added or refined as the project evolves.
       single line bundled config, runtime, fixtures, and docs into a
       task far larger than the ~200-LOC iteration budget; each new
       sub-item is independently testable and commitable.
-- [ ] Add a `mock` variant to `TrackerKind` in `symphony-config` with a
+- [x] Add a `mock` variant to `TrackerKind` in `symphony-config` with a
       `tracker.fixtures` YAML path; `build_tracker` in `symphony-cli`
       loads the fixtures into a `MockTracker`. Round-trip tests for the
       config parsing + a unit test for the CLI factory path.

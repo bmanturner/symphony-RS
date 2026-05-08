@@ -74,7 +74,9 @@ use symphony_core::poll_loop::{Dispatcher, PollLoop, PollLoopConfig};
 use symphony_core::state_machine::ReleaseReason;
 use symphony_core::tracker::Issue;
 use symphony_core::tracker_trait::IssueTracker;
-use symphony_tracker::{GitHubConfig, GitHubTracker, LinearConfig, LinearTracker};
+use symphony_tracker::{
+    GitHubConfig, GitHubTracker, LinearConfig, LinearTracker, fixtures as tracker_fixtures,
+};
 use symphony_workspace::{LocalFsWorkspace, Workspace, WorkspaceManager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -109,8 +111,8 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         "starting symphony run",
     );
 
-    let tracker =
-        build_tracker(&loaded.config).with_context(|| "building issue tracker adapter")?;
+    let tracker = build_tracker(&loaded.config, &loaded.source_path)
+        .with_context(|| "building issue tracker adapter")?;
     let workspace =
         build_workspace(&loaded.config).with_context(|| "building workspace manager")?;
     let agent = build_agent_runner(&loaded.config).with_context(|| "building agent runner")?;
@@ -178,7 +180,15 @@ fn install_ctrl_c(cancel: CancellationToken) {
 /// We deliberately do not implement `$VAR` expansion on the YAML field
 /// — figment's env layering is the documented expansion path (SPEC §5.4)
 /// and a second mechanism would just add ambiguity.
-pub(crate) fn build_tracker(cfg: &WorkflowConfig) -> Result<Arc<dyn IssueTracker>> {
+///
+/// `workflow_path` is the path to the `WORKFLOW.md` file. Used to
+/// resolve relative `tracker.fixtures` paths so an operator can ship a
+/// `WORKFLOW.md` and `issues.yaml` side-by-side without hard-coding
+/// absolute paths.
+pub(crate) fn build_tracker(
+    cfg: &WorkflowConfig,
+    workflow_path: &std::path::Path,
+) -> Result<Arc<dyn IssueTracker>> {
     match cfg.tracker.kind {
         TrackerKind::Linear => {
             let project_slug = cfg
@@ -225,6 +235,34 @@ pub(crate) fn build_tracker(cfg: &WorkflowConfig) -> Result<Arc<dyn IssueTracker
                     .with_context(|| format!("parsing tracker.endpoint = {endpoint:?}"))?;
             }
             Ok(Arc::new(GitHubTracker::new(gh_cfg)?))
+        }
+        TrackerKind::Mock => {
+            let rel = cfg
+                .tracker
+                .fixtures
+                .as_ref()
+                .ok_or_else(|| anyhow!("tracker.fixtures is required for mock"))?;
+            // Resolve relative to the workflow file's directory so an
+            // operator can ship `WORKFLOW.md` and `issues.yaml` together
+            // and reference the latter as a bare filename. Absolute
+            // paths pass through unchanged.
+            let path = if rel.is_absolute() {
+                rel.clone()
+            } else {
+                workflow_path
+                    .parent()
+                    .map(|p| p.join(rel))
+                    .unwrap_or_else(|| rel.clone())
+            };
+            let (tracker, fixtures) = tracker_fixtures::load(&path)
+                .with_context(|| format!("loading tracker fixtures from {}", path.display()))?;
+            info!(
+                path = %path.display(),
+                active = fixtures.active_count(),
+                terminal = fixtures.terminal_count(),
+                "loaded mock tracker fixtures",
+            );
+            Ok(Arc::new(tracker))
         }
     }
 }
@@ -649,7 +687,7 @@ mod tests {
             },
             ..WorkflowConfig::default()
         };
-        let err = match build_tracker(&cfg) {
+        let err = match build_tracker(&cfg, std::path::Path::new("WORKFLOW.md")) {
             Err(e) => e,
             Ok(_) => panic!("expected build_tracker to fail"),
         };
@@ -669,12 +707,55 @@ mod tests {
             },
             ..WorkflowConfig::default()
         };
-        let err = match build_tracker(&cfg) {
+        let err = match build_tracker(&cfg, std::path::Path::new("WORKFLOW.md")) {
             Err(e) => e,
             Ok(_) => panic!("expected build_tracker to fail"),
         };
         assert!(err.to_string().contains("owner/repo"));
         unsafe { env::remove_var(key) };
+    }
+
+    #[tokio::test]
+    async fn build_tracker_mock_loads_fixtures_relative_to_workflow_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(&workflow_path, "# stub\n").unwrap();
+        let fixtures_path = dir.path().join("issues.yaml");
+        std::fs::write(
+            &fixtures_path,
+            "active:\n  - id: id-1\n    identifier: ABC-1\n    title: t\n    state: Todo\n",
+        )
+        .unwrap();
+        let cfg = WorkflowConfig {
+            tracker: TrackerConfig {
+                kind: TrackerKind::Mock,
+                // Bare filename: must resolve next to WORKFLOW.md.
+                fixtures: Some(std::path::PathBuf::from("issues.yaml")),
+                ..TrackerConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let tracker = build_tracker(&cfg, &workflow_path).unwrap();
+        let active = tracker.fetch_active().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].identifier, "ABC-1");
+    }
+
+    #[test]
+    fn build_tracker_mock_requires_fixtures_path() {
+        let cfg = WorkflowConfig {
+            tracker: TrackerConfig {
+                kind: TrackerKind::Mock,
+                fixtures: None,
+                ..TrackerConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let err = match build_tracker(&cfg, std::path::Path::new("WORKFLOW.md")) {
+            Err(e) => e,
+            Ok(_) => panic!("expected build_tracker to fail when fixtures missing"),
+        };
+        assert!(err.to_string().contains("fixtures"));
     }
 
     #[test]

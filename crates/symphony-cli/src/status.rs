@@ -102,7 +102,7 @@ pub async fn run(path: &Path) -> StatusOutcome {
     if let Err(err) = loaded.config.validate() {
         return StatusOutcome::Invalid(Box::new(loaded), err);
     }
-    let tracker = match build_tracker(&loaded.config) {
+    let tracker = match build_tracker(&loaded.config, &loaded.source_path) {
         Ok(t) => t,
         Err(err) => {
             // `build_tracker` failures are credential / config shaped
@@ -251,6 +251,12 @@ fn tracker_label(kind: TrackerKind, cfg: &symphony_config::WorkflowConfig) -> St
             .tracker
             .repository
             .clone()
+            .unwrap_or_else(|| "?".to_string()),
+        TrackerKind::Mock => cfg
+            .tracker
+            .fixtures
+            .as_ref()
+            .map(|p| p.display().to_string())
             .unwrap_or_else(|| "?".to_string()),
     }
 }

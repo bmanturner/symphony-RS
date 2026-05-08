@@ -19,9 +19,11 @@ graphql_client.workspace = true
 url.workspace = true
 secrecy.workspace = true
 octocrab.workspace = true
+serde_yaml.workspace = true
 http = "1.4.0"
 
 [dev-dependencies]
 wiremock.workspace = true
 tokio-test.workspace = true
 rstest.workspace = true
+tempfile.workspace = true

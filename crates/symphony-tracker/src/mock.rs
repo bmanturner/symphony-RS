@@ -57,7 +57,7 @@ pub enum MockCall {
 /// Kept private so callers go through the [`MockTracker`] surface and we
 /// can evolve the representation (e.g. swap in a parking_lot mutex, add a
 /// tokio Notify for streaming tests) without breaking the public API.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct MockState {
     /// Issues returned by `fetch_active`. Already filtered by the test
     /// author to states they consider active — the trait contract is that
@@ -94,7 +94,7 @@ struct MockState {
 /// handles share the same script. Useful for tests where the
 /// orchestrator-under-test holds an `Arc<dyn IssueTracker>` while the test
 /// body retains a typed handle for assertions.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MockTracker {
     inner: Arc<Mutex<MockState>>,
 }
