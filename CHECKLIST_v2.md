@@ -17,7 +17,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Extend `PollingConfig` with `jitter_ms` and `startup_reconcile_recent_terminal` per SPEC v2 §5.2.
   - [x] Add typed `DecompositionConfig` (SPEC v2 §5.7) with `triggers` substructure and `child_issue_policy` enum.
   - [x] Add typed `IntegrationConfig` (SPEC v2 §5.10) with `merge_strategy`, `conflict_policy`, and `required_for` enums.
-  - [ ] Add typed `PullRequestConfig` (SPEC v2 §5.11) with `open_stage`, `mark_ready_stage`, and `initial_state` enums and templated title/body.
+  - [x] Add typed `PullRequestConfig` (SPEC v2 §5.11) with `open_stage`, `mark_ready_stage`, and `initial_state` enums and templated title/body.
   - [ ] Add typed `QaConfig` (SPEC v2 §5.12) with `blocker_policy` enum, `waiver_roles`, and `evidence_required` substructure.
   - [ ] Add typed `FollowupConfig` (SPEC v2 §5.13) sharing the policy enum with decomposition.
   - [ ] Add typed `ObservabilityConfig` (SPEC v2 §5.14) and migrate `StatusConfig` under `observability.sse`, preserving the existing `bind`/`replay_buffer` validation.

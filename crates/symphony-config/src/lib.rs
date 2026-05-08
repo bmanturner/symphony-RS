@@ -22,7 +22,8 @@ pub use config::{
     AgentBackend, AgentBackendProfile, AgentCompositeProfile, AgentConfig, AgentKind,
     AgentProfileConfig, AgentStrategy, ChildIssuePolicy, CodexConfig, ConfigValidationError,
     ConflictPolicy, DecompositionConfig, DecompositionTriggers, HermesAgentConfig, HooksConfig,
-    IntegrationConfig, IntegrationRequirement, MergeStrategy, PollingConfig, RoleConfig, RoleKind,
+    IntegrationConfig, IntegrationRequirement, MergeStrategy, PollingConfig, PrInitialState,
+    PrMarkReadyStage, PrOpenStage, PrProvider, PullRequestConfig, RoleConfig, RoleKind,
     RoutingConfig, RoutingMatch, RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION,
     TandemMode, TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
 };

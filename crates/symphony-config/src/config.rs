@@ -146,6 +146,15 @@ pub struct WorkflowConfig {
     /// `kind: integration_owner` once `required_for` is non-empty.
     #[serde(default)]
     pub integration: IntegrationConfig,
+
+    /// Pull-request lifecycle policy. SPEC v2 §5.11. Defaults to
+    /// `enabled: false` so a workflow that omits the block behaves
+    /// like v1 (no PR side effects). Later phases enforce that
+    /// `owner_role` resolves to a role of `kind: integration_owner`
+    /// and that `provider` lines up with the configured tracker
+    /// (only GitHub supports PR mutations today).
+    #[serde(default)]
+    pub pull_requests: PullRequestConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -174,6 +183,7 @@ impl Default for WorkflowConfig {
             routing: RoutingConfig::default(),
             decomposition: DecompositionConfig::default(),
             integration: IntegrationConfig::default(),
+            pull_requests: PullRequestConfig::default(),
         }
     }
 }
@@ -1457,6 +1467,189 @@ pub enum ConflictPolicy {
     /// Stop and require human intervention. Use when the workflow
     /// has zero tolerance for autonomous merge repair.
     BlockForHuman,
+}
+
+// ---------------------------------------------------------------------------
+// pull_requests (SPEC v2 §5.11)
+// ---------------------------------------------------------------------------
+
+/// Pull-request lifecycle policy.
+///
+/// Specialists do not open PRs by default; the integration owner owns
+/// PR creation, draft → ready transition, and final state. SPEC v2
+/// §5.11 specifies the operator-facing surface; this struct is the
+/// typed mirror.
+///
+/// Defaults are deliberately conservative: `enabled: false` with no
+/// `owner_role` means a workflow that omits the block behaves
+/// identically to v1 (no PR side effects). When enabled, later phases
+/// enforce that `owner_role` resolves to a role of
+/// `kind: integration_owner` and that `provider` lines up with the
+/// configured tracker — only GitHub supports the PR mutations
+/// described in SPEC v2 §5.11 today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestConfig {
+    /// Master switch. When `false` (the default), the orchestrator
+    /// skips every PR side effect even if other fields are set.
+    /// Pairs with the SPEC's "PR is optional" stance: integration
+    /// can complete without a PR if the workflow omits this block.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Role name (key into [`WorkflowConfig::roles`]) responsible for
+    /// opening, updating, and marking the PR ready. Optional at parse
+    /// time so partial fixtures can declare an empty `pull_requests:`
+    /// block; later phases enforce that the reference resolves to a
+    /// role of `kind: integration_owner` whenever `enabled` is true.
+    #[serde(default)]
+    pub owner_role: Option<String>,
+
+    /// Which forge adapter is responsible for the PR mutations.
+    /// Defaults to [`PrProvider::Github`] — the only PR-capable
+    /// adapter today. Later phases reject `enabled: true` when the
+    /// configured tracker cannot satisfy this provider.
+    #[serde(default)]
+    pub provider: PrProvider,
+
+    /// When the PR is first opened. Defaults to
+    /// [`PrOpenStage::AfterIntegrationVerification`] per the SPEC's
+    /// worked example. [`PrOpenStage::Manual`] disables auto-open
+    /// without disabling the rest of the lifecycle (the integration
+    /// owner can still update title/body and mark ready).
+    #[serde(default)]
+    pub open_stage: PrOpenStage,
+
+    /// Initial PR state on creation. Defaults to
+    /// [`PrInitialState::Draft`]: QA runs against the draft and the
+    /// integration owner promotes it on `mark_ready_stage`.
+    #[serde(default)]
+    pub initial_state: PrInitialState,
+
+    /// When the PR transitions from draft → ready for review.
+    /// Defaults to [`PrMarkReadyStage::AfterQaPasses`] per the SPEC's
+    /// worked example. [`PrMarkReadyStage::Manual`] keeps the PR in
+    /// draft until an operator-driven transition.
+    #[serde(default)]
+    pub mark_ready_stage: PrMarkReadyStage,
+
+    /// Templated PR title. `None` falls back to a built-in template
+    /// at render time. Variable rendering is the strict
+    /// `{{path.to.value}}` form introduced in CHECKLIST §7; unknown
+    /// variables MUST fail the render rather than silently producing
+    /// "{{...}}" in a real PR title.
+    #[serde(default)]
+    pub title_template: Option<String>,
+
+    /// Templated PR body. Same rendering rules as `title_template`.
+    /// The SPEC v2 §5.11 example uses `{{integration.summary}}`,
+    /// `{{qa.status}}`, and `{{links}}`; the renderer surfaces those
+    /// values from the integration record / QA verdict / linked
+    /// work.
+    #[serde(default)]
+    pub body_template: Option<String>,
+
+    /// When `true` (the default), the PR description includes
+    /// machine-readable links to the originating tracker issues so
+    /// the tracker auto-closes the parent on merge where supported.
+    #[serde(default = "default_true")]
+    pub link_tracker_issues: bool,
+
+    /// When `true` (the default), the integration owner must wait
+    /// for green CI before promoting a draft PR to ready for
+    /// review. Pairs with `qa.evidence_required` (SPEC v2 §5.12)
+    /// when QA also asserts CI status.
+    #[serde(default = "default_true")]
+    pub require_ci_green_before_ready: bool,
+}
+
+impl Default for PullRequestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            owner_role: None,
+            provider: PrProvider::default(),
+            open_stage: PrOpenStage::default(),
+            initial_state: PrInitialState::default(),
+            mark_ready_stage: PrMarkReadyStage::default(),
+            title_template: None,
+            body_template: None,
+            link_tracker_issues: true,
+            require_ci_green_before_ready: true,
+        }
+    }
+}
+
+/// Forge adapter responsible for PR mutations (SPEC v2 §5.11
+/// `provider`).
+///
+/// Today only GitHub supports the create/update/mark-ready/check
+/// surface required by the SPEC. Other forges are rejected at
+/// validation time so an enabled PR config does not silently drop
+/// mutations on the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrProvider {
+    /// GitHub via the REST + GraphQL adapter. Default.
+    #[default]
+    Github,
+}
+
+/// When the PR is first opened (SPEC v2 §5.11 `open_stage`).
+///
+/// The default — [`PrOpenStage::AfterIntegrationVerification`] —
+/// matches the SPEC's worked example: the integration owner opens
+/// the PR only after consolidation has actually verified.
+/// [`PrOpenStage::Manual`] is the operator escape hatch for
+/// workflows that drive PR opening from outside the orchestrator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrOpenStage {
+    /// Open the PR once the integration owner has produced an
+    /// integration record (canonical branch verified, no open
+    /// blockers). Default per SPEC v2 §5.11.
+    #[default]
+    AfterIntegrationVerification,
+    /// The orchestrator never auto-opens the PR. The integration
+    /// owner may still maintain it (update body, mark ready) once
+    /// it exists.
+    Manual,
+}
+
+/// Initial PR state on creation (SPEC v2 §5.11 `initial_state`).
+///
+/// Defaults to [`PrInitialState::Draft`] per the SPEC: QA runs
+/// against drafts so a failing verdict never spams reviewers, and
+/// the integration owner promotes after QA passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrInitialState {
+    /// Open as draft. Default per SPEC v2 §5.11.
+    #[default]
+    Draft,
+    /// Open in ready-for-review state. Use only when QA is disabled
+    /// or the workflow explicitly accepts reviewer pings on every
+    /// integration handoff.
+    ReadyForReview,
+}
+
+/// When a draft PR is promoted to ready for review (SPEC v2 §5.11
+/// `mark_ready_stage`).
+///
+/// Defaults to [`PrMarkReadyStage::AfterQaPasses`] per the SPEC.
+/// [`PrMarkReadyStage::Manual`] leaves promotion to an operator —
+/// the integration owner still records the QA pass, but does not
+/// flip the PR's draft bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrMarkReadyStage {
+    /// Mark ready as soon as QA records a passing verdict against
+    /// the draft branch. Default per SPEC v2 §5.11.
+    #[default]
+    AfterQaPasses,
+    /// The orchestrator never auto-promotes. The integration owner
+    /// or an operator marks the PR ready out-of-band.
+    Manual,
 }
 
 // ---------------------------------------------------------------------------
@@ -3174,6 +3367,273 @@ integration:
             ConflictPolicy::RouteToChildOwner
         );
         assert!(!parsed.integration.require_all_children_terminal);
+    }
+
+    #[test]
+    fn pull_requests_block_defaults_when_omitted() {
+        // SPEC v2 §5.11 defaults: an omitted `pull_requests:` block must
+        // produce the safe defaults — disabled, no owner, GitHub
+        // provider, draft after integration, ready after QA, link
+        // tracker issues, require green CI.
+        let cfg = WorkflowConfig::default();
+        let p = &cfg.pull_requests;
+        assert!(!p.enabled);
+        assert!(p.owner_role.is_none());
+        assert_eq!(p.provider, PrProvider::Github);
+        assert_eq!(p.open_stage, PrOpenStage::AfterIntegrationVerification);
+        assert_eq!(p.initial_state, PrInitialState::Draft);
+        assert_eq!(p.mark_ready_stage, PrMarkReadyStage::AfterQaPasses);
+        assert!(p.title_template.is_none());
+        assert!(p.body_template.is_none());
+        assert!(p.link_tracker_issues);
+        assert!(p.require_ci_green_before_ready);
+    }
+
+    #[test]
+    fn pull_requests_partial_block_inherits_documented_defaults() {
+        // An operator who writes only `enabled` and `owner_role` should
+        // still get the SPEC defaults for provider, lifecycle stages,
+        // tracker linking, and CI gating.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  enabled: true
+  owner_role: platform_lead
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let p = &parsed.pull_requests;
+        assert!(p.enabled);
+        assert_eq!(p.owner_role.as_deref(), Some("platform_lead"));
+        assert_eq!(p.provider, PrProvider::Github);
+        assert_eq!(p.open_stage, PrOpenStage::AfterIntegrationVerification);
+        assert_eq!(p.initial_state, PrInitialState::Draft);
+        assert_eq!(p.mark_ready_stage, PrMarkReadyStage::AfterQaPasses);
+        assert!(p.link_tracker_issues);
+        assert!(p.require_ci_green_before_ready);
+    }
+
+    #[test]
+    fn pull_requests_full_block_parses_spec_example() {
+        // Mirrors the SPEC v2 §5.11 worked example verbatim.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  enabled: true
+  owner_role: platform_lead
+  provider: github
+  open_stage: after_integration_verification
+  initial_state: draft
+  mark_ready_stage: after_qa_passes
+  title_template: "{{identifier}}: {{title}}"
+  body_template: |
+    ## Summary
+    {{integration.summary}}
+
+    ## QA
+    {{qa.status}}
+
+    ## Linked work
+    {{links}}
+  link_tracker_issues: true
+  require_ci_green_before_ready: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let p = &parsed.pull_requests;
+        assert!(p.enabled);
+        assert_eq!(p.owner_role.as_deref(), Some("platform_lead"));
+        assert_eq!(p.provider, PrProvider::Github);
+        assert_eq!(p.open_stage, PrOpenStage::AfterIntegrationVerification);
+        assert_eq!(p.initial_state, PrInitialState::Draft);
+        assert_eq!(p.mark_ready_stage, PrMarkReadyStage::AfterQaPasses);
+        assert_eq!(
+            p.title_template.as_deref(),
+            Some("{{identifier}}: {{title}}")
+        );
+        let body = p.body_template.as_deref().expect("body_template parses");
+        assert!(body.contains("{{integration.summary}}"));
+        assert!(body.contains("{{qa.status}}"));
+        assert!(body.contains("{{links}}"));
+        assert!(p.link_tracker_issues);
+        assert!(p.require_ci_green_before_ready);
+    }
+
+    #[test]
+    fn pull_requests_open_stage_serialises_snake_case() {
+        for (variant, literal) in [
+            (
+                PrOpenStage::AfterIntegrationVerification,
+                "after_integration_verification",
+            ),
+            (PrOpenStage::Manual, "manual"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: PrOpenStage = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn pull_requests_initial_state_serialises_snake_case() {
+        for (variant, literal) in [
+            (PrInitialState::Draft, "draft"),
+            (PrInitialState::ReadyForReview, "ready_for_review"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: PrInitialState = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn pull_requests_mark_ready_stage_serialises_snake_case() {
+        for (variant, literal) in [
+            (PrMarkReadyStage::AfterQaPasses, "after_qa_passes"),
+            (PrMarkReadyStage::Manual, "manual"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: PrMarkReadyStage = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn pull_requests_provider_serialises_snake_case() {
+        let yaml = serde_yaml::to_string(&PrProvider::Github).expect("serialises");
+        assert!(yaml.contains("github"), "expected github in {yaml:?}");
+        let reparsed: PrProvider = serde_yaml::from_str(&yaml).expect("re-parses");
+        assert_eq!(reparsed, PrProvider::Github);
+    }
+
+    #[test]
+    fn pull_requests_rejects_unknown_open_stage() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  open_stage: on_branch_push
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("on_branch_push")
+                || msg.contains("unknown variant")
+                || msg.contains("after_integration_verification"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pull_requests_rejects_unknown_initial_state() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  initial_state: in_review
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("in_review") || msg.contains("unknown variant") || msg.contains("draft"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pull_requests_rejects_unknown_mark_ready_stage() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  mark_ready_stage: after_review_request
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("after_review_request")
+                || msg.contains("unknown variant")
+                || msg.contains("after_qa_passes"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pull_requests_rejects_unknown_provider() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  provider: gitlab
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gitlab") || msg.contains("unknown variant") || msg.contains("github"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pull_requests_rejects_unknown_top_level_key() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  auto_merge: true
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto_merge") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn pull_requests_round_trips_through_yaml() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+pull_requests:
+  enabled: true
+  owner_role: platform_lead
+  provider: github
+  open_stage: manual
+  initial_state: ready_for_review
+  mark_ready_stage: manual
+  title_template: "draft: {{identifier}}"
+  body_template: "see {{links}}"
+  link_tracker_issues: false
+  require_ci_green_before_ready: false
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+        assert_eq!(parsed.pull_requests.open_stage, PrOpenStage::Manual);
+        assert_eq!(
+            parsed.pull_requests.initial_state,
+            PrInitialState::ReadyForReview
+        );
+        assert_eq!(
+            parsed.pull_requests.mark_ready_stage,
+            PrMarkReadyStage::Manual
+        );
+        assert!(!parsed.pull_requests.link_tracker_issues);
+        assert!(!parsed.pull_requests.require_ci_green_before_ready);
     }
 
     #[test]
