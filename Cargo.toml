@@ -33,8 +33,11 @@ repository = "https://github.com/foglet-io/rust-symphony"
 [workspace.dependencies]
 # Async / runtime: tokio is the only async runtime we target. `async-trait`
 # unlocks dyn-compatible async traits which we need at the orchestrator
-# composition boundary.
+# composition boundary. `tokio-util` brings `CancellationToken` for the
+# coop-cancellation handle the orchestrator threads through every async
+# I/O boundary.
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"

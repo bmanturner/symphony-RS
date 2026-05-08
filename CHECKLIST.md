@@ -109,7 +109,7 @@ under their phase header and are added or refined as the project evolves.
 
 - [x] State machine (`Unclaimed → Claimed{Running|RetryQueued} →
       Released`) as a pure module with property tests
-- [ ] Poll loop with `tokio::time::interval`, jitter, bounded concurrency
+- [x] Poll loop with `tokio::time::interval`, jitter, bounded concurrency
       [state machine]
 - [ ] Retry queue with exponential backoff (cap from config) [state
       machine]

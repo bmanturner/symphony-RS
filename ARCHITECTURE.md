@@ -361,6 +361,28 @@ production deps enter the budget: `ratatui`, `crossterm`, `axum`. The
 broadcast bus is a pure addition to the orchestrator (replay buffer
 default 256, configurable) — no behavioural change.
 
+### 2026-05-08 — `tokio-util` for cooperative cancellation
+**Context.** The architecture tenets require every async fn that touches
+I/O to take a cancellation handle. The poll loop in Phase 5 fans out
+dispatch tasks that each own an agent session; SIGINT shutdown (Phase 7)
+must drain in-flight work without aborting it mid-turn. `tokio` itself
+ships abort-style cancellation (drop the `JoinHandle`) but no shared,
+cloneable cooperative signal — `tokio_util::sync::CancellationToken` is
+that signal: clone-on-demand, parent/child relationships, and
+`cancelled().await` integrates naturally with `tokio::select!`.
+
+**Decision.** Add `tokio-util` (v0.7) to the workspace crate budget,
+default-features off, with the `rt` feature enabled (the only feature
+needed for `CancellationToken`). The orchestrator's `PollLoop::run`
+takes a `CancellationToken`, propagates clones to per-issue dispatch
+tasks, and resolves on cancellation by draining the join set rather
+than aborting it.
+
+**Consequence.** One additional production dependency, but it's a
+first-party tokio crate so the version-skew risk is minimal. No
+behavioural change to existing code; the token is plumbed only through
+new code paths added during Phase 5.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line
@@ -399,3 +421,6 @@ justifications follow. Anything added beyond this list requires a new ADR.
   ratatui.
 - **axum** — Phase 8 only; HTTP server in `symphony-cli` exposing
   `GET /events` as `text/event-stream`.
+- **tokio-util** — `CancellationToken` for cooperative cancellation of
+  the orchestrator's poll loop and any in-flight dispatch tasks. See
+  ADR `2026-05-08 — tokio-util for cooperative cancellation`.

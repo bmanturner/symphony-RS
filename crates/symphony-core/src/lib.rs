@@ -12,6 +12,7 @@
 //! phases).
 
 pub mod agent;
+pub mod poll_loop;
 pub mod state_machine;
 pub mod tracker;
 pub mod tracker_trait;
@@ -21,6 +22,7 @@ pub use agent::{
     CompletionReason, RateLimitSnapshot, SessionId, StartSessionParams, ThreadId, TokenUsage,
     TurnId,
 };
+pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
 pub use tracker_trait::{IssueTracker, TrackerError, TrackerResult};
