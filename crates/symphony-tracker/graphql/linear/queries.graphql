@@ -1,0 +1,133 @@
+# Linear GraphQL queries used by `LinearTracker`.
+#
+# Three operations, mirroring SPEC §11.1:
+#
+#   CandidateIssues   — `fetch_candidate_issues` (active dispatch list)
+#   IssuesByStates    — `fetch_issues_by_states` (terminal cleanup)
+#   IssueStatesByIds  — `fetch_issue_states_by_ids` (active reconcile)
+#
+# All three are typed by graphql_client against schema.graphql in this
+# directory. The adapter (Phase 2 next task) issues these via reqwest and
+# normalizes responses into `symphony_core::tracker::Issue`.
+#
+# Selection sets are deliberately narrow: only fields used by the
+# normalizer. Extending a query means adding the field to schema.graphql
+# first.
+
+query CandidateIssues(
+  $projectSlug: String!
+  $stateNames: [String!]!
+  $first: Int!
+  $after: String
+) {
+  issues(
+    filter: {
+      project: { slugId: { eq: $projectSlug } }
+      state: { name: { in: $stateNames } }
+    }
+    first: $first
+    after: $after
+  ) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      identifier
+      title
+      description
+      priority
+      branchName
+      url
+      createdAt
+      updatedAt
+      state {
+        id
+        name
+      }
+      labels(first: 50) {
+        nodes {
+          name
+        }
+      }
+      inverseRelations(first: 50) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+query IssuesByStates(
+  $projectSlug: String!
+  $stateNames: [String!]!
+  $first: Int!
+  $after: String
+) {
+  issues(
+    filter: {
+      project: { slugId: { eq: $projectSlug } }
+      state: { name: { in: $stateNames } }
+    }
+    first: $first
+    after: $after
+  ) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      identifier
+      title
+      description
+      priority
+      branchName
+      url
+      createdAt
+      updatedAt
+      state {
+        id
+        name
+      }
+      labels(first: 50) {
+        nodes {
+          name
+        }
+      }
+      inverseRelations(first: 50) {
+        nodes {
+          type
+          issue {
+            id
+            identifier
+            state {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+query IssueStatesByIds($ids: [ID!]!) {
+  issues(filter: { id: { in: $ids } }, first: 250) {
+    nodes {
+      id
+      identifier
+      state {
+        name
+      }
+    }
+  }
+}

@@ -48,7 +48,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] Add `octocrab` to the workspace crate budget via `cargo add -p
       symphony-tracker octocrab` (or workspace-level if other crates need
       it later). Record the rationale as a one-paragraph ADR.
-- [ ] Generate Linear GraphQL bindings via `graphql_client` from a
+- [x] Generate Linear GraphQL bindings via `graphql_client` from a
       checked-in `.graphql` query set [IssueTracker trait]
 - [ ] Implement `LinearTracker` translating GraphQL → `Issue`. `wiremock`
       integration tests covering happy path, 4xx, 5xx, malformed

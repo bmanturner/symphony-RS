@@ -26,3 +26,5 @@ pub mod mock;
 pub use mock::{MockCall, MockTracker};
 
 pub mod conformance;
+
+pub mod linear;

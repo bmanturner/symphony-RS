@@ -1,0 +1,111 @@
+# Minimal Linear GraphQL schema — only the surface our adapter touches.
+#
+# Why a hand-rolled schema instead of the upstream introspection dump?
+# Linear's full schema is hundreds of types and changes with every release.
+# Vendoring it would (a) bloat the repo, (b) drag thousands of lines of
+# generated Rust into our build for types we never use, and (c) break our
+# build whenever Linear adds an unrelated field. graphql_client only needs
+# the types referenced by our queries, so we ship just those, with names
+# and shapes matching the upstream schema. SPEC §11.2 already calls out
+# that "Linear GraphQL schema details can drift" and asks us to "keep
+# query construction isolated and test the exact query fields/types
+# REQUIRED by this specification" — vendoring a minimal schema is exactly
+# that isolation seam.
+#
+# When upstream Linear adds a field we want, extend this file and the
+# corresponding query in queries.graphql; do not pull in the full
+# introspection result.
+
+schema {
+  query: Query
+}
+
+# Linear's `DateTime` is an ISO-8601 string at the wire level. We map it to
+# `String` in the generated Rust (see `linear/queries.rs`) because SPEC
+# §11.3 stores timestamps as raw strings — we never compare them, only
+# echo them in logs and prompt templates.
+scalar DateTime
+
+type Query {
+  issues(
+    filter: IssueFilter
+    first: Int
+    after: String
+  ): IssueConnection!
+}
+
+type IssueConnection {
+  pageInfo: PageInfo!
+  nodes: [Issue!]!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+type Issue {
+  id: ID!
+  identifier: String!
+  title: String!
+  description: String
+  # Linear returns priority as a Float (0.0 == "no priority", 1..4 are
+  # urgent/high/medium/low). SPEC §11.3 mandates "integer only", so the
+  # adapter rounds to i32 — or leaves the normalized field None when the
+  # rounded value is 0 or negative.
+  priority: Float
+  branchName: String
+  url: String
+  createdAt: DateTime
+  updatedAt: DateTime
+  state: WorkflowState!
+  labels(first: Int): IssueLabelConnection!
+  # `inverseRelations` exposes the relations *pointing at* this issue;
+  # we filter to type == "blocks" client-side when normalizing.
+  inverseRelations(first: Int): IssueRelationConnection!
+}
+
+type WorkflowState {
+  id: ID!
+  name: String!
+}
+
+type IssueLabelConnection {
+  nodes: [IssueLabel!]!
+}
+
+type IssueLabel {
+  name: String!
+}
+
+type IssueRelationConnection {
+  nodes: [IssueRelation!]!
+}
+
+type IssueRelation {
+  type: String!
+  issue: Issue!
+}
+
+input IssueFilter {
+  project: ProjectFilter
+  state: WorkflowStateFilter
+  id: IDComparator
+}
+
+input ProjectFilter {
+  slugId: StringComparator
+}
+
+input WorkflowStateFilter {
+  name: StringComparator
+}
+
+input StringComparator {
+  eq: String
+  in: [String!]
+}
+
+input IDComparator {
+  in: [ID!]
+}
