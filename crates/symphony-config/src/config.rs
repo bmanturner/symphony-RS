@@ -130,6 +130,14 @@ pub struct WorkflowConfig {
     /// reference resolves to a configured role.
     #[serde(default)]
     pub routing: RoutingConfig,
+
+    /// Broad-issue decomposition policy. SPEC v2 §5.7. Defaults to
+    /// disabled with no `owner_role` so a workflow that does not
+    /// mention decomposition behaves identically to v1; later phases
+    /// enforce that `owner_role` resolves to a role of
+    /// `kind: integration_owner` once decomposition is enabled.
+    #[serde(default)]
+    pub decomposition: DecompositionConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -156,6 +164,7 @@ impl Default for WorkflowConfig {
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
             routing: RoutingConfig::default(),
+            decomposition: DecompositionConfig::default(),
         }
     }
 }
@@ -1135,6 +1144,147 @@ pub struct RoutingMatch {
     /// the schema until the routing engine lands.
     #[serde(default)]
     pub issue_size: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// decomposition (SPEC v2 §5.7)
+// ---------------------------------------------------------------------------
+
+/// Broad-issue decomposition policy.
+///
+/// Decomposition is the integration owner's first move on broad work:
+/// a parent issue is split into child scopes that each map to a
+/// specialist role, then later consolidated by the same owner. SPEC v2
+/// §5.7 captures the operator-facing surface; this struct is the
+/// typed mirror of that block.
+///
+/// Defaults are deliberately conservative: `enabled: false` with no
+/// `owner_role` means a workflow that omits the block behaves like v1
+/// (no auto-decomposition). The remaining defaults — `max_depth: 2`,
+/// `require_acceptance_criteria_per_child: true`, and
+/// [`ChildIssuePolicy::ProposeForApproval`] — match the SPEC's worked
+/// example with the safer policy chosen on ties: human approval is the
+/// safer default than direct tracker writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecompositionConfig {
+    /// Master switch. When `false` (the default), the runner skips
+    /// decomposition even on issues whose triggers would otherwise
+    /// fire — operators must opt in by setting `enabled: true` *and*
+    /// naming an `owner_role`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Role name (key into [`WorkflowConfig::roles`]) responsible for
+    /// running decomposition. Optional at parse time so partial
+    /// fixtures can declare an empty `decomposition:` block; later
+    /// phases enforce that the reference resolves to a role of
+    /// `kind: integration_owner`.
+    #[serde(default)]
+    pub owner_role: Option<String>,
+
+    /// Conditions under which an issue is considered "broad" and
+    /// therefore eligible for decomposition. Empty by default; an
+    /// empty trigger set means "never auto-decompose" even when
+    /// `enabled: true`, which matches operator intuition that omitted
+    /// triggers shouldn't fire.
+    #[serde(default)]
+    pub triggers: DecompositionTriggers,
+
+    /// What to do once the integration owner has a child plan: write
+    /// the child issues straight through `TrackerMutations` or queue
+    /// them for human/integration-owner approval first. SPEC v2 §5.7
+    /// shares this enum with `followups.default_policy` (§5.13).
+    #[serde(default)]
+    pub child_issue_policy: ChildIssuePolicy,
+
+    /// Maximum recursion depth for nested decomposition (parent →
+    /// child → grandchild). `2` matches the SPEC example and keeps
+    /// recursion bounded; the kernel rejects child plans that would
+    /// exceed this depth.
+    #[serde(default = "default_decomposition_max_depth")]
+    pub max_depth: u32,
+
+    /// When `true`, every child scope MUST carry its own acceptance
+    /// criteria; the integration owner's plan is rejected otherwise.
+    /// Defaults to `true` so operators get the SPEC's documented
+    /// safety behaviour without needing to write the field.
+    #[serde(default = "default_true")]
+    pub require_acceptance_criteria_per_child: bool,
+}
+
+impl Default for DecompositionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            owner_role: None,
+            triggers: DecompositionTriggers::default(),
+            child_issue_policy: ChildIssuePolicy::default(),
+            max_depth: default_decomposition_max_depth(),
+            require_acceptance_criteria_per_child: true,
+        }
+    }
+}
+
+fn default_decomposition_max_depth() -> u32 {
+    2
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Predicate clause for [`DecompositionConfig::triggers`] (SPEC v2 §5.7).
+///
+/// Each field is optional and additive: a work item is eligible when
+/// *any* configured trigger fires (OR-of-fields), so an operator can
+/// declare both a label list and a size threshold and have either
+/// path light up decomposition. Fields are kept narrow to the SPEC's
+/// worked example; new triggers require a schema decision.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecompositionTriggers {
+    /// Trigger when the work item carries any of these labels. Empty
+    /// list means "this trigger is not configured" and never fires —
+    /// the kernel does not decompose every issue by default.
+    #[serde(default)]
+    pub labels_any: Vec<String>,
+
+    /// Trigger when the integration owner's pre-flight estimate of
+    /// touched files exceeds this number. `None` means "this trigger
+    /// is not configured"; `Some(0)` would fire on every non-empty
+    /// estimate and is preserved as operator intent.
+    #[serde(default)]
+    pub estimated_files_over: Option<u32>,
+
+    /// Trigger when the work item's acceptance-criteria list exceeds
+    /// this number of items. Same `None` vs `Some(0)` semantics as
+    /// [`DecompositionTriggers::estimated_files_over`].
+    #[serde(default)]
+    pub acceptance_items_over: Option<u32>,
+}
+
+/// Policy enum shared between `decomposition.child_issue_policy`
+/// (SPEC v2 §5.7) and `followups.default_policy` (§5.13).
+///
+/// `create_directly` writes the child/follow-up issue through
+/// `TrackerMutations` as soon as the agent emits it.
+/// `propose_for_approval` instead enqueues a durable approval item
+/// for the integration owner or a human, deferring the tracker
+/// mutation until the queue advances. The default is the safer
+/// approval path: a fresh workflow shouldn't silently file new
+/// issues against an operator's tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildIssuePolicy {
+    /// Create the issue immediately via `TrackerMutations`. Use when
+    /// the workflow has high trust in its agents and a low tolerance
+    /// for queueing latency.
+    CreateDirectly,
+    /// Queue the proposed issue for approval. Default — protects an
+    /// operator's tracker from agent over-eagerness on day one.
+    #[default]
+    ProposeForApproval,
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,6 +2589,169 @@ routing:
             msg.contains("assign_role") || msg.contains("missing field"),
             "expected missing-field error for assign_role, got: {msg}"
         );
+    }
+
+    #[test]
+    fn decomposition_default_is_disabled() {
+        let cfg = WorkflowConfig::default();
+        assert!(!cfg.decomposition.enabled);
+        assert!(cfg.decomposition.owner_role.is_none());
+        assert!(cfg.decomposition.triggers.labels_any.is_empty());
+        assert!(cfg.decomposition.triggers.estimated_files_over.is_none());
+        assert!(cfg.decomposition.triggers.acceptance_items_over.is_none());
+        assert_eq!(
+            cfg.decomposition.child_issue_policy,
+            ChildIssuePolicy::ProposeForApproval
+        );
+        assert_eq!(cfg.decomposition.max_depth, 2);
+        assert!(cfg.decomposition.require_acceptance_criteria_per_child);
+    }
+
+    #[test]
+    fn decomposition_partial_block_inherits_documented_defaults() {
+        // An operator who writes only `enabled: true` should still
+        // get max_depth=2, require_acceptance_criteria_per_child=true,
+        // and the safer propose_for_approval policy.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  enabled: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert!(parsed.decomposition.enabled);
+        assert_eq!(parsed.decomposition.max_depth, 2);
+        assert!(parsed.decomposition.require_acceptance_criteria_per_child);
+        assert_eq!(
+            parsed.decomposition.child_issue_policy,
+            ChildIssuePolicy::ProposeForApproval
+        );
+    }
+
+    #[test]
+    fn decomposition_full_block_parses_spec_example() {
+        // Mirrors the SPEC v2 §5.7 worked example verbatim.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  enabled: true
+  owner_role: platform_lead
+  triggers:
+    labels_any: [epic, broad, umbrella]
+    estimated_files_over: 5
+    acceptance_items_over: 3
+  child_issue_policy: create_directly
+  max_depth: 2
+  require_acceptance_criteria_per_child: true
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let d = &parsed.decomposition;
+        assert!(d.enabled);
+        assert_eq!(d.owner_role.as_deref(), Some("platform_lead"));
+        assert_eq!(
+            d.triggers.labels_any,
+            vec![
+                "epic".to_string(),
+                "broad".to_string(),
+                "umbrella".to_string()
+            ]
+        );
+        assert_eq!(d.triggers.estimated_files_over, Some(5));
+        assert_eq!(d.triggers.acceptance_items_over, Some(3));
+        assert_eq!(d.child_issue_policy, ChildIssuePolicy::CreateDirectly);
+        assert_eq!(d.max_depth, 2);
+        assert!(d.require_acceptance_criteria_per_child);
+    }
+
+    #[test]
+    fn decomposition_child_issue_policy_serialises_snake_case() {
+        for (variant, literal) in [
+            (ChildIssuePolicy::CreateDirectly, "create_directly"),
+            (ChildIssuePolicy::ProposeForApproval, "propose_for_approval"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: ChildIssuePolicy = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn decomposition_rejects_unknown_child_issue_policy() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  child_issue_policy: file_directly
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file_directly")
+                || msg.contains("unknown variant")
+                || msg.contains("create_directly"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decomposition_rejects_unknown_trigger_key() {
+        // Typos inside `triggers:` must surface so `lables_any` does
+        // not silently produce a no-op predicate.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  triggers:
+    lables_any: [epic]
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lables_any") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decomposition_rejects_unknown_top_level_key() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  enable: true
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("enable") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decomposition_round_trips_through_yaml() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  enabled: true
+  owner_role: platform_lead
+  triggers:
+    labels_any: [epic]
+    acceptance_items_over: 4
+  child_issue_policy: propose_for_approval
+  max_depth: 3
+  require_acceptance_criteria_per_child: false
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
     }
 
     #[test]
