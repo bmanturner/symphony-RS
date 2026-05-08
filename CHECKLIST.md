@@ -10,7 +10,7 @@ under their phase header and are added or refined as the project evolves.
 
 ## Phase 1 — Foundations
 
-- [ ] `cargo check --workspace` builds clean (resolve any latent crate
+- [x] `cargo check --workspace` builds clean (resolve any latent crate
       version issues from bootstrap; lock `Cargo.lock`)
 - [ ] Wire `tracing-subscriber` in `symphony-cli` with env-filter and an
       optional JSON formatter selectable by `SYMPHONY_LOG_FORMAT` [needs
