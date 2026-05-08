@@ -195,7 +195,7 @@ keep one-task-per-iteration discipline.
       orchestrator, drain on SIGINT). `wiremock`-style integration test
       that connects a fake client and asserts a scripted event sequence
       arrives in order. [SSE handler]
-- [ ] Add `symphony watch [--url <URL>]` subcommand: hand-rolled SSE
+- [x] Add `symphony watch [--url <URL>]` subcommand: hand-rolled SSE
       client over `reqwest` (no extra crate), parsing `data: <json>`
       lines. Reconnects with capped exponential backoff; renders a
       "disconnected" banner during retries. [SSE server]

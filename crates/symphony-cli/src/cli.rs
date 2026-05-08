@@ -59,6 +59,38 @@ pub enum Command {
     /// next poll tick. Distinct from Phase 8's `symphony watch` live
     /// TUI: this command exits as soon as the tracker responds.
     Status(StatusArgs),
+
+    /// Live-tail the orchestrator's status stream. Connects to a
+    /// `symphony run` daemon's SSE endpoint (default
+    /// `http://127.0.0.1:6280/events`) and prints each
+    /// [`symphony_core::events::OrchestratorEvent`] as it arrives.
+    ///
+    /// On connection loss the client retries with capped exponential
+    /// backoff, reporting each `disconnected`/`reconnecting` transition
+    /// on stderr so an operator never wonders why the stream went
+    /// quiet. The TUI scaffold (next checklist item) replaces this
+    /// stdout/stderr surface with `ratatui`; the SSE plumbing itself is
+    /// stable from this iteration on.
+    Watch(WatchArgs),
+}
+
+/// Arguments for `symphony watch`.
+///
+/// We accept a single `--url` flag rather than a host/port pair so an
+/// operator can point the client at any HTTP endpoint that speaks the
+/// Symphony SSE wire format — including a reverse-proxied deployment or
+/// a local fixture server in tests.
+#[derive(Debug, clap::Args)]
+pub struct WatchArgs {
+    /// SSE endpoint to subscribe to. Must be the full URL including
+    /// path; the default matches the daemon's default bind plus the
+    /// `/events` route configured in [`crate::sse::router`].
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = "http://127.0.0.1:6280/events"
+    )]
+    pub url: String,
 }
 
 /// Arguments for `symphony status`.

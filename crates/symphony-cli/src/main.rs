@@ -17,6 +17,7 @@ mod run;
 mod sse;
 mod status;
 mod validate;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -55,6 +56,35 @@ fn main() -> anyhow::Result<ExitCode> {
                 .enable_all()
                 .build()?;
             match runtime.block_on(run::run(&args)) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    Ok(ExitCode::from(1))
+                }
+            }
+        }
+        Some(Command::Watch(args)) => {
+            // `watch` is long-lived: it spins a tokio runtime so the
+            // SSE client and the SIGINT listener can race the same
+            // [`CancellationToken`]. `Ctrl+C` cancels both halves and
+            // the function returns normally with exit code 0 — the
+            // operator stopped a working command, not a failure.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_for_signal = cancel.clone();
+            let result = runtime.block_on(async move {
+                let signal = tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        cancel_for_signal.cancel();
+                    }
+                });
+                let outcome = watch::run(&args, cancel).await;
+                signal.abort();
+                outcome
+            });
+            match result {
                 Ok(()) => Ok(ExitCode::SUCCESS),
                 Err(err) => {
                     eprintln!("error: {err:#}");
