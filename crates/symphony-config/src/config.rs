@@ -138,6 +138,14 @@ pub struct WorkflowConfig {
     /// `kind: integration_owner` once decomposition is enabled.
     #[serde(default)]
     pub decomposition: DecompositionConfig,
+
+    /// Integration-owner consolidation policy. SPEC v2 §5.10. Defaults
+    /// to an empty `required_for` set with no `owner_role`, so a
+    /// workflow that omits the block behaves identically to v1; later
+    /// phases enforce that `owner_role` resolves to a role of
+    /// `kind: integration_owner` once `required_for` is non-empty.
+    #[serde(default)]
+    pub integration: IntegrationConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -165,6 +173,7 @@ impl Default for WorkflowConfig {
             agents: BTreeMap::new(),
             routing: RoutingConfig::default(),
             decomposition: DecompositionConfig::default(),
+            integration: IntegrationConfig::default(),
         }
     }
 }
@@ -1285,6 +1294,169 @@ pub enum ChildIssuePolicy {
     /// operator's tracker from agent over-eagerness on day one.
     #[default]
     ProposeForApproval,
+}
+
+// ---------------------------------------------------------------------------
+// integration (SPEC v2 §5.10)
+// ---------------------------------------------------------------------------
+
+/// Integration-owner consolidation policy.
+///
+/// Where decomposition fans broad work *out* into specialist children,
+/// integration fans them back *in*: a single owner role consolidates
+/// child handoffs onto a canonical integration branch/worktree, runs
+/// integration tests, opens or refreshes the draft PR (when PR policy
+/// requires it), and produces the QA handoff. SPEC v2 §5.10 specifies
+/// the operator-facing surface; this struct is the typed mirror.
+///
+/// Defaults are deliberately conservative: with no `owner_role` and an
+/// empty `required_for` set, a workflow that omits the block behaves
+/// like v1 (no auto-integration gate). When the block is present,
+/// later phases enforce that `owner_role` resolves to a role of
+/// `kind: integration_owner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationConfig {
+    /// Role name (key into [`WorkflowConfig::roles`]) responsible for
+    /// running integration. Optional at parse time so partial fixtures
+    /// can declare an empty `integration:` block; later phases enforce
+    /// that the reference resolves to a role of
+    /// `kind: integration_owner`.
+    #[serde(default)]
+    pub owner_role: Option<String>,
+
+    /// Conditions under which the integration gate fires. Empty by
+    /// default; an empty list means "never auto-route to integration"
+    /// even if an integration owner is configured. Operators opt in
+    /// explicitly per SPEC v2 §5.10's worked example.
+    #[serde(default)]
+    pub required_for: Vec<IntegrationRequirement>,
+
+    /// How the integration owner consolidates child changes onto the
+    /// canonical integration branch. Defaults to
+    /// [`MergeStrategy::SequentialCherryPick`] — the conservative
+    /// linear-history option matching the SPEC's worked example.
+    #[serde(default)]
+    pub merge_strategy: MergeStrategy,
+
+    /// What happens when consolidation fails. Defaults to
+    /// [`ConflictPolicy::IntegrationOwnerRepairTurn`], the SPEC v2
+    /// §5.10 documented default.
+    #[serde(default)]
+    pub conflict_policy: ConflictPolicy,
+
+    /// When `true` (the default), the integration gate refuses to
+    /// run while any required child is still non-terminal. The
+    /// kernel's "premature parent completion" guard depends on this
+    /// being on; turning it off is an explicit operator override.
+    #[serde(default = "default_true")]
+    pub require_all_children_terminal: bool,
+
+    /// When `true` (the default), open blockers prevent the
+    /// integration owner from advancing to PR/QA. SPEC v2 §5.10
+    /// pairs this with the QA-blocker policy in §5.12.
+    #[serde(default = "default_true")]
+    pub require_no_open_blockers: bool,
+
+    /// When `true` (the default), the integration owner MUST emit a
+    /// structured integration summary in their handoff. PR body
+    /// templates (SPEC v2 §5.11) interpolate this summary, so the
+    /// safer default is to require it.
+    #[serde(default = "default_true")]
+    pub require_integration_summary: bool,
+
+    /// Tracker state to drive the parent issue into after a successful
+    /// integration handoff. Optional at parse time because the state
+    /// name is workflow-specific (e.g. `qa`, `In Review`); later
+    /// phases enforce that the value matches a configured tracker
+    /// state when integration is active.
+    #[serde(default)]
+    pub next_state_after_integration: Option<String>,
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        Self {
+            owner_role: None,
+            required_for: Vec::new(),
+            merge_strategy: MergeStrategy::default(),
+            conflict_policy: ConflictPolicy::default(),
+            require_all_children_terminal: true,
+            require_no_open_blockers: true,
+            require_integration_summary: true,
+            next_state_after_integration: None,
+        }
+    }
+}
+
+/// Conditions that route a work item through the integration gate
+/// (SPEC v2 §5.10 `required_for`).
+///
+/// The list is OR-of-elements: an item is required to pass through
+/// integration when *any* configured condition is true. The variant
+/// set is intentionally narrow to the SPEC's worked example; new
+/// conditions require a schema decision rather than a silent
+/// extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationRequirement {
+    /// The parent item was decomposed into one or more children. The
+    /// integration owner must consolidate the children before the
+    /// parent can close.
+    DecomposedParent,
+    /// The work spans multiple child branches/worktrees, even without
+    /// formal decomposition. Integration serialises the merge.
+    MultipleChildBranches,
+}
+
+/// How the integration owner consolidates child changes onto the
+/// canonical integration branch (SPEC v2 §5.10 `merge_strategy`).
+///
+/// The default is [`MergeStrategy::SequentialCherryPick`]: it keeps
+/// linear history and surfaces conflicts one child at a time, which
+/// pairs well with [`ConflictPolicy::IntegrationOwnerRepairTurn`].
+/// Operators with explicit shared-branch workflows (and
+/// `branching.allow_same_branch_for_children: true`) opt in to
+/// [`MergeStrategy::SharedBranch`] knowingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStrategy {
+    /// Cherry-pick each child branch's commits onto the integration
+    /// branch in dependency order. Default — preserves linear history
+    /// and isolates conflicts per child.
+    #[default]
+    SequentialCherryPick,
+    /// Use real merge commits per child branch. Use when the workflow
+    /// values branch-shape provenance over linear history.
+    MergeCommits,
+    /// Children share a single branch with the integration owner;
+    /// no consolidation is performed because there is nothing to
+    /// merge. Requires the shared-branch workspace strategy.
+    SharedBranch,
+}
+
+/// What happens when integration consolidation fails (SPEC v2 §5.10
+/// `conflict_policy`).
+///
+/// The default is [`ConflictPolicy::IntegrationOwnerRepairTurn`], the
+/// SPEC's documented default: the integration owner gets a repair
+/// turn in the canonical integration workspace before the work item
+/// becomes blocked with conflict evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    /// Hand the integration owner a repair turn in the canonical
+    /// integration workspace. If the repair turn fails, the work
+    /// item is blocked with conflict evidence. Default per SPEC v2
+    /// §5.10.
+    #[default]
+    IntegrationOwnerRepairTurn,
+    /// Route the conflict back to the child owner that produced the
+    /// offending change for resolution in their own workspace.
+    RouteToChildOwner,
+    /// Stop and require human intervention. Use when the workflow
+    /// has zero tolerance for autonomous merge repair.
+    BlockForHuman,
 }
 
 // ---------------------------------------------------------------------------
@@ -2752,6 +2924,256 @@ decomposition:
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn integration_block_defaults_when_omitted() {
+        // SPEC v2 §5.10 defaults: an omitted `integration:` block must
+        // produce the safe defaults (no owner, empty requirements,
+        // sequential cherry-pick, integration-owner repair turn, all
+        // gates on, no next-state).
+        let cfg = WorkflowConfig::default();
+        assert!(cfg.integration.owner_role.is_none());
+        assert!(cfg.integration.required_for.is_empty());
+        assert_eq!(
+            cfg.integration.merge_strategy,
+            MergeStrategy::SequentialCherryPick
+        );
+        assert_eq!(
+            cfg.integration.conflict_policy,
+            ConflictPolicy::IntegrationOwnerRepairTurn
+        );
+        assert!(cfg.integration.require_all_children_terminal);
+        assert!(cfg.integration.require_no_open_blockers);
+        assert!(cfg.integration.require_integration_summary);
+        assert!(cfg.integration.next_state_after_integration.is_none());
+    }
+
+    #[test]
+    fn integration_partial_block_inherits_documented_defaults() {
+        // An operator who writes only `owner_role` should still get the
+        // SPEC defaults for merge/conflict policy and the three gates.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  owner_role: platform_lead
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let i = &parsed.integration;
+        assert_eq!(i.owner_role.as_deref(), Some("platform_lead"));
+        assert!(i.required_for.is_empty());
+        assert_eq!(i.merge_strategy, MergeStrategy::SequentialCherryPick);
+        assert_eq!(
+            i.conflict_policy,
+            ConflictPolicy::IntegrationOwnerRepairTurn
+        );
+        assert!(i.require_all_children_terminal);
+        assert!(i.require_no_open_blockers);
+        assert!(i.require_integration_summary);
+    }
+
+    #[test]
+    fn integration_full_block_parses_spec_example() {
+        // Mirrors the SPEC v2 §5.10 worked example verbatim.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  owner_role: platform_lead
+  required_for:
+    - decomposed_parent
+    - multiple_child_branches
+  merge_strategy: sequential_cherry_pick
+  conflict_policy: integration_owner_repair_turn
+  require_all_children_terminal: true
+  require_no_open_blockers: true
+  require_integration_summary: true
+  next_state_after_integration: qa
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let i = &parsed.integration;
+        assert_eq!(i.owner_role.as_deref(), Some("platform_lead"));
+        assert_eq!(
+            i.required_for,
+            vec![
+                IntegrationRequirement::DecomposedParent,
+                IntegrationRequirement::MultipleChildBranches,
+            ]
+        );
+        assert_eq!(i.merge_strategy, MergeStrategy::SequentialCherryPick);
+        assert_eq!(
+            i.conflict_policy,
+            ConflictPolicy::IntegrationOwnerRepairTurn
+        );
+        assert!(i.require_all_children_terminal);
+        assert!(i.require_no_open_blockers);
+        assert!(i.require_integration_summary);
+        assert_eq!(i.next_state_after_integration.as_deref(), Some("qa"));
+    }
+
+    #[test]
+    fn integration_merge_strategy_serialises_snake_case() {
+        for (variant, literal) in [
+            (
+                MergeStrategy::SequentialCherryPick,
+                "sequential_cherry_pick",
+            ),
+            (MergeStrategy::MergeCommits, "merge_commits"),
+            (MergeStrategy::SharedBranch, "shared_branch"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: MergeStrategy = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn integration_conflict_policy_serialises_snake_case() {
+        for (variant, literal) in [
+            (
+                ConflictPolicy::IntegrationOwnerRepairTurn,
+                "integration_owner_repair_turn",
+            ),
+            (ConflictPolicy::RouteToChildOwner, "route_to_child_owner"),
+            (ConflictPolicy::BlockForHuman, "block_for_human"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: ConflictPolicy = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn integration_required_for_serialises_snake_case() {
+        for (variant, literal) in [
+            (
+                IntegrationRequirement::DecomposedParent,
+                "decomposed_parent",
+            ),
+            (
+                IntegrationRequirement::MultipleChildBranches,
+                "multiple_child_branches",
+            ),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: IntegrationRequirement = serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn integration_rejects_unknown_merge_strategy() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  merge_strategy: rebase_onto
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rebase_onto")
+                || msg.contains("unknown variant")
+                || msg.contains("sequential_cherry_pick"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn integration_rejects_unknown_conflict_policy() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  conflict_policy: escalate_to_oncall
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escalate_to_oncall")
+                || msg.contains("unknown variant")
+                || msg.contains("integration_owner_repair_turn"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn integration_rejects_unknown_required_for_variant() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  required_for:
+    - any_decomposition
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("any_decomposition")
+                || msg.contains("unknown variant")
+                || msg.contains("decomposed_parent"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn integration_rejects_unknown_top_level_key() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  owner_roles: [platform_lead]
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("owner_roles") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn integration_round_trips_through_yaml() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+integration:
+  owner_role: platform_lead
+  required_for:
+    - decomposed_parent
+  merge_strategy: merge_commits
+  conflict_policy: route_to_child_owner
+  require_all_children_terminal: false
+  require_no_open_blockers: true
+  require_integration_summary: true
+  next_state_after_integration: In Review
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+        assert_eq!(
+            parsed.integration.merge_strategy,
+            MergeStrategy::MergeCommits
+        );
+        assert_eq!(
+            parsed.integration.conflict_policy,
+            ConflictPolicy::RouteToChildOwner
+        );
+        assert!(!parsed.integration.require_all_children_terminal);
     }
 
     #[test]

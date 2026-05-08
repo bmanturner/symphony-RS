@@ -21,10 +21,10 @@ pub mod loader;
 pub use config::{
     AgentBackend, AgentBackendProfile, AgentCompositeProfile, AgentConfig, AgentKind,
     AgentProfileConfig, AgentStrategy, ChildIssuePolicy, CodexConfig, ConfigValidationError,
-    DecompositionConfig, DecompositionTriggers, HermesAgentConfig, HooksConfig, PollingConfig,
-    RoleConfig, RoleKind, RoutingConfig, RoutingMatch, RoutingMatchMode, RoutingRule,
-    SUPPORTED_SCHEMA_VERSION, TandemMode, TrackerConfig, TrackerKind, WorkflowConfig,
-    WorkspaceConfig,
+    ConflictPolicy, DecompositionConfig, DecompositionTriggers, HermesAgentConfig, HooksConfig,
+    IntegrationConfig, IntegrationRequirement, MergeStrategy, PollingConfig, RoleConfig, RoleKind,
+    RoutingConfig, RoutingMatch, RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION,
+    TandemMode, TrackerConfig, TrackerKind, WorkflowConfig, WorkspaceConfig,
 };
 pub use layered::{LayeredLoadError, LayeredLoader};
 pub use loader::{LoadedWorkflow, WorkflowLoadError, WorkflowLoader};
