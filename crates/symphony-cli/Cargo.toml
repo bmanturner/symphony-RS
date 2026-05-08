@@ -21,8 +21,10 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 dotenvy.workspace = true
 futures.workspace = true
+ratatui.workspace = true
 reqwest = { workspace = true }
 secrecy.workspace = true
 serde = { workspace = true }

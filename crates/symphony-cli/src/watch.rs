@@ -52,7 +52,7 @@
 
 use std::time::Duration;
 
-use futures::stream::{Stream, StreamExt};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use symphony_core::events::OrchestratorEvent;
 use tokio_util::sync::CancellationToken;
@@ -442,53 +442,22 @@ async fn dial(client: &reqwest::Client, url: &str) -> Result<Connection, String>
     })
 }
 
-/// `symphony watch` entry point. Drives [`stream`] and prints each
-/// event in a human-readable form on stdout/stderr until `cancel`
-/// fires. Lifecycle events go to stderr (so they survive a
-/// `| jq` pipeline filtering stdout); data events go to stdout as
-/// pretty-printed JSON, one event per line.
+/// `symphony watch` entry point. Builds the SSE stream and hands it to
+/// the [`crate::tui`] scaffold for rendering.
 ///
-/// The TUI scaffold (next checklist item) replaces this body with a
-/// `ratatui` render loop — the [`stream`] function above stays
-/// unchanged, which is the whole point of separating the two.
+/// All transport behaviour (reconnect, backoff, lag handling) lives in
+/// [`stream`]; presentation (alt-screen, key handling, layout) lives in
+/// [`crate::tui`]. This entry point is just composition glue, kept
+/// trivial so the operator-visible CLI surface is one short function.
 pub async fn run(args: &WatchArgs, cancel: CancellationToken) -> anyhow::Result<()> {
-    let mut s = Box::pin(stream(
-        args.url.clone(),
-        BackoffConfig::default(),
-        cancel.clone(),
-    ));
-    while let Some(ev) = s.next().await {
-        match ev {
-            WatchEvent::Connected { url } => {
-                eprintln!("connected: {url}");
-            }
-            WatchEvent::Disconnected { reason } => {
-                eprintln!("disconnected: {reason}");
-            }
-            WatchEvent::Reconnecting { attempt, delay } => {
-                eprintln!("reconnecting (attempt {attempt}, delay {delay:?})");
-            }
-            WatchEvent::Lagged { missed } => {
-                eprintln!("lagged: missed {missed} events; reconnecting");
-            }
-            WatchEvent::Event(orch) => {
-                // Print as one-line JSON so `symphony watch | jq` and
-                // `symphony watch | grep` both work cleanly. Going
-                // through the same serde codec the server uses keeps
-                // the round-trip honest.
-                match serde_json::to_string(&orch) {
-                    Ok(s) => println!("{s}"),
-                    Err(err) => warn!(error = %err, "failed to render event"),
-                }
-            }
-        }
-    }
-    Ok(())
+    let s = stream(args.url.clone(), BackoffConfig::default(), cancel.clone());
+    crate::tui::run(s, cancel).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     #[test]
     fn parser_splits_on_blank_line() {

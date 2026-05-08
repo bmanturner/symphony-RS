@@ -199,7 +199,7 @@ keep one-task-per-iteration discipline.
       client over `reqwest` (no extra crate), parsing `data: <json>`
       lines. Reconnects with capped exponential backoff; renders a
       "disconnected" banner during retries. [SSE server]
-- [ ] TUI scaffold with `ratatui` + `crossterm`: alternate screen,
+- [x] TUI scaffold with `ratatui` + `crossterm`: alternate screen,
       raw mode, terminal-resize-safe, hotkey `q` to quit. Renders a
       placeholder layout. [symphony watch, ratatui in budget]
 - [ ] TUI panel — **active issues** table: identifier, state, elapsed,

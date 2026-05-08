@@ -16,6 +16,7 @@ mod logging;
 mod run;
 mod sse;
 mod status;
+mod tui;
 mod validate;
 mod watch;
 
