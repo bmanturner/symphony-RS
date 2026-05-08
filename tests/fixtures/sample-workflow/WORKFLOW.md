@@ -2,12 +2,13 @@
 # Sample WORKFLOW.md fixture for Symphony-RS v2.
 #
 # This file is the worked example shipped with the repo. It exercises
-# every top-level section of the v2 schema (SPEC_v2 §5) so a reviewer
-# can read it as a reference for a complete, production-shaped
-# workflow. The matching typed `WorkflowConfig` lands in Phase 1;
-# until then the v1 loader cannot parse this file and the
-# fixture-shaped integration tests are gated `#[ignore]` with a
-# pointer back to this fixture.
+# every top-level section of the v2 schema that has landed in the
+# typed `WorkflowConfig` so far (SPEC_v2 §5). Sections still marked
+# untyped in CHECKLIST_v2 — `persistence:`, `budgets:`, `security:`,
+# plus the richer `tracker.state_mapping` / `unknown_state_policy`
+# surface — are intentionally absent so `WorkflowConfig::deny_unknown_fields`
+# rejects drift the moment one of those phases lands. They will be
+# added back here in the same checklist item that types them.
 #
 # Anything marked "$VAR" is a placeholder. Layered loading expands
 # these from the environment; tests that care about credential
@@ -17,32 +18,24 @@
 schema_version: 1
 
 tracker:
-  kind: linear
-  project_slug: ENG
+  # GitHub is the only PR-capable backend today (SPEC v2 §5.11), and
+  # this fixture exercises the full PR lifecycle, so the tracker has
+  # to satisfy `pull_requests.enabled = true`. The Linear path is
+  # covered by the quickstart fixture instead.
+  kind: github
+  repository: foglet-io/rust-symphony
   api_key: $SYMPHONY_TRACKER_API_KEY
-  unknown_state_policy: error
-  state_mapping:
-    ignore: [Archived, Duplicate]
-    intake: [Backlog, Todo]
-    ready: [Ready]
-    running: [In Progress]
-    blocked: [Blocked]
-    integration: [Integration]
-    qa: [QA, In Review]
-    rework: [Rework]
-    review: [Review]
-    done: [Done]
-    cancelled: [Cancelled]
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Cancelled, Closed, Duplicate]
 
 polling:
   interval_ms: 30000
   jitter_ms: 5000
   startup_reconcile_recent_terminal: true
 
-persistence:
-  kind: sqlite
-  path: .symphony/state.db
-  event_log: .symphony/events.ndjson
+# `persistence:` (SQLite-backed durable state) is part of SPEC v2
+# Phase 2 and has no typed mirror yet; it will be added here when
+# `crates/symphony-state` lands.
 
 roles:
   platform_lead:
@@ -229,18 +222,11 @@ observability:
   dashboard:
     enabled: false
 
-budgets:
-  max_parallel_runs: 6
-  max_cost_per_issue_usd: 10.00
-  max_turns_per_run: 20
-  max_retries: 3
-  pause_policy: block_work_item
-
-security:
-  destructive_actions_require_approval: true
-  publish_purchase_deploy_require_human: true
-  network_policy: workflow_defined
-  secret_redaction: true
+# `budgets:` and `security:` (Phase 11 / Phase 12) are intentionally
+# omitted: their typed mirrors land alongside the scheduler v2 and
+# operator surface phases, and `deny_unknown_fields` is the alarm
+# bell that flags drift if a section is added to the YAML before
+# its struct is in place.
 
 hooks:
   timeout_ms: 300000

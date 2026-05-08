@@ -24,7 +24,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Reshape `HooksConfig` to v2 list-of-commands form (SPEC v2 §5.17) and update `symphony-workspace` and `symphony-cli` consumers to iterate.
 - [x] Add `WorkspacePolicyConfig` and `BranchPolicyConfig` for worktree/shared-branch strategies.
 - [x] Add validation errors: missing `kind: integration_owner`, missing `kind: qa_gate` when QA is required, unknown role/agent references, duplicate tracker state mappings, invalid max depth, invalid branch template, PR config without GitHub, and contradictory shared-branch policy.
-- [ ] Add round-trip tests for a full v2 workflow fixture.
+- [x] Add round-trip tests for a full v2 workflow fixture.
 - [ ] Add negative tests for unknown nested keys, dangling role references, and invalid strategy combinations.
 
 ## Phase 2 — Durable State
