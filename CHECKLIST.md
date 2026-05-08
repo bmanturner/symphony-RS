@@ -50,7 +50,7 @@ under their phase header and are added or refined as the project evolves.
       it later). Record the rationale as a one-paragraph ADR.
 - [x] Generate Linear GraphQL bindings via `graphql_client` from a
       checked-in `.graphql` query set [IssueTracker trait]
-- [ ] Implement `LinearTracker` translating GraphQL → `Issue`. `wiremock`
+- [x] Implement `LinearTracker` translating GraphQL → `Issue`. `wiremock`
       integration tests covering happy path, 4xx, 5xx, malformed
       responses; passes the conformance suite. [Linear bindings,
       conformance suite]

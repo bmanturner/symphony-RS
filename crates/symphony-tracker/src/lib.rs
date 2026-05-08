@@ -28,3 +28,4 @@ pub use mock::{MockCall, MockTracker};
 pub mod conformance;
 
 pub mod linear;
+pub use linear::{LinearConfig, LinearTracker};

@@ -32,3 +32,6 @@ pub use queries::{
     CandidateIssues, CandidateIssuesVariables, IssueStatesByIds, IssueStatesByIdsVariables,
     IssuesByStates, IssuesByStatesVariables,
 };
+
+pub mod adapter;
+pub use adapter::{LinearConfig, LinearTracker};
