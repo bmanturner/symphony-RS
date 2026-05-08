@@ -123,7 +123,7 @@ under their phase header and are added or refined as the project evolves.
       decides accept-or-rerun [TandemRunner]
 - [x] `split-implement` strategy: lead plans, follower executes claimed
       subtasks via tool-use [TandemRunner]
-- [ ] `consensus` strategy: both run, pick the output with greater
+- [x] `consensus` strategy: both run, pick the output with greater
       test-pass delta [TandemRunner]
 - [ ] Telemetry: per-agent tokens, agreement rate, cost-per-turn
 

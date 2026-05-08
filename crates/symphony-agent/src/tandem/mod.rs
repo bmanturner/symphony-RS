@@ -1,73 +1,48 @@
 //! Tandem runner — wraps two inner [`AgentRunner`]s and exposes them as a
 //! single composite runner.
 //!
-//! This module is the scaffolding for SPEC-deviation #1: where the upstream
-//! Symphony spec assumes one coding agent per run, Symphony-RS lets a
-//! single dispatch drive two agents concurrently with a configurable
-//! lead/follower relationship. Three strategies are planned (see
-//! [`TandemStrategy`]); each lands in its own checklist item. This file
-//! delivers the *shape*: the strategy enum, the role enum, the
-//! [`TandemRunner`] struct that holds the two inner runners + strategy,
-//! and a baseline [`AgentRunner`] impl that:
-//!
-//! 1. Calls `start_session` on both inner runners (lead first so we can
-//!    abort it if the follower fails to launch).
-//! 2. Merges their event streams round-robin, suppressing the inner
-//!    [`AgentEvent::Completed`] / [`AgentEvent::Failed`] events.
-//! 3. Emits one synthesized [`AgentEvent::Completed`] tagged with the
-//!    lead session id once both inner streams have closed.
-//! 4. Forwards `continue_turn` to both and aborts both on `abort`.
-//!
-//! Strategy-specific behaviour (draft-review feedback merging, split-
-//! implement subtask routing, consensus output picking) is **not** in
-//! this commit — each strategy will read `self.strategy` and override the
-//! merge / continuation logic in its own checklist item. The baseline
-//! "run both, merge, complete when done" is what `consensus` already
-//! needs and what the other two strategies extend, so it doubles as a
-//! sensible default.
-//!
-//! # Why a custom `Stream` and not `tokio_stream::StreamExt::merge`
-//!
-//! `merge` would close as soon as one inner stream ends. We want the
-//! opposite: keep emitting from the longer-lived inner stream and only
-//! signal terminal once *both* are done. The hand-rolled state machine
-//! in `TandemStream` is small enough that pulling in `async-stream`
-//! solely for `stream! { ... }` would not be a net win.
+//! This module is SPEC-deviation #1: where upstream Symphony assumes one
+//! coding agent per run, Symphony-RS lets a single dispatch drive two
+//! agents with a configurable lead/follower relationship. This file
+//! delivers the *shape* — the [`TandemStrategy`] / [`TandemRole`] enums
+//! and the [`TandemRunner`] composition root — and dispatches into one
+//! of three submodules for the actual behaviour.
 //!
 //! # Strategy dispatch
 //!
-//! [`TandemStrategy::Consensus`] uses the parallel poll-merge baseline
-//! defined in this file. [`TandemStrategy::DraftReview`] is sequential
-//! (lead drafts, then follower reviews) and is implemented in the
-//! private `draft_review` submodule. [`TandemStrategy::SplitImplement`]
-//! is also sequential (lead plans, then follower executes claimed
-//! subtasks via tool-use) and lives in the `split_implement` submodule.
+//! - [`TandemStrategy::DraftReview`]: lead drafts, follower reviews
+//!   (`draft_review` submodule). Sequential — follower starts only
+//!   after the lead's draft is captured.
+//! - [`TandemStrategy::SplitImplement`]: lead plans, follower executes
+//!   subtasks it claims via tool-use (`split_implement` submodule).
+//!   Also sequential.
+//! - [`TandemStrategy::Consensus`]: both run in parallel; the
+//!   orchestrator picks the output with the greater test-pass delta
+//!   (`consensus` submodule). The scoring function is pluggable via
+//!   [`TandemRunner::with_consensus_scorer`] with a heuristic default.
+//!
+//! All three strategies expose the same `(lead, follower, params) ->
+//! AgentSession` shape, suppress per-stream terminal events, and emit
+//! exactly one synthesised terminal tagged with the lead session id. The
+//! orchestrator therefore sees a Tandem session as just another agent.
 
+mod consensus;
 mod draft_review;
 mod split_implement;
 
-use async_trait::async_trait;
-use futures::Stream;
-use serde::{Deserialize, Serialize};
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+pub use consensus::{ConsensusScorer, default_consensus_scorer};
 
-use symphony_core::agent::{
-    AgentControl, AgentEvent, AgentEventStream, AgentResult, AgentRunner, AgentSession,
-    CompletionReason, SessionId, StartSessionParams,
-};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use symphony_core::agent::{AgentResult, AgentRunner, AgentSession, StartSessionParams};
 
 // ---------------------------------------------------------------------------
 // Configuration enums
 // ---------------------------------------------------------------------------
 
 /// Which of the three SPEC-deviation strategies the runner should use.
-///
-/// The variants are stored on [`TandemRunner`] but not yet branched on by
-/// the baseline implementation in this module — each strategy lands in
-/// its own follow-up checklist item. The enum is wired up now so callers
-/// (and `WORKFLOW.md` parsing) can target the final API today.
 ///
 /// Serialized as kebab-case to match the planned `WORKFLOW.md` syntax
 /// (`tandem.strategy = "draft-review"`).
@@ -81,8 +56,10 @@ pub enum TandemStrategy {
     /// tool-use channel.
     SplitImplement,
     /// Both run in parallel; the orchestrator picks the output with the
-    /// greater test-pass delta. The current baseline merge in this module
-    /// is consensus's run-both phase.
+    /// greater test-pass delta. The scoring function is pluggable via
+    /// [`TandemRunner::with_consensus_scorer`] (default counts test-pass
+    /// phrasing and test-tool invocations). Failure on either side is a
+    /// forfeit; ties break toward the lead.
     Consensus,
 }
 
@@ -90,7 +67,7 @@ pub enum TandemStrategy {
 ///
 /// Carried in telemetry (Phase 6's per-agent token counts and agreement
 /// rate) and used by the Phase 8 status surface to label a tandem panel.
-/// Not currently embedded in [`AgentEvent`] — strategy-specific commits
+/// Not currently embedded in `AgentEvent` — strategy-specific commits
 /// may add a tandem-tagged variant later if and when the orchestrator
 /// needs to demultiplex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +95,13 @@ pub struct TandemRunner {
     lead: Arc<dyn AgentRunner>,
     follower: Arc<dyn AgentRunner>,
     strategy: TandemStrategy,
+    /// Scorer used by [`TandemStrategy::Consensus`] to break ties between
+    /// the two candidate transcripts. Lazily defaulted via
+    /// [`default_consensus_scorer`] when `None`. Stored as an `Option`
+    /// rather than always-eager-defaulting so that constructing a
+    /// `TandemRunner` for a non-consensus strategy doesn't allocate a
+    /// scoring closure that will never be called.
+    consensus_scorer: Option<ConsensusScorer>,
 }
 
 impl TandemRunner {
@@ -133,7 +117,20 @@ impl TandemRunner {
             lead,
             follower,
             strategy,
+            consensus_scorer: None,
         }
+    }
+
+    /// Override the consensus scorer. Only affects [`TandemStrategy::Consensus`];
+    /// silently ignored under other strategies but stored verbatim so a
+    /// caller can flip strategies without re-injecting the scorer.
+    ///
+    /// Builder-style for ergonomic composition at the orchestrator's
+    /// composition root, where a `WORKFLOW.md`-driven scoring policy is
+    /// looked up once and applied to every freshly constructed runner.
+    pub fn with_consensus_scorer(mut self, scorer: ConsensusScorer) -> Self {
+        self.consensus_scorer = Some(scorer);
+        self
     }
 
     /// Borrow the configured strategy. Exposed for status-surface and
@@ -147,184 +144,27 @@ impl TandemRunner {
 #[async_trait]
 impl AgentRunner for TandemRunner {
     async fn start_session(&self, params: StartSessionParams) -> AgentResult<AgentSession> {
-        // Strategy-specific dispatch. Draft-review and split-implement
-        // are sequential (lead first, follower second) and each live in
-        // their own submodule. Consensus uses the parallel poll-merge
-        // baseline below.
+        // Each strategy lives in its own submodule. The orchestrator
+        // doesn't know or care which one it's talking to — all three
+        // expose the same `(lead, follower, params) -> AgentSession`
+        // shape and emit normalized `AgentEvent`s.
         match self.strategy {
             TandemStrategy::DraftReview => {
-                return draft_review::start(self.lead.clone(), self.follower.clone(), params).await;
+                draft_review::start(self.lead.clone(), self.follower.clone(), params).await
             }
             TandemStrategy::SplitImplement => {
-                return split_implement::start(self.lead.clone(), self.follower.clone(), params)
-                    .await;
+                split_implement::start(self.lead.clone(), self.follower.clone(), params).await
             }
-            TandemStrategy::Consensus => {}
-        }
-
-        // Lead first so a follower-launch failure can clean up by aborting
-        // the already-started lead instead of leaving an orphan subprocess.
-        let lead_session = self.lead.start_session(params.clone()).await?;
-        let follower_session = match self.follower.start_session(params).await {
-            Ok(s) => s,
-            Err(e) => {
-                // Best-effort lead cleanup; ignore secondary failures so
-                // the original error reaches the caller.
-                let _ = lead_session.control.abort().await;
-                return Err(e);
-            }
-        };
-
-        let initial_session = lead_session.initial_session.clone();
-        let events: AgentEventStream = Box::pin(TandemStream {
-            lead: lead_session.events,
-            follower: follower_session.events,
-            lead_done: false,
-            follower_done: false,
-            terminal_emitted: false,
-            poll_lead_first: true,
-            final_session: initial_session.clone(),
-        });
-        let control: Box<dyn AgentControl> = Box::new(TandemControl {
-            lead: lead_session.control,
-            follower: follower_session.control,
-        });
-
-        Ok(AgentSession {
-            initial_session,
-            events,
-            control,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Control surface
-// ---------------------------------------------------------------------------
-
-/// [`AgentControl`] composite that fans out to both inner controls.
-///
-/// Strategy-specific commits will likely override this — for example,
-/// `draft-review` may call `continue_turn` only on the lead with merged
-/// feedback rather than on both. The baseline forwards to both so a
-/// Tandem session behaves like two parallel sessions until a strategy
-/// kicks in.
-struct TandemControl {
-    lead: Box<dyn AgentControl>,
-    follower: Box<dyn AgentControl>,
-}
-
-#[async_trait]
-impl AgentControl for TandemControl {
-    async fn continue_turn(&self, guidance: &str) -> AgentResult<()> {
-        // Sequential rather than `tokio::join!` to keep error attribution
-        // unambiguous: if the lead refuses, we don't also burn a follower
-        // turn that we'd then have to roll back.
-        self.lead.continue_turn(guidance).await?;
-        self.follower.continue_turn(guidance).await
-    }
-
-    async fn abort(&self) -> AgentResult<()> {
-        // Abort is documented idempotent; we want both subprocesses gone
-        // even if one abort fails. Surface the lead error preferentially
-        // because it's the one the orchestrator's retry policy keys on.
-        let lead_res = self.lead.abort().await;
-        let follower_res = self.follower.abort().await;
-        match (lead_res, follower_res) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(e), _) => Err(e),
-            (Ok(()), Err(e)) => Err(e),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Merged stream
-// ---------------------------------------------------------------------------
-
-/// Merges two [`AgentEventStream`]s by alternating polls and suppressing
-/// per-stream terminal events; emits a single synthetic
-/// [`AgentEvent::Completed`] tagged with the lead session once both inner
-/// streams have ended.
-///
-/// Why suppress per-stream terminals: the orchestrator stops consuming
-/// the moment it sees a terminal. If we forwarded the lead's `Completed`
-/// while the follower was still mid-turn, the follower would be silently
-/// abandoned mid-flight with its subprocess still running.
-struct TandemStream {
-    lead: AgentEventStream,
-    follower: AgentEventStream,
-    lead_done: bool,
-    follower_done: bool,
-    terminal_emitted: bool,
-    /// Round-robin fairness flag: alternated each poll so a chatty lead
-    /// can't starve the follower.
-    poll_lead_first: bool,
-    final_session: SessionId,
-}
-
-impl Stream for TandemStream {
-    type Item = AgentEvent;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<AgentEvent>> {
-        let this = self.get_mut();
-
-        if this.terminal_emitted {
-            return Poll::Ready(None);
-        }
-
-        // Alternate which side we sample first so neither side starves.
-        let lead_first = this.poll_lead_first;
-        this.poll_lead_first = !lead_first;
-
-        for try_lead in [lead_first, !lead_first] {
-            if try_lead {
-                if !this.lead_done {
-                    match this.lead.as_mut().poll_next(cx) {
-                        Poll::Ready(Some(ev)) if ev.is_terminal() => {
-                            // Suppress; mark side done and continue.
-                            this.lead_done = true;
-                        }
-                        Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
-                        Poll::Ready(None) => this.lead_done = true,
-                        Poll::Pending => { /* fall through to follower */ }
-                    }
-                }
-            } else if !this.follower_done {
-                match this.follower.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(ev)) if ev.is_terminal() => {
-                        this.follower_done = true;
-                    }
-                    Poll::Ready(Some(ev)) => return Poll::Ready(Some(ev)),
-                    Poll::Ready(None) => this.follower_done = true,
-                    Poll::Pending => { /* fall through */ }
-                }
+            TandemStrategy::Consensus => {
+                let scorer = self
+                    .consensus_scorer
+                    .clone()
+                    .unwrap_or_else(default_consensus_scorer);
+                consensus::start(self.lead.clone(), self.follower.clone(), params, scorer).await
             }
         }
-
-        if this.lead_done && this.follower_done {
-            this.terminal_emitted = true;
-            return Poll::Ready(Some(AgentEvent::Completed {
-                session: this.final_session.clone(),
-                reason: CompletionReason::Success,
-            }));
-        }
-
-        // At least one side is Pending and not yet done. Both sides
-        // (whichever we polled) registered wakers via the calls above.
-        Poll::Pending
     }
 }
-
-// Silence "unused" warnings for items the strategy commits will reach for
-// shortly. Removing this blanket attribute is a checklist-level signal
-// that downstream strategies have started consuming the API.
-#[allow(dead_code)]
-const _: fn() = || {
-    // Compile-time touch points so refactors notice when these go away.
-    let _ = TandemRole::Lead;
-    let _ = TandemRole::Follower;
-};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -333,6 +173,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use futures::StreamExt;
     use futures::stream;
     use std::sync::Mutex;
@@ -474,7 +315,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merges_messages_then_emits_single_terminal() {
+    async fn consensus_dispatch_emits_single_terminal_tagged_with_lead_session() {
+        // Whichever side wins the consensus vote, the orchestrator must
+        // see exactly one terminal tagged with the lead session id. Both
+        // sides score 0 here (no test-pass phrasing) → lead wins by the
+        // tie-break rule, so its messages replay and the follower's are
+        // discarded. The detailed scoring/forfeit/replay assertions live
+        // in the `consensus` submodule's own tests; this is a smoke test
+        // of the dispatch wiring through `TandemRunner`.
         let lead = StubRunner::new(
             "lead-1",
             vec![msg("lead-1", "L1"), msg("lead-1", "L2"), done("lead-1")],
@@ -489,14 +337,6 @@ mod tests {
         let session = runner.start_session(params()).await.unwrap();
         let collected: Vec<AgentEvent> = session.events.collect().await;
 
-        // Three messages from the inner streams, then one synthesized
-        // Completed tagged with the lead session id, then the stream ends.
-        let messages: Vec<&AgentEvent> = collected
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::Message { .. }))
-            .collect();
-        assert_eq!(messages.len(), 3);
-
         let terminals: Vec<&AgentEvent> = collected.iter().filter(|e| e.is_terminal()).collect();
         assert_eq!(terminals.len(), 1, "exactly one synthetic terminal");
         match terminals[0] {
@@ -506,9 +346,51 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-
-        // Terminal must be the last event.
         assert!(collected.last().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn with_consensus_scorer_overrides_default() {
+        // Custom scorer that always favours the follower regardless of
+        // content. Verifies the builder hook actually feeds through into
+        // `consensus::start`'s scoring stage.
+        let lead = StubRunner::new("lead-1", vec![msg("lead-1", "lead text"), done("lead-1")]);
+        let follower = StubRunner::new(
+            "foll-1",
+            vec![msg("foll-1", "follower text"), done("foll-1")],
+        );
+        let scorer: ConsensusScorer = Arc::new(|events: &[AgentEvent]| {
+            // Any side whose first message starts with "follower" wins.
+            for ev in events {
+                if let AgentEvent::Message { content, .. } = ev
+                    && content.starts_with("follower")
+                {
+                    return 100;
+                }
+            }
+            0
+        });
+        let runner = TandemRunner::new(
+            lead as Arc<dyn AgentRunner>,
+            follower as Arc<dyn AgentRunner>,
+            TandemStrategy::Consensus,
+        )
+        .with_consensus_scorer(scorer);
+        let session = runner.start_session(params()).await.unwrap();
+        let collected: Vec<AgentEvent> = session.events.collect().await;
+        let first_msg = collected
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Message { .. }))
+            .unwrap();
+        match first_msg {
+            AgentEvent::Message {
+                content, session, ..
+            } => {
+                assert_eq!(content, "follower text");
+                assert_eq!(session.as_str(), "foll-1");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[tokio::test]
