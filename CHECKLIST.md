@@ -130,7 +130,7 @@ under their phase header and are added or refined as the project evolves.
 ## Phase 7 — CLI binary
 
 - [x] `symphony validate <path>` subcommand wired to `WorkflowLoader`
-- [ ] `symphony run` subcommand composing real adapters
+- [x] `symphony run` subcommand composing real adapters
 - [ ] `symphony status` snapshot output (point-in-time; distinct from
       Phase 8's `symphony watch` live TUI)
 - [ ] Graceful SIGINT shutdown that drains in-flight turns

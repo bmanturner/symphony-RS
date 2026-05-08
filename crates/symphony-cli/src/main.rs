@@ -13,6 +13,7 @@
 
 mod cli;
 mod logging;
+mod run;
 mod validate;
 
 use std::process::ExitCode;
@@ -41,18 +42,36 @@ fn main() -> anyhow::Result<ExitCode> {
             let code = validate::render(&outcome);
             Ok(ExitCode::from(code as u8))
         }
-        Some(Command::Run) | Some(Command::Status) | None => {
-            // Other subcommands and the bare invocation land later in
-            // Phase 7. Until then we emit a tracing event so smoke tests
-            // can confirm the binary started, and exit non-zero so CI
-            // does not treat a stub invocation as success.
+        Some(Command::Run(args)) => {
+            // `run` owns the orchestrator's lifecycle, which means it
+            // owns the tokio runtime. We build it here (rather than
+            // making `main` `#[tokio::main]`) so the synchronous
+            // subcommands keep their cheap startup path — the tokio
+            // runtime adds tens of milliseconds to a `validate` that
+            // does no I/O.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            match runtime.block_on(run::run(&args)) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    Ok(ExitCode::from(1))
+                }
+            }
+        }
+        Some(Command::Status) | None => {
+            // `status` and the bare invocation land later in Phase 7.
+            // Until then we emit a tracing event so smoke tests can
+            // confirm the binary started, and exit non-zero so CI does
+            // not treat a stub invocation as success.
             tracing::info!(
                 target: "symphony::cli",
                 version = env!("CARGO_PKG_VERSION"),
-                "subcommand not yet implemented; only `validate` is wired in this iteration",
+                "subcommand not yet implemented; only `validate` and `run` are wired in this iteration",
             );
             eprintln!(
-                "symphony: only `validate` is implemented in this iteration; \
+                "symphony: only `validate` and `run` are implemented in this iteration; \
                  see `symphony --help`",
             );
             Ok(ExitCode::from(64))

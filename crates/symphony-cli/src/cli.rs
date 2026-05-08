@@ -49,13 +49,28 @@ pub enum Command {
     /// itself runs the same loader on startup.
     Validate(ValidateArgs),
 
-    /// Start the orchestrator daemon. Stubbed in this iteration —
-    /// composition lands later in Phase 7.
-    Run,
+    /// Start the orchestrator daemon: load `WORKFLOW.md`, build the
+    /// configured tracker / agent / workspace adapters, and drive the
+    /// poll loop until SIGINT is received.
+    Run(RunArgs),
 
     /// Print a point-in-time snapshot of in-flight runs. Stubbed in
     /// this iteration — composition lands later in Phase 7.
     Status,
+}
+
+/// Arguments for `symphony run`.
+///
+/// The single positional argument mirrors `symphony validate`'s contract
+/// so an operator can swap one for the other on the command line. We
+/// deliberately do not accept tracker / agent overrides on the CLI —
+/// `WORKFLOW.md` is the single source of truth (SPEC §5.4); env layering
+/// is the supported escape hatch for per-deployment differences.
+#[derive(Debug, clap::Args)]
+pub struct RunArgs {
+    /// Path to the `WORKFLOW.md` file to drive the orchestrator from.
+    #[arg(value_name = "PATH", default_value = "WORKFLOW.md")]
+    pub path: PathBuf,
 }
 
 /// Arguments for `symphony validate`.
