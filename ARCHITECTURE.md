@@ -201,6 +201,31 @@ pass-through values are `serde_yaml::Value`); `PartialEq` is enough for
 the round-trip tests we need. Adding a new tracker or agent kind is a
 two-line change to the relevant enum plus an arm in `validate`.
 
+### 2026-05-08 — Layered config: WORKFLOW.md > env > defaults
+**Context.** SPEC §5.4 says "Environment variables do not globally
+override YAML values" — the upstream model only honours env *when the
+YAML explicitly references `$VAR_NAME`*. We deviate to give operators a
+proper layered config (so a daemon-wide `SYMPHONY_TRACKER__API_KEY` does
+not need every per-repo `WORKFLOW.md` to reference it), but we keep the
+spec's spirit: anything written into the YAML wins.
+
+**Decision.** `LayeredLoader` builds a `figment::Figment` with three
+providers in order — `Serialized::defaults(WorkflowConfig::default())`,
+`Env::prefixed("SYMPHONY_").split("__")`, then `Yaml::string(front_matter)`.
+Later providers override earlier ones, so YAML > env > defaults. The
+`__` separator lets nested keys be expressed (`SYMPHONY_POLLING__INTERVAL_MS`).
+`WorkflowLoader` stays as the simple "split file" parser; production
+callers reach for `LayeredLoader`.
+
+**Consequence.** Typos in env keys (`SYMPHONY_POLLING__INTERVA_MS`) are
+hard errors via `deny_unknown_fields`, the same way YAML typos are. Env
+values are coerced from strings during typed extraction, so callers can
+set `SYMPHONY_AGENT__KIND=claude` without quoting. The `figment::Error`
+variant is boxed inside `LayeredLoadError::Merge` because it is large
+enough to trip clippy's `result_large_err` lint otherwise. Tests use
+`figment::Jail` (gated behind figment's `test` feature, enabled as a
+dev-dependency only) so env mutations are process-isolated.
+
 ## Dependencies
 
 The pre-approved crate budget lives in the workspace `Cargo.toml`. One-line

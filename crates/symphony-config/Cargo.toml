@@ -18,3 +18,7 @@ notify.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# figment's `Jail` (process-isolated env-var fixture) is gated behind its
+# `test` feature; we enable it as a dev-dependency for the layered-loader
+# test suite.
+figment = { workspace = true, features = ["test"] }

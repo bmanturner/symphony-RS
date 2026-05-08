@@ -21,7 +21,7 @@ under their phase header and are added or refined as the project evolves.
 - [x] Implement `WorkflowLoader::from_path()` using `gray_matter` to split
       front matter from body; return `{config, prompt_template}`
       [WorkflowConfig]
-- [ ] Layer config sources with `figment`: defaults → env (`SYMPHONY_*`) →
+- [x] Layer config sources with `figment`: defaults → env (`SYMPHONY_*`) →
       WORKFLOW.md; round-trip tests for valid / missing / malformed cases
       [WorkflowLoader]
 - [ ] Add `tests/fixtures/sample-workflow/WORKFLOW.md` for downstream
