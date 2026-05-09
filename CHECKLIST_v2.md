@@ -137,7 +137,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Wire `Scheduler v2` that fans the queue ticks under shared `polling.interval_ms` cadence with `jitter_ms`, replacing the flat `PollLoop` entry point and migrating its existing reconciliation/cancellation semantics to the intake + recovery queues.
 - [ ] Replace single flat poll loop with logical queues: intake, specialist, integration, QA, follow-up approval, budget pause, recovery; keep cadence under `polling.interval_ms`. (Decomposed below.)
   - [x] Add `SpecialistRunner` that drains `SpecialistDispatchQueue` and invokes the existing `Dispatcher` trait under a max-concurrency `Semaphore`, with parking for capacity-deferred requests, missing-issue counting, parent-cancellation propagation, and reap-completed observability.
-  - [ ] Add an `IntegrationDispatchRunner` over `IntegrationDispatchQueue` mirroring the specialist runner's bounded-concurrency contract, with tests for ready/blocked candidates.
+  - [x] Add an `IntegrationDispatchRunner` over `IntegrationDispatchQueue` mirroring the specialist runner's bounded-concurrency contract, with tests for ready/blocked candidates.
   - [ ] Add a `QaDispatchRunner` over `QaDispatchQueue` mirroring the runner contract, with tests for ready/blocked candidates and waiver-routed verdicts.
   - [ ] Add a `FollowupApprovalRunner` and a `BudgetPauseRunner` (operator-decision queues) mirroring the runner contract, with tests for approve/reject and resume paths.
   - [ ] Add a `RecoveryRunner` that drains `RecoveryDispatchQueue` with parity tests against the flat-loop reconciliation contract.
