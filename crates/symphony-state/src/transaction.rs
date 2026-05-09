@@ -32,6 +32,7 @@ use crate::edges::{
     list_open_blockers_for_subtree_in, update_edge_status_in,
 };
 use crate::events::{EventRecord, NewEvent};
+use crate::handoffs::{HandoffRecord, NewHandoff, create_handoff_in};
 use crate::repository::{
     NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord, create_run_in,
     create_work_item_in, get_run_in, get_work_item_in, update_run_status_in,
@@ -126,6 +127,17 @@ impl<'conn> StateTransaction<'conn> {
     /// sequence numbers; nothing is broadcast or visible until commit.
     pub fn append_event(&mut self, new: NewEvent<'_>) -> StateResult<EventRecord> {
         crate::events::append_event_in(&self.tx, new)
+    }
+
+    /// Persist a structured agent handoff envelope inside this
+    /// transaction.
+    ///
+    /// Handoffs are typically composed with the `run.completed` event
+    /// append so the durable log and the handoff row land atomically:
+    /// a crash between the two would let the operator surface contradict
+    /// the audit trail.
+    pub fn create_handoff(&mut self, new: NewHandoff<'_>) -> StateResult<HandoffRecord> {
+        create_handoff_in(&self.tx, new)
     }
 }
 
@@ -407,5 +419,97 @@ mod tests {
             })
             .unwrap();
         assert_eq!(next.sequence.0, 2);
+    }
+
+    #[test]
+    fn handoff_and_event_compose_atomically() {
+        use crate::handoffs::{HandoffRepository, NewHandoff};
+
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "running",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+
+        let handoff = db
+            .transaction(|tx| {
+                let h = tx.create_handoff(NewHandoff {
+                    run_id: run.id,
+                    work_item_id: wi.id,
+                    ready_for: "qa",
+                    summary: "specialist done",
+                    changed_files: Some(r#"["src/lib.rs"]"#),
+                    tests_run: None,
+                    evidence: None,
+                    known_risks: None,
+                    now,
+                })?;
+                tx.append_event(NewEvent {
+                    event_type: "run.completed",
+                    work_item_id: Some(wi.id),
+                    run_id: Some(run.id),
+                    payload: r#"{"ready_for":"qa"}"#,
+                    now,
+                })?;
+                Ok(h)
+            })
+            .expect("commit");
+
+        assert_eq!(
+            db.latest_handoff_for_work_item(wi.id).unwrap().unwrap().id,
+            handoff.id
+        );
+        let events = db.list_events_for_work_item(wi.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "run.completed");
+    }
+
+    #[test]
+    fn rolled_back_handoff_is_not_persisted() {
+        use crate::handoffs::{HandoffRepository, NewHandoff};
+
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "running",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+
+        let _ = db
+            .transaction::<_, ()>(|tx| {
+                tx.create_handoff(NewHandoff {
+                    run_id: run.id,
+                    work_item_id: wi.id,
+                    ready_for: "qa",
+                    summary: "doomed",
+                    changed_files: None,
+                    tests_run: None,
+                    evidence: None,
+                    known_risks: None,
+                    now,
+                })?;
+                Err(crate::StateError::Sqlite(
+                    rusqlite::Error::QueryReturnedNoRows,
+                ))
+            })
+            .expect_err("forced rollback");
+
+        assert!(db.list_handoffs_for_work_item(wi.id).unwrap().is_empty());
     }
 }

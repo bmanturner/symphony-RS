@@ -14,6 +14,7 @@
 
 pub mod edges;
 pub mod events;
+pub mod handoffs;
 pub mod migrations;
 pub mod repository;
 pub mod transaction;
