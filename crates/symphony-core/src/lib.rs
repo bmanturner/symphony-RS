@@ -15,6 +15,7 @@ pub mod advisory;
 pub mod agent;
 pub mod blocker;
 pub mod decomposition;
+pub mod decomposition_applier;
 pub mod decomposition_runner;
 pub mod event_bus;
 pub mod events;
@@ -43,6 +44,10 @@ pub use blocker::{
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
     DecompositionStatus,
+};
+pub use decomposition_applier::{
+    AppliedChild, AppliedDecomposition, ApplyError, DecompositionApplier,
+    DefaultDecompositionApplier, apply_decomposition,
 };
 pub use decomposition_runner::{
     ChildDraft, DecompositionContext, DecompositionDraft, DecompositionEligibility,

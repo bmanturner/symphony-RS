@@ -65,7 +65,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add tests for first-match and priority-based routing.
 - [x] Add decomposition proposal type with child scopes, role assignments, dependencies, and acceptance criteria.
 - [x] Implement integration-owner decomposition runner path.
-- [ ] Add child issue creation through `TrackerMutations`, gated by `decomposition.child_issue_policy`.
+- [x] Add child issue creation through `TrackerMutations`, gated by `decomposition.child_issue_policy`.
 - [ ] Add parent/child edge persistence and blocker propagation.
 - [ ] Add guard preventing parent completion while required children are non-terminal.
 
