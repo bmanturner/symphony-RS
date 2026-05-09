@@ -134,7 +134,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Add a follow-up approval queue tick that drains pending approval-routed follow-ups, with tests for approve/reject paths.
   - [x] Add a budget-pause queue tick that surfaces durable budget pauses for operator/policy resume, with tests for resume conditions.
   - [x] Add a recovery queue tick that reconciles expired leases and orphaned workspace claims on each cadence (separate from the operator `recovery` command), with tests for lease expiry reaping.
-  - [ ] Wire `Scheduler v2` that fans the queue ticks under shared `polling.interval_ms` cadence with `jitter_ms`, replacing the flat `PollLoop` entry point and migrating its existing reconciliation/cancellation semantics to the intake + recovery queues.
+  - [x] Wire `Scheduler v2` that fans the queue ticks under shared `polling.interval_ms` cadence with `jitter_ms`, replacing the flat `PollLoop` entry point and migrating its existing reconciliation/cancellation semantics to the intake + recovery queues.
 - [ ] Replace single flat poll loop with logical queues: intake, specialist, integration, QA, follow-up approval, budget pause, recovery; keep cadence under `polling.interval_ms`.
 - [ ] Add durable leases for running work.
 - [ ] Add lease heartbeat and expiration handling.

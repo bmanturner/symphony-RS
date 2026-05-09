@@ -47,6 +47,7 @@ pub mod recovery_tick;
 pub mod retry;
 pub mod role;
 pub mod routing;
+pub mod scheduler_v2;
 pub mod specialist_tick;
 pub mod state_machine;
 pub mod tracker;
@@ -161,6 +162,7 @@ pub use routing::{
     RoutingContext, RoutingDecision, RoutingEngine, RoutingError, RoutingMatch, RoutingMatchMode,
     RoutingRule, RoutingTable,
 };
+pub use scheduler_v2::{SchedulerTickReport, SchedulerV2, SchedulerV2Config};
 pub use specialist_tick::{
     RoleKindLookup, SpecialistDispatchQueue, SpecialistDispatchRequest, SpecialistQueueTick,
 };
