@@ -8,10 +8,11 @@
 //! subsequent decomposition step extends.
 //!
 //! [`build_scheduler_v2`] currently registers the **intake**,
-//! **recovery**, **specialist**, and **integration** ticks plus a
-//! [`SpecialistRunner`] and an [`IntegrationDispatchRunner`] that
-//! drain the specialist and integration dispatch queues under
-//! `cfg.agent.max_concurrent_agents` capacity. The recovery tick is
+//! **recovery**, **specialist**, **integration**, and **QA** ticks
+//! plus a [`SpecialistRunner`], an [`IntegrationDispatchRunner`], and
+//! a [`QaDispatchRunner`] that drain the specialist, integration, and
+//! QA dispatch queues under `cfg.agent.max_concurrent_agents`
+//! capacity. The recovery tick is
 //! driven by the shared [`ActiveSetStore`] plus an in-memory
 //! [`ClaimedRunRegistry`] that stands in for the durable `runs` table
 //! until a state DB is plumbed in: any claim whose `IssueId` is no
@@ -28,9 +29,12 @@
 //! over `IntegrationQueueRepository`; tests wire a deterministic fake.
 //! Each request is consumed by the [`IntegrationDispatchRunner`] under
 //! the configured [`IntegrationDispatcher`] (production: the
-//! integration-owner agent runner). QA / follow-up-approval /
-//! budget-pause ticks layer on top of the same store and runners in
-//! subsequent decomposition steps. The returned scheduler is not yet
+//! integration-owner agent runner). The QA tick consults a caller-
+//! supplied [`QaQueueSource`] under SPEC-default [`QaGates`] (blocker
+//! gate on; no per-workflow knob exists yet) and dispatches each ready
+//! work item through the configured [`QaDispatcher`]. Follow-up-
+//! approval / budget-pause ticks layer on top of the same store and
+//! runners in subsequent decomposition steps. The returned scheduler is not yet
 //! wired into [`crate::run::run`]; that switch is the last
 //! decomposition step. Until then the production entry point remains
 //! [`PollLoop`].
@@ -49,11 +53,13 @@ use symphony_config::{self as cfg, WorkflowConfig};
 use symphony_core::{
     ActiveSetStore, Dispatcher, ExpiredLeaseCandidate, IntakeQueueTick, IntegrationDispatchQueue,
     IntegrationDispatchRunner, IntegrationDispatcher, IntegrationGates, IntegrationQueueSource,
-    IntegrationQueueTick, IssueId, OrphanedWorkspaceClaimCandidate, QueueTick, QueueTickCadence,
-    RecoveryDispatchQueue, RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick,
-    RecoveryRunId, RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName, RoutingEngine,
-    RoutingMatch, RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2, SchedulerV2Config,
-    SpecialistDispatchQueue, SpecialistQueueTick, SpecialistRunner, TrackerRead, WorkItemId,
+    IntegrationQueueTick, IssueId, OrphanedWorkspaceClaimCandidate, QaDispatchQueue,
+    QaDispatchRunner, QaDispatcher, QaGates, QaQueueSource, QaQueueTick, QueueTick,
+    QueueTickCadence, RecoveryDispatchQueue, RecoveryQueueError, RecoveryQueueSource,
+    RecoveryQueueTick, RecoveryRunId, RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName,
+    RoutingEngine, RoutingMatch, RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2,
+    SchedulerV2Config, SpecialistDispatchQueue, SpecialistQueueTick, SpecialistRunner, TrackerRead,
+    WorkItemId,
 };
 
 /// What [`build_scheduler_v2`] hands back to the composition root.
@@ -117,6 +123,24 @@ pub struct SchedulerV2Bundle {
     /// (`require_all_children_terminal`, `require_no_open_blockers`) at
     /// emission time, so every request the runner sees is authoritative.
     pub integration_runner: Arc<IntegrationDispatchRunner>,
+    /// FIFO of pending [`symphony_core::QaDispatchRequest`]s emitted by
+    /// the QA queue tick. Drained by [`Self::qa_runner`] under bounded
+    /// concurrency. Held on the bundle so the eventual `run.rs` switch
+    /// (and tests) can observe queue state directly without reaching
+    /// into the tick.
+    pub qa_dispatch: Arc<QaDispatchQueue>,
+    /// Bounded-concurrency consumer for [`Self::qa_dispatch`], pre-wired
+    /// with `cfg.agent.max_concurrent_agents` capacity and the supplied
+    /// [`QaDispatcher`] (production: the QA-gate agent runner). The
+    /// composition root drives [`QaDispatchRunner::run_pending`] and
+    /// [`QaDispatchRunner::reap_completed`] on its own cadence; the
+    /// scheduler tick fan only enqueues requests. The upstream
+    /// [`QaQueueTick`] applies the workflow's [`QaGates`] at emission
+    /// time, so every drained request is authoritative — the runner
+    /// performs no additional gate check. Verdicts (pass / fail / waived
+    /// / inconclusive) are signalled by the dispatcher's returned
+    /// [`symphony_core::QaDispatchReason`].
+    pub qa_runner: Arc<QaDispatchRunner>,
 }
 
 /// One in-flight claim recorded in [`ClaimedRunRegistry`].
@@ -282,8 +306,20 @@ impl RecoveryQueueSource for ActiveSetRecoverySource {
 /// agent runner) under the configured `agent.max_concurrent_agents`
 /// ceiling. Per-role caps will layer in once role-aware dispatch lands.
 ///
+/// The QA tick consults `qa_source` under [`QaGates`] derived from
+/// SPEC v2 §5.12 defaults (blocker gate on). `WorkflowConfig` does not
+/// yet expose a per-workflow knob for the QA queue's blocker gate —
+/// the SPEC default is the only supported value at this layer; a
+/// future schema addition will mirror it the same way `cfg.integration`
+/// flows into [`IntegrationGates`]. Production wires `qa_source` to a
+/// state-crate adapter over `QaQueueRepository`; tests pass a
+/// deterministic fake. Every emitted request is pre-gated by the tick,
+/// so [`QaDispatchRunner`] simply invokes `qa_dispatcher` (production:
+/// the QA-gate agent runner) under the configured
+/// `agent.max_concurrent_agents` ceiling.
+///
 /// This function is intentionally additive: it does not register
-/// QA / follow-up approval / budget-pause ticks yet. Those come in
+/// follow-up approval / budget-pause ticks yet. Those come in
 /// subsequent decomposition steps, which will extend this builder
 /// rather than introduce a parallel one.
 pub fn build_scheduler_v2(
@@ -292,6 +328,8 @@ pub fn build_scheduler_v2(
     dispatcher: Arc<dyn Dispatcher>,
     integration_source: Arc<dyn IntegrationQueueSource>,
     integration_dispatcher: Arc<dyn IntegrationDispatcher>,
+    qa_source: Arc<dyn QaQueueSource>,
+    qa_dispatcher: Arc<dyn QaDispatcher>,
 ) -> SchedulerV2Bundle {
     let cadence = QueueTickCadence::from_millis(cfg.polling.interval_ms, cfg.polling.jitter_ms);
     let scheduler_cfg = SchedulerV2Config::from_cadence(cadence);
@@ -350,9 +388,23 @@ pub fn build_scheduler_v2(
         max_concurrent,
     ));
 
+    let qa_dispatch = Arc::new(QaDispatchQueue::new());
+    let qa_gates = QaGates::default();
+    let qa: Box<dyn QueueTick> = Box::new(QaQueueTick::new(
+        qa_source,
+        qa_gates,
+        qa_dispatch.clone(),
+        cadence,
+    ));
+    let qa_runner = Arc::new(QaDispatchRunner::new(
+        qa_dispatch.clone(),
+        qa_dispatcher,
+        max_concurrent,
+    ));
+
     let scheduler = SchedulerV2::with_ticks(
         scheduler_cfg,
-        vec![intake, recovery, specialist, integration],
+        vec![intake, recovery, specialist, integration, qa],
     );
     SchedulerV2Bundle {
         scheduler,
@@ -363,6 +415,8 @@ pub fn build_scheduler_v2(
         specialist_runner,
         integration_dispatch,
         integration_runner,
+        qa_dispatch,
+        qa_runner,
     }
 }
 
@@ -433,7 +487,8 @@ mod tests {
     use symphony_core::tracker_trait::{TrackerError, TrackerResult};
     use symphony_core::{
         IntegrationCandidate, IntegrationDispatchReason, IntegrationDispatchRequest,
-        IntegrationQueueError, IntegrationRequestCause,
+        IntegrationQueueError, IntegrationRequestCause, QaCandidate, QaDispatchReason,
+        QaDispatchRequest, QaQueueError, QaRequestCause,
     };
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
@@ -570,6 +625,137 @@ mod tests {
                 .push(request.parent_identifier.clone());
             self.reason
         }
+    }
+
+    /// Empty QA source — never surfaces a candidate. Used by tests
+    /// that only exercise other ticks/runners.
+    struct EmptyQaSource;
+
+    impl QaQueueSource for EmptyQaSource {
+        fn list_ready(&self, _gates: QaGates) -> Result<Vec<QaCandidate>, QaQueueError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn empty_qa_source() -> Arc<dyn QaQueueSource> {
+        Arc::new(EmptyQaSource)
+    }
+
+    /// No-op QA dispatcher — would resolve every request as `Passed`.
+    /// Used by tests that don't drive the QA runner.
+    struct NoopQaDispatcher;
+
+    #[async_trait]
+    impl QaDispatcher for NoopQaDispatcher {
+        async fn dispatch(
+            &self,
+            _request: QaDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> QaDispatchReason {
+            QaDispatchReason::Passed
+        }
+    }
+
+    fn noop_qa_dispatcher() -> Arc<dyn QaDispatcher> {
+        Arc::new(NoopQaDispatcher)
+    }
+
+    /// Gate-aware QA source: stores per-gate candidate lists,
+    /// mirroring `QaQueueRepository::list_ready_for_qa_with_gates`. The
+    /// tick supplies the workflow's gates; this fake returns whichever
+    /// list was pre-loaded for that exact gate value.
+    #[derive(Default)]
+    struct GateAwareQaSource {
+        // require_no_open_blockers → list
+        by_gates: StdMutex<Vec<(bool, Vec<QaCandidate>)>>,
+    }
+
+    impl GateAwareQaSource {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn set(&self, gates: QaGates, candidates: Vec<QaCandidate>) {
+            let key = gates.require_no_open_blockers;
+            let mut by = self.by_gates.lock().unwrap();
+            by.retain(|(k, _)| *k != key);
+            by.push((key, candidates));
+        }
+    }
+
+    impl QaQueueSource for GateAwareQaSource {
+        fn list_ready(&self, gates: QaGates) -> Result<Vec<QaCandidate>, QaQueueError> {
+            let key = gates.require_no_open_blockers;
+            let by = self.by_gates.lock().unwrap();
+            Ok(by
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default())
+        }
+    }
+
+    /// Records every QA dispatch invocation and resolves with a
+    /// configured reason. Mirrors the recording dispatchers in the
+    /// runner-side tests.
+    struct RecordingQaDispatcher {
+        calls: StdMutex<Vec<String>>,
+        reason: QaDispatchReason,
+    }
+
+    impl RecordingQaDispatcher {
+        fn new(reason: QaDispatchReason) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                reason,
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl QaDispatcher for RecordingQaDispatcher {
+        async fn dispatch(
+            &self,
+            request: QaDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> QaDispatchReason {
+            self.calls.lock().unwrap().push(request.identifier.clone());
+            self.reason
+        }
+    }
+
+    fn qa_candidate(id: i64, identifier: &str, cause: QaRequestCause) -> QaCandidate {
+        QaCandidate {
+            work_item_id: WorkItemId::new(id),
+            identifier: identifier.into(),
+            title: format!("title {identifier}"),
+            cause,
+        }
+    }
+
+    async fn wait_for_qa_outcomes(
+        runner: &QaDispatchRunner,
+        n: usize,
+    ) -> Vec<symphony_core::QaDispatchOutcome> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut acc = Vec::new();
+        while acc.len() < n {
+            acc.extend(runner.reap_completed().await);
+            if acc.len() >= n {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {n} qa outcomes; got {} so far",
+                    acc.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        acc
     }
 
     fn integration_candidate(
@@ -780,15 +966,22 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
-        // Intake + recovery + specialist + integration; QA /
+        // Intake + recovery + specialist + integration + QA;
         // follow-up approval / budget-pause ticks layer on in
         // subsequent steps.
-        assert_eq!(bundle.scheduler.tick_count(), 4);
+        assert_eq!(bundle.scheduler.tick_count(), 5);
         assert!(bundle.claimed_runs.is_empty());
         assert!(bundle.recovery_dispatch.is_empty());
         assert!(bundle.specialist_dispatch.is_empty());
         assert!(bundle.integration_dispatch.is_empty());
+        assert!(bundle.qa_dispatch.is_empty());
+        assert_eq!(
+            bundle.qa_runner.max_concurrent(),
+            cfg.agent.max_concurrent_agents as usize,
+        );
         assert_eq!(
             bundle.specialist_runner.max_concurrent(),
             cfg.agent.max_concurrent_agents as usize,
@@ -809,6 +1002,8 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let sc = bundle.scheduler.config();
         assert_eq!(sc.interval, Duration::from_millis(123));
@@ -825,6 +1020,8 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -834,8 +1031,8 @@ mod tests {
 
         assert!(active_set.is_empty());
         let report = scheduler.tick_once().await;
-        // intake + recovery + specialist + integration
-        assert_eq!(report.outcomes.len(), 4);
+        // intake + recovery + specialist + integration + qa
+        assert_eq!(report.outcomes.len(), 5);
         assert_eq!(report.outcomes[0].processed, 3);
         assert_eq!(active_set.len(), 3);
         assert_eq!(
@@ -858,6 +1055,8 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             scheduler,
@@ -924,6 +1123,8 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -974,6 +1175,8 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1009,6 +1212,8 @@ mod tests {
             noop_dispatcher(),
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1075,6 +1280,8 @@ mod tests {
             dispatcher.clone() as Arc<dyn Dispatcher>,
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1141,6 +1348,8 @@ mod tests {
             dispatcher.clone() as Arc<dyn Dispatcher>,
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1181,6 +1390,8 @@ mod tests {
             dispatcher.clone() as Arc<dyn Dispatcher>,
             empty_integration_source(),
             noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1279,6 +1490,8 @@ mod tests {
             noop_dispatcher(),
             source.clone() as Arc<dyn IntegrationQueueSource>,
             dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1339,6 +1552,8 @@ mod tests {
             noop_dispatcher(),
             source.clone() as Arc<dyn IntegrationQueueSource>,
             dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1392,6 +1607,8 @@ mod tests {
             noop_dispatcher(),
             source.clone() as Arc<dyn IntegrationQueueSource>,
             dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
+            empty_qa_source(),
+            noop_qa_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1412,5 +1629,164 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].parent_id, WorkItemId::new(7));
         assert_eq!(dispatcher.calls(), vec!["PROJ-7"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // QA tick + runner end-to-end coverage.
+    //
+    // Each scenario builds the scheduler with a `GateAwareQaSource`
+    // pre-loaded for the workflow's [`QaGates`], ticks the scheduler
+    // (which fans the QA tick → enqueues a dispatch request when the
+    // gates allow it), then drives the runner exposed on the bundle.
+    // The runner is the load-bearing piece this checklist step adds.
+    //
+    // `WorkflowConfig` does not yet expose a per-workflow knob for the
+    // QA blocker gate — the builder always uses [`QaGates::default()`]
+    // (SPEC v2 §5.12 default: blocker gate on). The "waiver-routed
+    // verdict" coverage therefore exercises the dispatcher returning
+    // [`QaDispatchReason::Waived`] for an emitted request, which is
+    // how a `qa.waiver_roles`-authorised role is observed at this
+    // surface.
+    // ---------------------------------------------------------------------
+
+    /// Ready: source surfaces a candidate under the workflow's default
+    /// gates → the QA tick enqueues a dispatch request → the runner
+    /// invokes the dispatcher and reports `Passed`.
+    #[tokio::test]
+    async fn builder_dispatches_qa_candidates_when_ready() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(GateAwareQaSource::new());
+        source.set(
+            QaGates::default(),
+            vec![qa_candidate(
+                42,
+                "PROJ-42",
+                QaRequestCause::IntegrationConsolidated,
+            )],
+        );
+        let dispatcher = Arc::new(RecordingQaDispatcher::new(QaDispatchReason::Passed));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            source.clone() as Arc<dyn QaQueueSource>,
+            dispatcher.clone() as Arc<dyn QaDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            qa_dispatch,
+            qa_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(qa_dispatch.len(), 1);
+
+        let report = qa_runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_capacity, 0);
+
+        let outcomes = wait_for_qa_outcomes(&qa_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].work_item_id, WorkItemId::new(42));
+        assert_eq!(outcomes[0].identifier, "PROJ-42");
+        assert_eq!(outcomes[0].reason, QaDispatchReason::Passed);
+        assert_eq!(dispatcher.calls(), vec!["PROJ-42"]);
+    }
+
+    /// Blocked: source returns nothing under default gates (e.g. an
+    /// open subtree blocker keeps QA suppressed upstream) → the QA
+    /// tick emits no request and the runner has nothing to dispatch.
+    #[tokio::test]
+    async fn builder_emits_no_qa_request_when_subtree_blocked() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(GateAwareQaSource::new());
+        // Default gates: empty list models "subtree blocked upstream".
+        source.set(QaGates::default(), Vec::new());
+        // The waived view *would* surface a candidate, but the builder
+        // wires the SPEC default (gates-on); the tick must never see it.
+        source.set(
+            QaGates {
+                require_no_open_blockers: false,
+            },
+            vec![qa_candidate(7, "PROJ-7", QaRequestCause::DirectQaRequest)],
+        );
+        let dispatcher = Arc::new(RecordingQaDispatcher::new(QaDispatchReason::Passed));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            source.clone() as Arc<dyn QaQueueSource>,
+            dispatcher.clone() as Arc<dyn QaDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            qa_dispatch,
+            qa_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert!(qa_dispatch.is_empty());
+
+        let report = qa_runner.run_pending(CancellationToken::new()).await;
+        assert!(report.is_idle());
+        assert!(dispatcher.calls().is_empty());
+    }
+
+    /// Waiver-routed: an authorised waiver role records a `Waived`
+    /// verdict for an emitted request. The runner records the verdict
+    /// verbatim — the kernel-side validation of the waiver itself
+    /// (waiver role + reason) lives in `QaOutcome::try_new`.
+    #[tokio::test]
+    async fn builder_records_waiver_routed_qa_verdict() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(GateAwareQaSource::new());
+        source.set(
+            QaGates::default(),
+            vec![qa_candidate(
+                99,
+                "PROJ-99",
+                QaRequestCause::IntegrationConsolidated,
+            )],
+        );
+        let dispatcher = Arc::new(RecordingQaDispatcher::new(QaDispatchReason::Waived));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            source.clone() as Arc<dyn QaQueueSource>,
+            dispatcher.clone() as Arc<dyn QaDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            qa_dispatch,
+            qa_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(qa_dispatch.len(), 1);
+
+        let report = qa_runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+
+        let outcomes = wait_for_qa_outcomes(&qa_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].work_item_id, WorkItemId::new(99));
+        assert_eq!(outcomes[0].reason, QaDispatchReason::Waived);
+        assert_eq!(dispatcher.calls(), vec!["PROJ-99"]);
     }
 }

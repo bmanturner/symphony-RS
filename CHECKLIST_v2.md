@@ -146,7 +146,7 @@ One unchecked item per implementation iteration. Each item should land with test
     - [x] Extend the `scheduler` builder to register a `RecoveryQueueTick` driven by the shared `ActiveSetStore`, with tests proving expired-lease/orphaned-claim reconciliation parity against the flat-loop contract.
     - [x] Extend the `scheduler` builder to register a `SpecialistQueueTick` paired with a `SpecialistRunner` over a shared `SpecialistDispatchQueue`, reusing the existing `SymphonyDispatcher` under the configured `agent.max_concurrent_agents`, with tests for capacity-deferred parking, parent-cancellation propagation, and reap-completed observability.
     - [x] Extend the `scheduler` builder to register an `IntegrationQueueTick` paired with an `IntegrationDispatchRunner`, with tests for ready/blocked/waived gating end-to-end.
-    - [ ] Extend the `scheduler` builder to register a `QaQueueTick` paired with a `QaDispatchRunner`, with tests for ready/blocked candidates and waiver-routed verdicts end-to-end.
+    - [x] Extend the `scheduler` builder to register a `QaQueueTick` paired with a `QaDispatchRunner`, with tests for ready/blocked candidates and waiver-routed verdicts end-to-end.
     - [ ] Extend the `scheduler` builder to register `FollowupApprovalQueueTick` + `FollowupApprovalRunner` and `BudgetPauseQueueTick` + `BudgetPauseRunner`, with tests for approve/reject and resume paths end-to-end.
     - [ ] Switch `symphony-cli/src/run.rs` from `PollLoop` to the `SchedulerV2` builder, migrating SIGINT drain semantics to the runners' reap surface and retiring `PollLoop` as the production entry point. Keep `PollLoop` exported for parity tests until phase close.
 - [ ] Add durable leases for running work.
