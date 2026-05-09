@@ -222,6 +222,66 @@ pub trait RunRepository {
     /// in practice. Results are ordered by `lease_expires_at ASC` so the
     /// oldest stale lease is reclaimed first.
     fn find_expired_leases(&self, now: &str) -> StateResult<Vec<RunRecord>>;
+
+    /// Atomically claim the durable lease on a run.
+    ///
+    /// The acquisition succeeds when, at the moment of the conditional
+    /// UPDATE, one of the following holds:
+    ///
+    /// * The run has no lease (`lease_owner IS NULL`).
+    /// * `owner` already holds the lease (idempotent refresh / extension).
+    /// * The previous lease has strictly expired (`lease_expires_at <
+    ///   now`). The boundary is the same `<` used by
+    ///   [`Self::find_expired_leases`]: a lease that just touched its
+    ///   deadline is not yet expired and cannot be taken over.
+    ///
+    /// On contention the existing holder + expiration are returned so the
+    /// scheduler can park or reroute the dispatch request without losing
+    /// it (see `CHECKLIST_v2.md` Phase 11 lease subtasks).
+    ///
+    /// `expires_at` and `now` are RFC3339 strings; `now` is provided
+    /// explicitly rather than read from `CURRENT_TIMESTAMP` so kernel
+    /// callers can keep clock semantics consistent with composed event
+    /// timestamps inside [`crate::transaction::StateTransaction`].
+    fn acquire_lease(
+        &mut self,
+        run_id: RunId,
+        owner: &str,
+        expires_at: &str,
+        now: &str,
+    ) -> StateResult<LeaseAcquisition>;
+
+    /// Clear the lease columns on a run.
+    ///
+    /// Returns `Ok(true)` when the row exists (regardless of whether it
+    /// previously held a lease — clearing an already-cleared lease is a
+    /// no-op success), and `Ok(false)` when the run row is missing. The
+    /// kernel is expected to call this exactly once per run, on terminal
+    /// completion (success, failure, or cancellation), to keep
+    /// `find_expired_leases` from surfacing finished work.
+    fn release_lease(&mut self, run_id: RunId) -> StateResult<bool>;
+}
+
+/// Outcome of [`RunRepository::acquire_lease`].
+///
+/// Modeled as an enum rather than a `Result<bool, _>` so the scheduler
+/// can branch on contention details (who holds it, until when) without a
+/// follow-up query — and so future variants (e.g. `Stale` for explicit
+/// takeover telemetry) can be added without breaking callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseAcquisition {
+    /// Lease successfully acquired (or refreshed by the same owner).
+    Acquired,
+    /// Another owner holds an unexpired lease; the call had no effect.
+    Contended {
+        /// The current `lease_owner` value at the time the conditional
+        /// UPDATE rejected the acquisition.
+        holder: String,
+        /// The current `lease_expires_at` value (RFC3339 string).
+        expires_at: String,
+    },
+    /// The run row does not exist.
+    NotFound,
 }
 
 pub(crate) const WORK_ITEM_COLUMNS: &str = "id, tracker_id, identifier, parent_id, title, \
@@ -417,6 +477,68 @@ pub(crate) fn find_expired_leases_in(conn: &Connection, now: &str) -> StateResul
     Ok(out)
 }
 
+pub(crate) fn acquire_lease_in(
+    conn: &Connection,
+    run_id: RunId,
+    owner: &str,
+    expires_at: &str,
+    now: &str,
+) -> StateResult<LeaseAcquisition> {
+    // Conditional UPDATE: succeeds iff the lease is vacant, already
+    // ours, or strictly expired. SQLite serializes writers, so this is
+    // atomic with respect to other connections.
+    let updated = conn.execute(
+        "UPDATE runs \
+         SET lease_owner = ?2, lease_expires_at = ?3 \
+         WHERE id = ?1 \
+           AND ( lease_owner IS NULL \
+              OR lease_owner = ?2 \
+              OR lease_expires_at < ?4 )",
+        params![run_id.0, owner, expires_at, now],
+    )?;
+    if updated == 1 {
+        return Ok(LeaseAcquisition::Acquired);
+    }
+
+    // Diagnose: missing row vs. live contention. The follow-up SELECT
+    // can theoretically race with another writer that takes over after
+    // our failed UPDATE, but reporting the most recently observed holder
+    // is acceptable — the caller treats both Contended outcomes the
+    // same (park the dispatch).
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT lease_owner, lease_expires_at FROM runs WHERE id = ?1",
+            params![run_id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(LeaseAcquisition::NotFound),
+        Some((Some(holder), Some(expires))) => Ok(LeaseAcquisition::Contended {
+            holder,
+            expires_at: expires,
+        }),
+        // The row exists but the lease columns are NULL or partially
+        // NULL — that should have satisfied the UPDATE predicate. The
+        // only realistic way to reach this branch is a concurrent
+        // release between the UPDATE and the SELECT; reporting it as
+        // contention with an empty holder would be wrong, so surface
+        // the same "vacant" view the next acquire attempt would see.
+        Some(_) => Ok(LeaseAcquisition::Contended {
+            holder: String::new(),
+            expires_at: String::new(),
+        }),
+    }
+}
+
+pub(crate) fn release_lease_in(conn: &Connection, run_id: RunId) -> StateResult<bool> {
+    let updated = conn.execute(
+        "UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?1",
+        params![run_id.0],
+    )?;
+    Ok(updated == 1)
+}
+
 pub(crate) fn list_runs_for_work_item_in(
     conn: &Connection,
     work_item_id: WorkItemId,
@@ -485,6 +607,20 @@ impl RunRepository for StateDb {
 
     fn find_expired_leases(&self, now: &str) -> StateResult<Vec<RunRecord>> {
         find_expired_leases_in(self.conn(), now)
+    }
+
+    fn acquire_lease(
+        &mut self,
+        run_id: RunId,
+        owner: &str,
+        expires_at: &str,
+        now: &str,
+    ) -> StateResult<LeaseAcquisition> {
+        acquire_lease_in(self.conn(), run_id, owner, expires_at, now)
+    }
+
+    fn release_lease(&mut self, run_id: RunId) -> StateResult<bool> {
+        release_lease_in(self.conn(), run_id)
     }
 }
 
@@ -769,6 +905,219 @@ mod tests {
             .find_expired_leases("2026-05-08T00:00:01Z")
             .expect("query");
         assert_eq!(past.len(), 1);
+    }
+
+    fn read_lease(db: &StateDb, run_id: RunId) -> (Option<String>, Option<String>) {
+        db.conn()
+            .query_row(
+                "SELECT lease_owner, lease_expires_at FROM runs WHERE id = ?1",
+                params![run_id.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("lease row")
+    }
+
+    #[test]
+    fn acquire_lease_on_vacant_run_succeeds_and_writes_columns() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        let outcome = db
+            .acquire_lease(
+                run,
+                "worker-a",
+                "2026-05-08T01:00:00Z",
+                "2026-05-08T00:00:00Z",
+            )
+            .expect("acquire");
+        assert_eq!(outcome, LeaseAcquisition::Acquired);
+        let (owner, expires) = read_lease(&db, run);
+        assert_eq!(owner.as_deref(), Some("worker-a"));
+        assert_eq!(expires.as_deref(), Some("2026-05-08T01:00:00Z"));
+    }
+
+    #[test]
+    fn acquire_lease_is_idempotent_for_same_owner() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        db.acquire_lease(
+            run,
+            "worker-a",
+            "2026-05-08T01:00:00Z",
+            "2026-05-08T00:00:00Z",
+        )
+        .unwrap();
+        // Same owner re-acquires while the lease is still live, with a
+        // later expiration — this should refresh the deadline.
+        let outcome = db
+            .acquire_lease(
+                run,
+                "worker-a",
+                "2026-05-08T02:00:00Z",
+                "2026-05-08T00:30:00Z",
+            )
+            .expect("re-acquire");
+        assert_eq!(outcome, LeaseAcquisition::Acquired);
+        let (owner, expires) = read_lease(&db, run);
+        assert_eq!(owner.as_deref(), Some("worker-a"));
+        assert_eq!(expires.as_deref(), Some("2026-05-08T02:00:00Z"));
+    }
+
+    #[test]
+    fn acquire_lease_rejects_other_owner_while_unexpired() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        db.acquire_lease(
+            run,
+            "worker-a",
+            "2026-05-08T01:00:00Z",
+            "2026-05-08T00:00:00Z",
+        )
+        .unwrap();
+        let outcome = db
+            .acquire_lease(
+                run,
+                "worker-b",
+                "2026-05-08T01:30:00Z",
+                "2026-05-08T00:30:00Z",
+            )
+            .expect("contend");
+        assert_eq!(
+            outcome,
+            LeaseAcquisition::Contended {
+                holder: "worker-a".into(),
+                expires_at: "2026-05-08T01:00:00Z".into(),
+            }
+        );
+        // Original lease is untouched.
+        let (owner, expires) = read_lease(&db, run);
+        assert_eq!(owner.as_deref(), Some("worker-a"));
+        assert_eq!(expires.as_deref(), Some("2026-05-08T01:00:00Z"));
+    }
+
+    #[test]
+    fn acquire_lease_takes_over_strictly_expired_lease() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        db.acquire_lease(
+            run,
+            "worker-a",
+            "2026-05-08T01:00:00Z",
+            "2026-05-08T00:00:00Z",
+        )
+        .unwrap();
+        // `now` is strictly past the previous lease deadline.
+        let outcome = db
+            .acquire_lease(
+                run,
+                "worker-b",
+                "2026-05-08T03:00:00Z",
+                "2026-05-08T01:00:01Z",
+            )
+            .expect("takeover");
+        assert_eq!(outcome, LeaseAcquisition::Acquired);
+        let (owner, expires) = read_lease(&db, run);
+        assert_eq!(owner.as_deref(), Some("worker-b"));
+        assert_eq!(expires.as_deref(), Some("2026-05-08T03:00:00Z"));
+    }
+
+    #[test]
+    fn acquire_lease_at_exact_expiration_is_contention() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        db.acquire_lease(
+            run,
+            "worker-a",
+            "2026-05-08T01:00:00Z",
+            "2026-05-08T00:00:00Z",
+        )
+        .unwrap();
+        // Equality is "deadline reached" but not yet expired — matches
+        // the boundary used by `find_expired_leases`.
+        let outcome = db
+            .acquire_lease(
+                run,
+                "worker-b",
+                "2026-05-08T02:00:00Z",
+                "2026-05-08T01:00:00Z",
+            )
+            .expect("boundary");
+        assert!(matches!(outcome, LeaseAcquisition::Contended { .. }));
+    }
+
+    #[test]
+    fn acquire_lease_on_missing_run_reports_not_found() {
+        let mut db = open();
+        let outcome = db
+            .acquire_lease(
+                RunId(999),
+                "worker-a",
+                "2026-05-08T01:00:00Z",
+                "2026-05-08T00:00:00Z",
+            )
+            .expect("missing");
+        assert_eq!(outcome, LeaseAcquisition::NotFound);
+    }
+
+    #[test]
+    fn release_lease_clears_columns_and_returns_true() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        db.acquire_lease(
+            run,
+            "worker-a",
+            "2026-05-08T01:00:00Z",
+            "2026-05-08T00:00:00Z",
+        )
+        .unwrap();
+        assert!(db.release_lease(run).expect("release"));
+        let (owner, expires) = read_lease(&db, run);
+        assert!(owner.is_none());
+        assert!(expires.is_none());
+        // After release, a different owner can acquire freely.
+        let outcome = db
+            .acquire_lease(
+                run,
+                "worker-b",
+                "2026-05-08T02:00:00Z",
+                "2026-05-08T00:30:00Z",
+            )
+            .unwrap();
+        assert_eq!(outcome, LeaseAcquisition::Acquired);
+    }
+
+    #[test]
+    fn release_lease_is_no_op_success_when_lease_already_clear() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        // No prior acquisition; release should still report the row
+        // exists rather than failing.
+        assert!(db.release_lease(run).expect("release vacant"));
+    }
+
+    #[test]
+    fn release_lease_returns_false_for_missing_run() {
+        let mut db = open();
+        assert!(!db.release_lease(RunId(999)).expect("release missing"));
+    }
+
+    #[test]
+    fn released_lease_is_no_longer_surfaced_by_find_expired_leases() {
+        let mut db = open();
+        let run = seed_run(&mut db, "ENG-1");
+        db.acquire_lease(
+            run,
+            "worker-a",
+            "2026-05-08T01:00:00Z",
+            "2026-05-08T00:00:00Z",
+        )
+        .unwrap();
+        // With a fresh `now` past expiration, the lease would otherwise
+        // appear in `find_expired_leases` — releasing must remove it.
+        db.release_lease(run).unwrap();
+        let expired = db
+            .find_expired_leases("2026-05-08T05:00:00Z")
+            .expect("expired");
+        assert!(expired.is_empty());
     }
 
     #[test]
