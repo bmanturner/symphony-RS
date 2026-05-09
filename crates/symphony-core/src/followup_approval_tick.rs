@@ -110,6 +110,13 @@ pub struct FollowupApprovalDispatchRequest {
     pub blocking: bool,
     /// Configured approval role.
     pub approval_role: RoleName,
+    /// Durable `runs` row this dispatch will animate, when known. The
+    /// follow-up approval runner uses this to acquire/release the
+    /// durable lease (CHECKLIST_v2 Phase 11). `None` for legacy
+    /// producers that do not reserve a run row before queueing — those
+    /// dispatches bypass lease acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<crate::blocker::RunRef>,
 }
 
 /// Shared FIFO of pending [`FollowupApprovalDispatchRequest`]s.
@@ -273,6 +280,7 @@ impl QueueTick for FollowupApprovalQueueTick {
                 title: c.title,
                 blocking: c.blocking,
                 approval_role: c.approval_role,
+                run_id: None,
             });
             self.claimed
                 .lock()
@@ -604,6 +612,7 @@ mod tests {
             title: "first".into(),
             blocking: false,
             approval_role: role.clone(),
+            run_id: None,
         });
         q.enqueue(FollowupApprovalDispatchRequest {
             followup_id: FollowupId::new(2),
@@ -611,6 +620,7 @@ mod tests {
             title: "second".into(),
             blocking: true,
             approval_role: role,
+            run_id: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -642,9 +652,26 @@ mod tests {
             title: "verify".into(),
             blocking: false,
             approval_role: RoleName::new("platform_lead"),
+            run_id: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: FollowupApprovalDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn dispatch_request_round_trips_when_run_id_present() {
+        let r = FollowupApprovalDispatchRequest {
+            followup_id: FollowupId::new(7),
+            source_work_item: WorkItemId::new(100),
+            title: "verify".into(),
+            blocking: false,
+            approval_role: RoleName::new("platform_lead"),
+            run_id: Some(crate::blocker::RunRef::new(99)),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: FollowupApprovalDispatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+        assert!(json.contains("run_id"));
     }
 }
