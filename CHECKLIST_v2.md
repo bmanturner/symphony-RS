@@ -62,7 +62,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 5 — Routing and Decomposition
 
 - [x] Implement routing engine that maps normalized work items to roles from workflow config.
-- [ ] Add tests for first-match and priority-based routing.
+- [x] Add tests for first-match and priority-based routing.
 - [ ] Add decomposition proposal type with child scopes, role assignments, dependencies, and acceptance criteria.
 - [ ] Implement integration-owner decomposition runner path.
 - [ ] Add child issue creation through `TrackerMutations`, gated by `decomposition.child_issue_policy`.

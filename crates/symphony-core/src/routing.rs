@@ -621,4 +621,248 @@ mod tests {
         assert!(!glob_match("a?c", "abbc"));
         assert!(!glob_match("a?c", "ac"));
     }
+
+    // --- first-match dispatch --------------------------------------------
+
+    #[test]
+    fn first_match_ignores_priority_field_entirely() {
+        // A later rule with a much higher priority must not "win" in
+        // first-match mode — order is the only signal.
+        let table = RoutingTable {
+            default_role: None,
+            match_mode: RoutingMatchMode::FirstMatch,
+            rules: vec![
+                rule(Some(1), &["qa"], &[], None, "first_winner"),
+                rule(Some(9999), &["qa"], &[], None, "would_win_in_priority"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let decision = engine
+            .route(&item_with(&["qa"]), &RoutingContext::default())
+            .unwrap();
+        assert_eq!(
+            decision,
+            RoutingDecision::Matched {
+                role: RoleName::from("first_winner"),
+                rule_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn first_match_catch_all_at_top_shadows_specific_rules_below() {
+        // An empty `when` is a catch-all. Operators using first-match must
+        // place it last; placing it first intentionally short-circuits.
+        let table = RoutingTable {
+            default_role: Some(RoleName::from("fallback")),
+            match_mode: RoutingMatchMode::FirstMatch,
+            rules: vec![
+                rule(None, &[], &[], None, "catch_all"),
+                rule(None, &["qa"], &[], None, "specific"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let decision = engine
+            .route(&item_with(&["qa"]), &RoutingContext::default())
+            .unwrap();
+        assert_eq!(
+            decision,
+            RoutingDecision::Matched {
+                role: RoleName::from("catch_all"),
+                rule_index: 0,
+            }
+        );
+    }
+
+    // --- priority dispatch -----------------------------------------------
+
+    #[test]
+    fn priority_mode_falls_through_to_default_role_when_nothing_matches() {
+        let table = RoutingTable {
+            default_role: Some(RoleName::from("platform_lead")),
+            match_mode: RoutingMatchMode::Priority,
+            rules: vec![
+                rule(Some(50), &["docs"], &[], None, "docs_role"),
+                rule(Some(99), &["infra"], &[], None, "infra_role"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let decision = engine
+            .route(&item_with(&["bug"]), &RoutingContext::default())
+            .unwrap();
+        assert_eq!(
+            decision,
+            RoutingDecision::Default {
+                role: RoleName::from("platform_lead"),
+            }
+        );
+    }
+
+    #[test]
+    fn priority_mode_returns_no_match_when_no_rule_and_no_default() {
+        let table = RoutingTable {
+            default_role: None,
+            match_mode: RoutingMatchMode::Priority,
+            rules: vec![rule(Some(99), &["docs"], &[], None, "docs_role")],
+        };
+        let engine = RoutingEngine::new(table);
+        let decision = engine
+            .route(&item_with(&["bug"]), &RoutingContext::default())
+            .unwrap();
+        assert_eq!(decision, RoutingDecision::NoMatch);
+    }
+
+    #[test]
+    fn priority_tie_is_detected_between_non_adjacent_rules() {
+        // Rules at indices 0 and 3 share the winning priority, with a
+        // lower-priority rule between them that must not mask the tie.
+        let table = RoutingTable {
+            default_role: None,
+            match_mode: RoutingMatchMode::Priority,
+            rules: vec![
+                rule(Some(50), &["qa"], &[], None, "first"),
+                rule(Some(10), &["qa"], &[], None, "noise_low"),
+                rule(Some(20), &["qa"], &[], None, "noise_mid"),
+                rule(Some(50), &["qa"], &[], None, "fourth"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let err = engine
+            .route(&item_with(&["qa"]), &RoutingContext::default())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RoutingError::PriorityTie {
+                first: 0,
+                second: 3,
+                priority: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn priority_none_ties_with_explicit_zero() {
+        // `None` is documented as equivalent to `0`. When the only two
+        // matching rules are `None` and `Some(0)`, they MUST tie.
+        let table = RoutingTable {
+            default_role: None,
+            match_mode: RoutingMatchMode::Priority,
+            rules: vec![
+                rule(None, &["qa"], &[], None, "implicit_zero"),
+                rule(Some(0), &["qa"], &[], None, "explicit_zero"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let err = engine
+            .route(&item_with(&["qa"]), &RoutingContext::default())
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RoutingError::PriorityTie {
+                first: 0,
+                second: 1,
+                priority: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn priority_mode_records_winning_rule_index() {
+        // The decision must report the index of the rule that actually
+        // won, not e.g. the first matching rule scanned.
+        let table = RoutingTable {
+            default_role: None,
+            match_mode: RoutingMatchMode::Priority,
+            rules: vec![
+                rule(Some(10), &["qa"], &[], None, "low"),
+                rule(Some(40), &["qa"], &[], None, "mid"),
+                rule(Some(99), &["qa"], &[], None, "high"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let decision = engine
+            .route(&item_with(&["qa"]), &RoutingContext::default())
+            .unwrap();
+        assert_eq!(
+            decision,
+            RoutingDecision::Matched {
+                role: RoleName::from("high"),
+                rule_index: 2,
+            }
+        );
+    }
+
+    // --- predicate semantics ---------------------------------------------
+
+    #[test]
+    fn labels_any_is_or_across_listed_labels() {
+        // Within `labels_any`, listed labels combine as OR. Either of the
+        // two configured labels present on the work item should match.
+        let when = RoutingMatch {
+            labels_any: vec!["bug".into(), "qa".into()],
+            ..Default::default()
+        };
+        assert!(matches_clause(
+            &when,
+            &item_with(&["qa"]),
+            &RoutingContext::default()
+        ));
+        assert!(matches_clause(
+            &when,
+            &item_with(&["bug"]),
+            &RoutingContext::default()
+        ));
+        assert!(!matches_clause(
+            &when,
+            &item_with(&["docs"]),
+            &RoutingContext::default()
+        ));
+    }
+
+    #[test]
+    fn paths_any_is_or_across_listed_globs_and_changed_paths() {
+        let when = RoutingMatch {
+            paths_any: vec!["docs/**".into(), "infra/**".into()],
+            ..Default::default()
+        };
+        let ctx_match_first = RoutingContext {
+            changed_paths: vec!["docs/intro.md".into()],
+            issue_size: None,
+        };
+        let ctx_match_second = RoutingContext {
+            changed_paths: vec!["src/main.rs".into(), "infra/terraform/main.tf".into()],
+            issue_size: None,
+        };
+        let ctx_no_match = RoutingContext {
+            changed_paths: vec!["src/main.rs".into()],
+            issue_size: None,
+        };
+        assert!(matches_clause(&when, &item_with(&[]), &ctx_match_first));
+        assert!(matches_clause(&when, &item_with(&[]), &ctx_match_second));
+        assert!(!matches_clause(&when, &item_with(&[]), &ctx_no_match));
+    }
+
+    // --- determinism ------------------------------------------------------
+
+    #[test]
+    fn routing_is_deterministic_across_repeated_calls() {
+        // Same inputs → same decision, every time. This is the headline
+        // contract of the engine.
+        let table = RoutingTable {
+            default_role: Some(RoleName::from("platform_lead")),
+            match_mode: RoutingMatchMode::Priority,
+            rules: vec![
+                rule(Some(10), &["qa"], &[], None, "low"),
+                rule(Some(99), &["qa"], &[], None, "high"),
+                rule(Some(50), &["qa"], &[], None, "mid"),
+            ],
+        };
+        let engine = RoutingEngine::new(table);
+        let item = item_with(&["qa"]);
+        let ctx = RoutingContext::default();
+        let first = engine.route(&item, &ctx).unwrap();
+        for _ in 0..16 {
+            assert_eq!(engine.route(&item, &ctx).unwrap(), first);
+        }
+    }
 }
