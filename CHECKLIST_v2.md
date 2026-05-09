@@ -32,7 +32,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add `crates/symphony-state` with SQLite-backed `rusqlite` migrations.
 - [x] Create migrations for `work_items`, `work_item_edges`, `runs`, `workspace_claims`, `handoffs`, `qa_verdicts`, `events`, pending tracker syncs, and budget pauses.
 - [x] Add repository traits for work items and runs.
-- [ ] Add append-only event repository with monotonically increasing sequence.
+- [x] Add append-only event repository with monotonically increasing sequence.
 - [ ] Add transaction helper for state transition + event append.
 - [ ] Add recovery query for expired leases/runs.
 - [ ] Add tests proving state survives process restart using a temp SQLite DB.
