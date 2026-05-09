@@ -22,6 +22,7 @@ pub mod events;
 pub mod followup;
 pub mod handoff;
 pub mod integration;
+pub mod integration_request;
 pub mod parent_close;
 pub mod poll_loop;
 pub mod prompt;
@@ -69,6 +70,10 @@ pub use handoff::{
 pub use integration::{
     IntegrationConflict, IntegrationError, IntegrationId, IntegrationMergeStrategy,
     IntegrationRecord, IntegrationStatus,
+};
+pub use integration_request::{
+    IntegrationChild, IntegrationGates, IntegrationRequestCause, IntegrationRequestError,
+    IntegrationRunRequest, IntegrationWorkspace,
 };
 pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};

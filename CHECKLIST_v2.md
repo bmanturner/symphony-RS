@@ -94,7 +94,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 8 — Integration Owner Flow
 
 - [x] Add integration queue fed by completed child issues or broad issues requiring consolidation.
-- [ ] Implement integration-owner run request with child handoffs and branch/workspace claims.
+- [x] Implement integration-owner run request with child handoffs and branch/workspace claims.
 - [ ] Add integration record and pull request record persistence.
 - [ ] Add git integration operation abstraction in `symphony-workspace` using the git CLI: merge/cherry-pick/shared-branch verification and push.
 - [ ] Add gate requiring all child issues terminal before integration unless explicitly waived.
