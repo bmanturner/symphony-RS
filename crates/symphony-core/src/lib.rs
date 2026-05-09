@@ -39,6 +39,7 @@ pub mod qa_blocker;
 pub mod qa_blocker_policy;
 pub mod qa_request;
 pub mod qa_rework;
+pub mod qa_tick;
 pub mod queue_tick;
 pub mod retry;
 pub mod role;
@@ -132,6 +133,10 @@ pub use qa_request::{
 pub use qa_rework::{
     BlockerReworkInput, BlockerReworkRoute, PriorRunSummary, QaReworkDecision, QaReworkError,
     derive_qa_rework_routing,
+};
+pub use qa_tick::{
+    QaCandidate, QaDispatchQueue, QaDispatchRequest, QaGates, QaQueueError, QaQueueSource,
+    QaQueueTick,
 };
 pub use queue_tick::{QueueTick, QueueTickCadence, ScriptedQueueTick, run_queue_tick_n};
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};

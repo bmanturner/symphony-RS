@@ -130,7 +130,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Add an intake queue tick that wraps the existing tracker-poll/active-set fetch behind the new abstraction without changing observable behavior, with tests proving parity with the current flat poll.
   - [x] Add a specialist queue tick that claims routable specialist work items and emits dispatch requests, with tests for first-match and priority routing parity.
   - [x] Add an integration queue tick that drains `IntegrationQueueRepository` entries respecting gates, with tests for ready/blocked/waived cases.
-  - [ ] Add a QA queue tick that drains `QaQueueRepository` entries respecting gates, with tests for ready/blocked cases.
+  - [x] Add a QA queue tick that drains `QaQueueRepository` entries respecting gates, with tests for ready/blocked cases.
   - [ ] Add a follow-up approval queue tick that drains pending approval-routed follow-ups, with tests for approve/reject paths.
   - [ ] Add a budget-pause queue tick that surfaces durable budget pauses for operator/policy resume, with tests for resume conditions.
   - [ ] Add a recovery queue tick that reconciles expired leases and orphaned workspace claims on each cadence (separate from the operator `recovery` command), with tests for lease expiry reaping.
