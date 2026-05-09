@@ -43,6 +43,7 @@ pub mod qa_request;
 pub mod qa_rework;
 pub mod qa_tick;
 pub mod queue_tick;
+pub mod recovery_tick;
 pub mod retry;
 pub mod role;
 pub mod routing;
@@ -149,6 +150,11 @@ pub use qa_tick::{
     QaQueueTick,
 };
 pub use queue_tick::{QueueTick, QueueTickCadence, ScriptedQueueTick, run_queue_tick_n};
+pub use recovery_tick::{
+    ExpiredLeaseCandidate, OrphanedWorkspaceClaimCandidate, RecoveryDispatchQueue,
+    RecoveryDispatchRequest, RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick,
+    RecoveryRunId, RecoveryWorkspaceClaimId,
+};
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};
 pub use routing::{
