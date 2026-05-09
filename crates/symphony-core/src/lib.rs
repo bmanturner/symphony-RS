@@ -15,6 +15,7 @@ pub mod advisory;
 pub mod agent;
 pub mod blocker;
 pub mod blocker_gate;
+pub mod budget_pause_tick;
 pub mod decomposition;
 pub mod decomposition_applier;
 pub mod decomposition_runner;
@@ -62,6 +63,10 @@ pub use blocker::{
 };
 pub use blocker_gate::{
     BlockerGateError, GateOperation, OpenBlockerSnapshot, check_no_open_blockers, collect_open,
+};
+pub use budget_pause_tick::{
+    BudgetPauseCandidate, BudgetPauseDispatchQueue, BudgetPauseDispatchRequest, BudgetPauseId,
+    BudgetPauseQueueError, BudgetPauseQueueSource, BudgetPauseQueueTick, BudgetPauseStatus,
 };
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
