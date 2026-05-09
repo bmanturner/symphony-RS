@@ -15,6 +15,7 @@ pub mod agent;
 pub mod blocker;
 pub mod event_bus;
 pub mod events;
+pub mod followup;
 pub mod handoff;
 pub mod poll_loop;
 pub mod qa;
@@ -35,6 +36,9 @@ pub use blocker::{
 };
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
+pub use followup::{
+    FollowupError, FollowupId, FollowupIssueRequest, FollowupPolicy, FollowupStatus,
+};
 pub use handoff::{
     BranchOrWorkspace, Handoff, HandoffBlockerRequest, HandoffError, HandoffFollowupRequest,
     ReadyFor,
