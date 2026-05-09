@@ -14,6 +14,7 @@
 mod cli;
 mod logging;
 mod run;
+mod scheduler;
 mod sse;
 mod status;
 mod tui;
