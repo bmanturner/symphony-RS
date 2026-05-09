@@ -183,9 +183,61 @@ Each catalog entry MUST include:
 - allowed tools/toolsets if relevant;
 - required evidence/handoff expectations if role-specific.
 
-## 7. Validation Requirements
+## 7. Role-Scoped Runtime Profile Resolution
 
-Workflow validation MUST fail when:
+Prompt assembly alone is not enough. Symphony MUST also resolve the runtime backend from the role assigned to the run:
+
+1. Select the current role from the run/work item (`assigned_role`, routing result, QA gate, or platform-lead queue).
+2. Resolve `roles.<role>.agent` to an entry in `agents:`.
+3. If the agent profile is concrete, instantiate that backend with the profile's runtime overrides.
+4. If the agent profile is composite, resolve its lead/follower profiles and instantiate each concrete backend with its own overrides.
+5. Fail before dispatch if the role has no runnable agent profile.
+
+`AgentBackendProfile.model` MUST be honored by the backend adapter:
+
+- Claude: pass the configured model as the backend's model flag/field (`--model <model>` for Claude Code today).
+- Codex: pass the configured model through the app-server conversation/session configuration, not by inventing an unsupported shell flag.
+- Hermes: pass the configured model through Hermes' supported non-interactive model/provider interface, or fail validation if the installed Hermes command cannot express the requested model.
+
+`AgentBackendProfile` MUST support structured command arguments rather than shell-string appending:
+
+```yaml
+agents:
+  platform_lead_sonnet:
+    backend: claude
+    command: claude
+    args: []
+    model: claude-sonnet-4-5
+    extra_args: [--mcp-config, .symphony/mcp/platform-lead.json]
+
+  codex_fast:
+    backend: codex
+    command: codex
+    args: [app-server]
+    model: gpt-5-codex
+    extra_args: [--profile, fast]
+
+  hermes_operator:
+    backend: hermes
+    command: hermes
+    args: [chat, --query-file, -, --source, symphony]
+    model: anthropic/claude-sonnet-4
+    extra_args: [--provider, openrouter]
+```
+
+Launch semantics:
+
+- `command` is the executable or shell entrypoint, not an arbitrary concatenated command line.
+- `args` are backend-default/base arguments declared by the profile.
+- `extra_args` are appended after `args` and after Symphony-required protocol flags where backend ordering requires that.
+- The effective argv MUST be visible in debug/operator surfaces with secrets redacted.
+- Backends that still require `bash -lc` internally MUST construct the shell command from structured args with correct quoting; operators should not have to encode quoting in `WORKFLOW.md`.
+
+This section is required for Paperclip parity: two roles using the same backend may need different model/cost/permission/tooling profiles, and Platform Lead assignment quality depends on those runtime profiles being real, not merely documented in the role catalog.
+
+## 8. Validation Requirements
+
+Validation MUST fail when:
 
 - a configured instruction file path escapes the repository/workflow root;
 - a required instruction file is missing;
