@@ -7,9 +7,13 @@ license.workspace = true
 description = "Durable orchestrator state for Symphony-RS v2 (SQLite via rusqlite)."
 
 [dependencies]
+async-trait.workspace = true
 rusqlite.workspace = true
+symphony-core = { path = "../symphony-core" }
 thiserror.workspace = true
+tokio = { workspace = true }
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -21,6 +21,7 @@ pub mod migrations;
 pub mod pull_request_records;
 pub mod qa_queue;
 pub mod repository;
+pub mod run_lease_store;
 pub mod transaction;
 
 use std::path::Path;
