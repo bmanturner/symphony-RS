@@ -12,6 +12,7 @@
 //! phases).
 
 pub mod agent;
+pub mod blocker;
 pub mod event_bus;
 pub mod events;
 pub mod poll_loop;
@@ -26,6 +27,9 @@ pub use agent::{
     AgentControl, AgentError, AgentEvent, AgentEventStream, AgentResult, AgentRunner, AgentSession,
     CompletionReason, RateLimitSnapshot, SessionId, StartSessionParams, ThreadId, TokenUsage,
     TurnId,
+};
+pub use blocker::{
+    Blocker, BlockerError, BlockerId, BlockerOrigin, BlockerSeverity, BlockerStatus, RunRef,
 };
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;

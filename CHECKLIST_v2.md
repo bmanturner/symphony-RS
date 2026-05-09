@@ -41,7 +41,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [x] Add `WorkItem`, `WorkItemStatusClass`, and `WorkItemId` to `symphony-core`, including tracker-state-to-status-class mapping and case-insensitive raw state handling.
 - [x] Add `RoleKind`, `RoleContext`, and role authority flags.
-- [ ] Add `Blocker`, `BlockerStatus`, and blocker edge invariants.
+- [x] Add `Blocker`, `BlockerStatus`, and blocker edge invariants.
 - [ ] Add `Handoff` and `ReadyFor` structured output type.
 - [ ] Add `QaVerdict`, `QaEvidence`, and acceptance-criteria trace types.
 - [ ] Add `FollowupIssueRequest` and `FollowupPolicy` types.
