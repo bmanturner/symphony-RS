@@ -1191,6 +1191,191 @@ impl ExistingWorktreeClaimer {
     }
 }
 
+/// Provisioner for the [`ClaimStrategy::SharedBranch`] strategy.
+///
+/// Hands every claimant the same canonical worktree path and the same
+/// shared branch. Used by workflows that explicitly accept multiple work
+/// items committing to a single branch — typically the integration
+/// owner's consolidation worktree where children land directly rather
+/// than being cherry-picked across branches (SPEC v2 §5.10
+/// `merge_strategy: shared_branch`).
+///
+/// Distinct from [`ExistingWorktreeClaimer`] in two semantic ways even
+/// though both reuse a pre-existing checkout:
+///
+/// 1. The branch is *not* optional. Sharing without a named shared
+///    branch is meaningless, so [`Self::new`] takes `branch: String`
+///    (not `Option<String>`) and every claim verifies the worktree's
+///    `HEAD` matches it.
+/// 2. [`CleanupPolicy::RemoveAfterRun`] is rejected at construction.
+///    Removing a shared workspace after a single run would clobber any
+///    sibling work item still operating on it; that is a configuration
+///    error worth failing loudly rather than data-loss-by-default.
+///
+/// Like [`ExistingWorktreeClaimer`], `created_now` is always `false` and
+/// `base_ref` is always `None` — neither concept applies to a
+/// pre-provisioned shared worktree. The owner field reflects the
+/// *current* claimant; downstream queues are expected to consult durable
+/// state ([`symphony_state` work item edges]) for the full set of
+/// siblings sharing the branch.
+///
+/// SPEC v2 §5.9 requires `branching.allow_same_branch_for_children:
+/// true` whenever this strategy is configured; that pairing is enforced
+/// by `symphony-config` at load time, not here, so the claimer trusts
+/// its caller to have already validated the workflow.
+#[derive(Debug, Clone)]
+pub struct SharedBranchClaimer {
+    path: PathBuf,
+    branch: String,
+    cleanup: CleanupPolicy,
+}
+
+impl SharedBranchClaimer {
+    /// Construct a claimer pointing at a shared worktree on `branch`.
+    ///
+    /// `path` must already exist and be a directory; the git "is inside
+    /// a work tree" assertion is deferred to [`Self::claim`] because it
+    /// is a runtime invariant (the operator may reset the worktree
+    /// between configuration and the first claim).
+    ///
+    /// `branch` is the shared branch every claim verifies the worktree
+    /// is checked out on. Empty input is rejected — an empty shared
+    /// branch is a configuration bug, not a "match anything" signal.
+    ///
+    /// `cleanup` accepts [`CleanupPolicy::RetainUntilDone`] or
+    /// [`CleanupPolicy::RetainAlways`]. [`CleanupPolicy::RemoveAfterRun`]
+    /// is rejected because reclaiming a shared workspace at run end
+    /// would corrupt any sibling work still using it; the operator must
+    /// pick a retention-style policy explicitly.
+    pub fn new(
+        path: impl AsRef<Path>,
+        branch: impl Into<String>,
+        cleanup: CleanupPolicy,
+    ) -> WorkspaceResult<Self> {
+        let path = path.as_ref();
+        if !path.is_dir() {
+            return Err(WorkspaceError::InvalidRoot(format!(
+                "shared worktree {} does not exist or is not a directory",
+                path.display()
+            )));
+        }
+        let branch = branch.into();
+        if branch.trim().is_empty() {
+            return Err(WorkspaceError::InvalidRoot(
+                "shared_branch strategy requires a non-empty branch name".into(),
+            ));
+        }
+        if matches!(cleanup, CleanupPolicy::RemoveAfterRun) {
+            return Err(WorkspaceError::InvalidRoot(
+                "shared_branch strategy is incompatible with cleanup=remove_after_run; \
+                 sibling claims would be destroyed mid-run"
+                    .into(),
+            ));
+        }
+        let path = std::fs::canonicalize(path).map_err(|e| {
+            WorkspaceError::InvalidRoot(format!("canonicalize shared worktree: {e}"))
+        })?;
+        Ok(Self {
+            path,
+            branch,
+            cleanup,
+        })
+    }
+
+    /// Canonical worktree path the claimer hands back on every claim.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Shared branch every claim verifies the worktree is checked out on.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Verify the shared worktree and return a [`WorkspaceClaim`] for
+    /// `identifier`.
+    ///
+    /// Behaviour mirrors [`ExistingWorktreeClaimer::claim`] but the
+    /// required-branch check is unconditional and the strategy stamp is
+    /// [`ClaimStrategy::SharedBranch`]:
+    ///
+    /// 1. Sanitise `identifier` (rejects `..` / `.` / empty so the
+    ///    owner field cannot smuggle a hostile string downstream).
+    /// 2. Run `git -C <path> rev-parse --is-inside-work-tree` and
+    ///    require `true`.
+    /// 3. Run `git -C <path> rev-parse --abbrev-ref HEAD` and require
+    ///    the result to equal [`Self::branch`].
+    ///
+    /// Concurrent claims for distinct identifiers are explicitly legal
+    /// — that is the whole point of the strategy — and each returns the
+    /// same `path` and `branch`. `verification` stays
+    /// [`VerificationStatus::Pending`]; the generic pre-launch verifier
+    /// from later checklist items still runs against the claim.
+    pub async fn claim(
+        &self,
+        identifier: &str,
+        work_item_id: Option<i64>,
+    ) -> WorkspaceResult<WorkspaceClaim> {
+        let safe = safe_component(identifier)?;
+
+        let inside = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .await
+            .map_err(|e| WorkspaceError::Git(format!("spawn git rev-parse: {e}")))?;
+        if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+            return Err(WorkspaceError::Git(format!(
+                "{} is not a git working tree (rev-parse status {}, stderr: {})",
+                self.path.display(),
+                inside.status,
+                String::from_utf8_lossy(&inside.stderr).trim()
+            )));
+        }
+
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .map_err(|e| WorkspaceError::Git(format!("spawn git rev-parse HEAD: {e}")))?;
+        if !head.status.success() {
+            return Err(WorkspaceError::Git(format!(
+                "git rev-parse --abbrev-ref HEAD in {} failed ({}): {}",
+                self.path.display(),
+                head.status,
+                String::from_utf8_lossy(&head.stderr).trim()
+            )));
+        }
+        let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        if current != self.branch {
+            return Err(WorkspaceError::Git(format!(
+                "shared worktree {} is on branch {:?} but shared_branch strategy requires {:?}",
+                self.path.display(),
+                current,
+                self.branch
+            )));
+        }
+
+        Ok(WorkspaceClaim {
+            path: self.path.clone(),
+            strategy: ClaimStrategy::SharedBranch,
+            base_ref: None,
+            branch: Some(self.branch.clone()),
+            owner: Some(ClaimOwner {
+                identifier: safe,
+                work_item_id,
+            }),
+            cleanup: self.cleanup,
+            verification: VerificationReport::default(),
+            created_now: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2364,5 +2549,198 @@ mod tests {
         assert_eq!(second.owner.as_ref().unwrap().identifier, "ENG-2");
         assert!(!first.created_now);
         assert!(!second.created_now);
+    }
+
+    // ----- SharedBranchClaimer (Phase 6) -----------------------------------
+
+    /// Constructor must reject a missing path: an operator pointing the
+    /// shared strategy at a typo-ed worktree is a deployment-config bug,
+    /// surfaced loudly rather than at every claim attempt.
+    #[test]
+    fn shared_branch_claimer_rejects_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let err = SharedBranchClaimer::new(
+            tmp.path().join("nope"),
+            "symphony/integration",
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Empty branch name is a configuration error, not a "match
+    /// anything" wildcard. Rejecting it at construction prevents the
+    /// rev-parse comparison from silently accepting any HEAD value.
+    #[test]
+    fn shared_branch_claimer_rejects_empty_branch() {
+        let tmp = TempDir::new().unwrap();
+        let err =
+            SharedBranchClaimer::new(tmp.path(), "  ", CleanupPolicy::RetainAlways).unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// `cleanup=remove_after_run` is incompatible with sharing because
+    /// reclaiming the directory at one run's end would clobber sibling
+    /// work items still operating on the shared branch. Reject it at
+    /// construction so the data-loss path is structurally impossible.
+    #[test]
+    fn shared_branch_claimer_rejects_remove_after_run_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let err = SharedBranchClaimer::new(
+            tmp.path(),
+            "symphony/integration",
+            CleanupPolicy::RemoveAfterRun,
+        )
+        .unwrap_err();
+        match err {
+            WorkspaceError::InvalidRoot(detail) => {
+                assert!(
+                    detail.contains("remove_after_run"),
+                    "error must mention the offending policy, got: {detail}"
+                );
+            }
+            other => panic!("expected InvalidRoot, got {other:?}"),
+        }
+    }
+
+    /// Happy path: a worktree on the configured shared branch yields a
+    /// claim whose envelope reflects the strategy. `created_now` must
+    /// stay `false` (the shared worktree is operator-provisioned), and
+    /// `base_ref` must be `None` (no per-claim base ref applies).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_branch_claim_passes_branch_check() {
+        let repo = init_repo_with_branches("symphony/integration").await;
+        let claimer = SharedBranchClaimer::new(
+            repo.path(),
+            "symphony/integration",
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let claim = claimer.claim("ENG-7", Some(11)).await.unwrap();
+
+        assert_eq!(claim.path, claimer.path());
+        assert_eq!(claim.strategy, ClaimStrategy::SharedBranch);
+        assert_eq!(claim.base_ref, None);
+        assert_eq!(claim.branch.as_deref(), Some("symphony/integration"));
+        let owner = claim.owner.as_ref().expect("owner present");
+        assert_eq!(owner.identifier, "ENG-7");
+        assert_eq!(owner.work_item_id, Some(11));
+        assert_eq!(claim.cleanup, CleanupPolicy::RetainAlways);
+        assert_eq!(claim.verification.status, VerificationStatus::Pending);
+        assert!(
+            !claim.created_now,
+            "shared worktree never reports created_now"
+        );
+    }
+
+    /// Branch mismatch is unconditionally fatal — there is no
+    /// `required_branch = None` escape hatch like
+    /// [`ExistingWorktreeClaimer`] offers, because sharing without a
+    /// known branch is meaningless.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_branch_claim_rejects_branch_mismatch() {
+        let repo = init_repo_with_branches("feature/x").await;
+        let claimer = SharedBranchClaimer::new(
+            repo.path(),
+            "symphony/integration",
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let err = claimer.claim("ENG-7", None).await.unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Git(msg)
+                if msg.contains("feature/x") && msg.contains("symphony/integration")),
+            "expected Git error naming both branches, got {err:?}"
+        );
+    }
+
+    /// Pointing the strategy at a non-git directory fails at claim time
+    /// with a [`WorkspaceError::Git`]. The constructor only verifies the
+    /// path is a directory; the working-tree assertion is a runtime
+    /// invariant.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_branch_claim_rejects_non_git_directory() {
+        let tmp = TempDir::new().unwrap();
+        let claimer = SharedBranchClaimer::new(
+            tmp.path(),
+            "symphony/integration",
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let err = claimer.claim("ENG-7", None).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Git(_)));
+    }
+
+    /// Reserved component (`..`) must be rejected before any git
+    /// invocation, mirroring the other claimers' identifier sanitisation
+    /// contract.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_branch_claim_rejects_dot_dot_identifier() {
+        let repo = init_repo_with_branches("symphony/integration").await;
+        let claimer = SharedBranchClaimer::new(
+            repo.path(),
+            "symphony/integration",
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let err = claimer.claim("..", None).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Multiple distinct identifiers claiming the same shared worktree
+    /// is the strategy's whole point: each succeeds, each receives the
+    /// same `path` and `branch`, and the `owner` field reflects the
+    /// individual claimant for downstream attribution.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_branch_claim_supports_concurrent_siblings() {
+        let repo = init_repo_with_branches("symphony/integration").await;
+        let claimer = SharedBranchClaimer::new(
+            repo.path(),
+            "symphony/integration",
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let first = claimer.claim("ENG-1", Some(1)).await.unwrap();
+        let second = claimer.claim("ENG-2", Some(2)).await.unwrap();
+
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.branch, second.branch);
+        assert_eq!(first.strategy, ClaimStrategy::SharedBranch);
+        assert_eq!(second.strategy, ClaimStrategy::SharedBranch);
+        assert_eq!(first.owner.as_ref().unwrap().identifier, "ENG-1");
+        assert_eq!(second.owner.as_ref().unwrap().identifier, "ENG-2");
+        assert_eq!(first.owner.as_ref().unwrap().work_item_id, Some(1));
+        assert_eq!(second.owner.as_ref().unwrap().work_item_id, Some(2));
+        assert!(!first.created_now);
+        assert!(!second.created_now);
+    }
+
+    /// `RetainUntilDone` is the documented compromise cleanup for
+    /// shared workspaces: still allowed, in case operators want
+    /// reclamation once the integration owner's work item terminates
+    /// and all siblings are settled.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shared_branch_claim_accepts_retain_until_done() {
+        let repo = init_repo_with_branches("symphony/integration").await;
+        let claimer = SharedBranchClaimer::new(
+            repo.path(),
+            "symphony/integration",
+            CleanupPolicy::RetainUntilDone,
+        )
+        .unwrap();
+
+        let claim = claimer.claim("ENG-9", None).await.unwrap();
+        assert_eq!(claim.cleanup, CleanupPolicy::RetainUntilDone);
     }
 }

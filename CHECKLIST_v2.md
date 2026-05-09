@@ -74,7 +74,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Replace `WorkspaceManager::ensure` / path-only workspace return with `WorkspaceClaim` containing path, strategy, base ref, branch, owner, cleanup policy, and verification report.
 - [x] Add `git_worktree` strategy with branch template expansion using the git adapter.
 - [x] Add `existing_worktree` strategy with required branch verification.
-- [ ] Add shared integration branch strategy for explicit same-branch workflows.
+- [x] Add shared integration branch strategy for explicit same-branch workflows.
 - [ ] Add cwd verification immediately before agent launch.
 - [ ] Add git branch/ref verification immediately before mutation-capable runs.
 - [ ] Add clean-tree policy enforcement.
