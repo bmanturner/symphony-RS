@@ -29,6 +29,7 @@ pub mod poll_loop;
 pub mod prompt;
 pub mod pull_request;
 pub mod qa;
+pub mod qa_request;
 pub mod retry;
 pub mod role;
 pub mod routing;
@@ -93,6 +94,9 @@ pub use pull_request::{
 pub use qa::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, QaError, QaEvidence, QaOutcome, QaVerdict,
     QaVerdictId,
+};
+pub use qa_request::{
+    QaDraftPullRequest, QaRequestCause, QaRequestError, QaRunRequest, QaWorkspace,
 };
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};

@@ -95,7 +95,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [x] Add integration queue fed by completed child issues or broad issues requiring consolidation.
 - [x] Implement integration-owner run request with child handoffs and branch/workspace claims.
-- [ ] Add integration record and pull request record persistence.
+- [x] Add integration record and pull request record persistence.
   - [x] Add `integration_records` table migration and `IntegrationRecordRepository` to `symphony-state`.
   - [x] Add `PullRequestRecord` domain type to `symphony-core` and `pull_request_records` table migration plus `PullRequestRecordRepository` to `symphony-state`.
 - [x] Add git integration operation abstraction in `symphony-workspace` using the git CLI: merge/cherry-pick/shared-branch verification and push.
@@ -106,7 +106,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 9 — QA Gate Flow
 
 - [x] Add QA queue fed by draft PRs/integration handoffs or direct specialist handoffs for simple issues.
-- [ ] Implement QA run request with draft PR ref, final branch/workspace, acceptance trace, changed files, CI/check status, and prior handoffs.
+- [x] Implement QA run request with draft PR ref, final branch/workspace, acceptance trace, changed files, CI/check status, and prior handoffs.
 - [ ] Add QA verdict persistence (widen `qa_verdicts.verdict` CHECK to the five SPEC §4.9 verdicts and persist `role`, `waiver_role`, `reason` alongside the existing evidence/trace columns).
 - [ ] Add blocker creation from QA verdict when failures are found.
 - [ ] Add policy: QA blockers block parent completion by default; QA waivers require a configured waiver role and reason.
