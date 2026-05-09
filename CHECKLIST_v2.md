@@ -40,7 +40,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 3 — Core Domain Types
 
 - [x] Add `WorkItem`, `WorkItemStatusClass`, and `WorkItemId` to `symphony-core`, including tracker-state-to-status-class mapping and case-insensitive raw state handling.
-- [ ] Add `RoleKind`, `RoleContext`, and role authority flags.
+- [x] Add `RoleKind`, `RoleContext`, and role authority flags.
 - [ ] Add `Blocker`, `BlockerStatus`, and blocker edge invariants.
 - [ ] Add `Handoff` and `ReadyFor` structured output type.
 - [ ] Add `QaVerdict`, `QaEvidence`, and acceptance-criteria trace types.
