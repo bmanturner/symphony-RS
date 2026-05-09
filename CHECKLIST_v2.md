@@ -139,7 +139,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Add `SpecialistRunner` that drains `SpecialistDispatchQueue` and invokes the existing `Dispatcher` trait under a max-concurrency `Semaphore`, with parking for capacity-deferred requests, missing-issue counting, parent-cancellation propagation, and reap-completed observability.
   - [x] Add an `IntegrationDispatchRunner` over `IntegrationDispatchQueue` mirroring the specialist runner's bounded-concurrency contract, with tests for ready/blocked candidates.
   - [x] Add a `QaDispatchRunner` over `QaDispatchQueue` mirroring the runner contract, with tests for ready/blocked candidates and waiver-routed verdicts.
-  - [ ] Add a `FollowupApprovalRunner` and a `BudgetPauseRunner` (operator-decision queues) mirroring the runner contract, with tests for approve/reject and resume paths.
+  - [x] Add a `FollowupApprovalRunner` and a `BudgetPauseRunner` (operator-decision queues) mirroring the runner contract, with tests for approve/reject and resume paths.
   - [ ] Add a `RecoveryRunner` that drains `RecoveryDispatchQueue` with parity tests against the flat-loop reconciliation contract.
   - [ ] Wire the per-queue runners and the new ticks into `symphony-cli/src/run.rs` behind `SchedulerV2`, retiring `PollLoop` as the production entry point and migrating SIGINT drain semantics to the runners' reap surface.
 - [ ] Add durable leases for running work.

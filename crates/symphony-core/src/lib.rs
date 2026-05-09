@@ -15,6 +15,7 @@ pub mod advisory;
 pub mod agent;
 pub mod blocker;
 pub mod blocker_gate;
+pub mod budget_pause_runner;
 pub mod budget_pause_tick;
 pub mod decomposition;
 pub mod decomposition_applier;
@@ -22,6 +23,7 @@ pub mod decomposition_runner;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
+pub mod followup_approval_runner;
 pub mod followup_approval_tick;
 pub mod followup_policy;
 pub mod followup_request;
@@ -69,6 +71,10 @@ pub use blocker::{
 pub use blocker_gate::{
     BlockerGateError, GateOperation, OpenBlockerSnapshot, check_no_open_blockers, collect_open,
 };
+pub use budget_pause_runner::{
+    BudgetPauseDispatchOutcome, BudgetPauseDispatchReason, BudgetPauseDispatcher,
+    BudgetPauseRunReport, BudgetPauseRunner,
+};
 pub use budget_pause_tick::{
     BudgetPauseCandidate, BudgetPauseDispatchQueue, BudgetPauseDispatchRequest, BudgetPauseId,
     BudgetPauseQueueError, BudgetPauseQueueSource, BudgetPauseQueueTick, BudgetPauseStatus,
@@ -90,6 +96,10 @@ pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use followup::{
     FollowupError, FollowupId, FollowupIssueRequest, FollowupLink, FollowupPolicy, FollowupStatus,
+};
+pub use followup_approval_runner::{
+    FollowupApprovalDispatchOutcome, FollowupApprovalDispatchReason, FollowupApprovalDispatcher,
+    FollowupApprovalRunReport, FollowupApprovalRunner,
 };
 pub use followup_approval_tick::{
     FollowupApprovalCandidate, FollowupApprovalDispatchQueue, FollowupApprovalDispatchRequest,
