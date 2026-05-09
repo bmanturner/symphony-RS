@@ -73,7 +73,7 @@ pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use prompt::{
     PromptBlocker, PromptChild, PromptContext, PromptIssue, PromptParent, PromptWorkspace,
-    default_handoff_output_schema, render as render_prompt,
+    RenderError, default_handoff_output_schema, render as render_prompt,
 };
 pub use qa::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, QaError, QaEvidence, QaOutcome, QaVerdict,

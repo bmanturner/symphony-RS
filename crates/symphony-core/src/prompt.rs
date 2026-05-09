@@ -17,12 +17,11 @@
 //!
 //! This module supplies the typed [`PromptContext`] envelope that
 //! collects those fields and a [`render`] function that fills
-//! `{{var}}` placeholders against it. The substitution surface is the
-//! same shape as the legacy CLI renderer in `symphony-cli::run` so that
-//! existing fixtures keep working — the next checklist item swaps the
-//! mechanic for a strict `{{path.to.value}}` renderer that fails on
-//! unknown variables. Holding the *shape* steady here lets that swap
-//! land as a pure mechanism change.
+//! `{{path.to.value}}` placeholders against it. The renderer is
+//! deliberately strict: an unknown path, an unclosed `{{`, or an
+//! empty placeholder is an error. Operators get a loud failure at
+//! prompt-build time rather than an agent prompt that silently
+//! contains literal `{{role.bogus}}` text.
 //!
 //! ## Substitution surface
 //!
@@ -49,9 +48,10 @@
 //! * `{{blockers}}` — `- [{severity}] {reason}`.
 //! * `{{acceptance_criteria}}` — `- {item}`.
 //!
-//! Placeholders not listed above are left untouched in the rendered
-//! output, mirroring the legacy renderer. The next checklist item
-//! tightens this contract.
+//! Any placeholder that does not resolve to one of the paths above
+//! returns [`RenderError::UnknownPath`]. Unclosed `{{` returns
+//! [`RenderError::Malformed`]. Empty placeholders (e.g. `{{}}`)
+//! return [`RenderError::InvalidPath`].
 
 use std::path::PathBuf;
 
@@ -255,114 +255,109 @@ pub fn default_handoff_output_schema() -> String {
     .to_string()
 }
 
-/// Substitute `{{var}}` placeholders in `template` against `ctx`.
-///
-/// See the module docs for the full substitution surface. Unknown
-/// placeholders are left untouched; the next checklist item swaps this
-/// for a strict renderer that fails on unknown keys.
-pub fn render(template: &str, ctx: &PromptContext) -> String {
-    let mut out = template.to_string();
-
-    for (key, value) in single_value_pairs(ctx) {
-        if out.contains(&key) {
-            out = out.replace(&key, &value);
-        }
-    }
-
-    let lists: [(&str, String); 3] = [
-        ("{{children}}", render_children(&ctx.children)),
-        ("{{blockers}}", render_blockers(&ctx.blockers)),
-        (
-            "{{acceptance_criteria}}",
-            render_acceptance(&ctx.acceptance_criteria),
-        ),
-    ];
-    for (key, value) in lists {
-        if out.contains(key) {
-            out = out.replace(key, &value);
-        }
-    }
-
-    out
+/// Errors raised by [`render`] when a template cannot be expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderError {
+    /// The template references a path that the renderer does not know
+    /// how to resolve against [`PromptContext`].
+    UnknownPath(String),
+    /// The template has a `{{` that is never closed by `}}`.
+    Malformed(String),
+    /// A placeholder resolved to an empty path (e.g. `{{}}` or
+    /// `{{ }}`) or contained empty path segments.
+    InvalidPath(String),
 }
 
-fn single_value_pairs(ctx: &PromptContext) -> Vec<(String, String)> {
-    let issue = &ctx.issue;
-    let mut pairs = vec![
-        ("{{identifier}}".to_string(), issue.identifier.clone()),
-        ("{{title}}".to_string(), issue.title.clone()),
-        (
-            "{{description}}".to_string(),
-            issue.description.clone().unwrap_or_default(),
-        ),
-        ("{{state}}".to_string(), issue.state.clone()),
-        (
-            "{{branch_name}}".to_string(),
-            issue.branch_name.clone().unwrap_or_default(),
-        ),
-        ("{{url}}".to_string(), issue.url.clone().unwrap_or_default()),
-        (
-            "{{output_schema}}".to_string(),
-            ctx.output_schema.clone().unwrap_or_default(),
-        ),
-    ];
-
-    if let Some(role) = &ctx.role {
-        pairs.push(("{{role.name}}".to_string(), role.name.to_string()));
-        pairs.push(("{{role.kind}}".to_string(), role.kind.to_string()));
-        pairs.push((
-            "{{role.authority}}".to_string(),
-            render_authority(&role.authority),
-        ));
-    } else {
-        pairs.push(("{{role.name}}".to_string(), String::new()));
-        pairs.push(("{{role.kind}}".to_string(), String::new()));
-        pairs.push(("{{role.authority}}".to_string(), String::new()));
-    }
-
-    if let Some(ws) = &ctx.workspace {
-        pairs.push((
-            "{{workspace.path}}".to_string(),
-            ws.path.display().to_string(),
-        ));
-        pairs.push(("{{workspace.strategy}}".to_string(), ws.strategy.clone()));
-        pairs.push((
-            "{{workspace.branch}}".to_string(),
-            ws.branch.clone().unwrap_or_default(),
-        ));
-        pairs.push((
-            "{{workspace.base_ref}}".to_string(),
-            ws.base_ref.clone().unwrap_or_default(),
-        ));
-    } else {
-        for k in [
-            "{{workspace.path}}",
-            "{{workspace.strategy}}",
-            "{{workspace.branch}}",
-            "{{workspace.base_ref}}",
-        ] {
-            pairs.push((k.to_string(), String::new()));
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenderError::UnknownPath(p) => write!(f, "unknown prompt placeholder: {{{{{p}}}}}"),
+            RenderError::Malformed(s) => write!(f, "unclosed prompt placeholder near: {s}"),
+            RenderError::InvalidPath(p) => write!(f, "invalid prompt placeholder path: {p:?}"),
         }
     }
+}
 
-    if let Some(p) = &ctx.parent {
-        pairs.push(("{{parent.identifier}}".to_string(), p.identifier.clone()));
-        pairs.push(("{{parent.title}}".to_string(), p.title.clone()));
-        pairs.push((
-            "{{parent.url}}".to_string(),
-            p.url.clone().unwrap_or_default(),
-        ));
-    } else {
-        for k in [
-            "{{parent.identifier}}",
-            "{{parent.title}}",
-            "{{parent.url}}",
-        ] {
-            pairs.push((k.to_string(), String::new()));
+impl std::error::Error for RenderError {}
+
+/// Strictly substitute `{{path.to.value}}` placeholders in `template`
+/// against `ctx`.
+///
+/// See the module docs for the resolvable path surface. Anything else
+/// is an error: unknown paths return [`RenderError::UnknownPath`],
+/// unclosed `{{` returns [`RenderError::Malformed`], and empty paths
+/// return [`RenderError::InvalidPath`].
+pub fn render(template: &str, ctx: &PromptContext) -> Result<String, RenderError> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            return Err(RenderError::Malformed(rest[start..].to_string()));
+        };
+        let raw = &after_open[..end];
+        let path = raw.trim();
+        if path.is_empty() {
+            return Err(RenderError::InvalidPath(raw.to_string()));
         }
+        if path.split('.').any(|seg| seg.trim().is_empty()) {
+            return Err(RenderError::InvalidPath(path.to_string()));
+        }
+        out.push_str(&resolve_path(ctx, path)?);
+        rest = &after_open[end + 2..];
     }
+    out.push_str(rest);
+    Ok(out)
+}
 
-    pairs
+fn resolve_path(ctx: &PromptContext, path: &str) -> Result<String, RenderError> {
+    let mut segs = path.split('.');
+    let head = segs.next().expect("non-empty path checked by caller");
+    let tail: Vec<&str> = segs.collect();
+    match (head, tail.as_slice()) {
+        ("identifier", []) => Ok(ctx.issue.identifier.clone()),
+        ("title", []) => Ok(ctx.issue.title.clone()),
+        ("description", []) => Ok(ctx.issue.description.clone().unwrap_or_default()),
+        ("state", []) => Ok(ctx.issue.state.clone()),
+        ("branch_name", []) => Ok(ctx.issue.branch_name.clone().unwrap_or_default()),
+        ("url", []) => Ok(ctx.issue.url.clone().unwrap_or_default()),
+        ("output_schema", []) => Ok(ctx.output_schema.clone().unwrap_or_default()),
+        ("role", [field]) => {
+            let role = ctx.role.as_ref();
+            match *field {
+                "name" => Ok(role.map(|r| r.name.to_string()).unwrap_or_default()),
+                "kind" => Ok(role.map(|r| r.kind.to_string()).unwrap_or_default()),
+                "authority" => Ok(role
+                    .map(|r| render_authority(&r.authority))
+                    .unwrap_or_default()),
+                _ => Err(RenderError::UnknownPath(path.to_string())),
+            }
+        }
+        ("workspace", [field]) => {
+            let ws = ctx.workspace.as_ref();
+            match *field {
+                "path" => Ok(ws.map(|w| w.path.display().to_string()).unwrap_or_default()),
+                "strategy" => Ok(ws.map(|w| w.strategy.clone()).unwrap_or_default()),
+                "branch" => Ok(ws.and_then(|w| w.branch.clone()).unwrap_or_default()),
+                "base_ref" => Ok(ws.and_then(|w| w.base_ref.clone()).unwrap_or_default()),
+                _ => Err(RenderError::UnknownPath(path.to_string())),
+            }
+        }
+        ("parent", [field]) => {
+            let p = ctx.parent.as_ref();
+            match *field {
+                "identifier" => Ok(p.map(|p| p.identifier.clone()).unwrap_or_default()),
+                "title" => Ok(p.map(|p| p.title.clone()).unwrap_or_default()),
+                "url" => Ok(p.and_then(|p| p.url.clone()).unwrap_or_default()),
+                _ => Err(RenderError::UnknownPath(path.to_string())),
+            }
+        }
+        ("children", []) => Ok(render_children(&ctx.children)),
+        ("blockers", []) => Ok(render_blockers(&ctx.blockers)),
+        ("acceptance_criteria", []) => Ok(render_acceptance(&ctx.acceptance_criteria)),
+        _ => Err(RenderError::UnknownPath(path.to_string())),
+    }
 }
 
 fn render_authority(a: &RoleAuthority) -> String {
@@ -432,7 +427,7 @@ mod tests {
     fn for_issue_carries_every_issue_field_into_the_substitution_surface() {
         let ctx = PromptContext::for_issue(&issue());
         let tpl = "Issue {{identifier}}: {{title}}\nState: {{state}}\nBranch: {{branch_name}}\nURL: {{url}}\n{{description}}";
-        let out = render(tpl, &ctx);
+        let out = render(tpl, &ctx).unwrap();
         assert!(out.contains("Issue ENG-7: Add fizz to buzz"));
         assert!(out.contains("State: Todo"));
         assert!(out.contains("Branch: feature/eng-7"));
@@ -447,15 +442,43 @@ mod tests {
         i.branch_name = None;
         i.url = None;
         let ctx = PromptContext::for_issue(&i);
-        let out = render("[{{description}}][{{branch_name}}][{{url}}]", &ctx);
+        let out = render("[{{description}}][{{branch_name}}][{{url}}]", &ctx).unwrap();
         assert_eq!(out, "[][][]");
     }
 
     #[test]
-    fn unknown_placeholders_are_left_untouched() {
+    fn unknown_top_level_placeholder_returns_error() {
         let ctx = PromptContext::for_issue(&issue());
-        let out = render("hello {{nope}} {{role.bogus}}", &ctx);
-        assert_eq!(out, "hello {{nope}} {{role.bogus}}");
+        let err = render("hello {{nope}}", &ctx).unwrap_err();
+        assert_eq!(err, RenderError::UnknownPath("nope".into()));
+    }
+
+    #[test]
+    fn unknown_subfield_returns_error() {
+        let ctx = PromptContext::for_issue(&issue());
+        let err = render("hello {{role.bogus}}", &ctx).unwrap_err();
+        assert_eq!(err, RenderError::UnknownPath("role.bogus".into()));
+    }
+
+    #[test]
+    fn unclosed_placeholder_returns_malformed_error() {
+        let ctx = PromptContext::for_issue(&issue());
+        let err = render("hello {{identifier", &ctx).unwrap_err();
+        assert!(matches!(err, RenderError::Malformed(_)));
+    }
+
+    #[test]
+    fn empty_placeholder_returns_invalid_path_error() {
+        let ctx = PromptContext::for_issue(&issue());
+        let err = render("hello {{ }}", &ctx).unwrap_err();
+        assert!(matches!(err, RenderError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn whitespace_around_path_is_trimmed() {
+        let ctx = PromptContext::for_issue(&issue());
+        let out = render("[{{  identifier  }}]", &ctx).unwrap();
+        assert_eq!(out, "[ENG-7]");
     }
 
     #[test]
@@ -465,11 +488,10 @@ mod tests {
         let out = render(
             "role={{role.name}} kind={{role.kind}} grants=[{{role.authority}}]",
             &ctx,
-        );
+        )
+        .unwrap();
         assert!(out.contains("role=platform_lead"));
         assert!(out.contains("kind=integration_owner"));
-        // Integration owner defaults grant the four parent-ownership
-        // authorities, in the rendered order.
         assert!(
             out.contains("grants=[can_decompose, can_assign, can_request_qa, can_close_parent]"),
             "got: {out}"
@@ -482,7 +504,8 @@ mod tests {
         let out = render(
             "role=[{{role.name}}] kind=[{{role.kind}}] grants=[{{role.authority}}]",
             &ctx,
-        );
+        )
+        .unwrap();
         assert_eq!(out, "role=[] kind=[] grants=[]");
     }
 
@@ -498,7 +521,8 @@ mod tests {
         let out = render(
             "ws={{workspace.path}} s={{workspace.strategy}} b={{workspace.branch}} base={{workspace.base_ref}}",
             &ctx,
-        );
+        )
+        .unwrap();
         assert_eq!(
             out,
             "ws=/tmp/wt/eng-7 s=git_worktree b=symphony/eng-7 base=main"
@@ -511,7 +535,8 @@ mod tests {
         let out = render(
             "[{{workspace.path}}][{{workspace.strategy}}][{{workspace.branch}}][{{workspace.base_ref}}]",
             &ctx,
-        );
+        )
+        .unwrap();
         assert_eq!(out, "[][][][]");
     }
 
@@ -525,7 +550,8 @@ mod tests {
         let out = render(
             "parent={{parent.identifier}}|{{parent.title}}|{{parent.url}}",
             &ctx,
-        );
+        )
+        .unwrap();
         assert_eq!(out, "parent=ENG-1|Broad parent|https://example.test/eng-1");
     }
 
@@ -543,7 +569,7 @@ mod tests {
                 status: "In Progress".into(),
             },
         ]);
-        let out = render("children:\n{{children}}", &ctx);
+        let out = render("children:\n{{children}}", &ctx).unwrap();
         assert_eq!(
             out,
             "children:\n- ENG-8: Child A [Done]\n- ENG-9: Child B [In Progress]"
@@ -553,7 +579,7 @@ mod tests {
     #[test]
     fn empty_children_list_renders_as_empty_string() {
         let ctx = PromptContext::for_issue(&issue());
-        let out = render("children:[{{children}}]", &ctx);
+        let out = render("children:[{{children}}]", &ctx).unwrap();
         assert_eq!(out, "children:[]");
     }
 
@@ -573,7 +599,7 @@ mod tests {
                 severity: BlockerSeverity::Medium,
             },
         ]);
-        let out = render("blockers:\n{{blockers}}", &ctx);
+        let out = render("blockers:\n{{blockers}}", &ctx).unwrap();
         assert_eq!(
             out,
             "blockers:\n- [high] schema not approved\n- [medium] vendor outage"
@@ -584,7 +610,7 @@ mod tests {
     fn acceptance_criteria_render_as_bullet_list() {
         let ctx = PromptContext::for_issue(&issue())
             .with_acceptance_criteria(vec!["tests pass".into(), "no clippy warnings".into()]);
-        let out = render("ac:\n{{acceptance_criteria}}", &ctx);
+        let out = render("ac:\n{{acceptance_criteria}}", &ctx).unwrap();
         assert_eq!(out, "ac:\n- tests pass\n- no clippy warnings");
     }
 
@@ -592,15 +618,36 @@ mod tests {
     fn output_schema_is_inserted_verbatim() {
         let schema = "{\"summary\": \"...\"}";
         let ctx = PromptContext::for_issue(&issue()).with_output_schema(schema);
-        let out = render("emit:\n{{output_schema}}", &ctx);
+        let out = render("emit:\n{{output_schema}}", &ctx).unwrap();
         assert_eq!(out, format!("emit:\n{schema}"));
     }
 
     #[test]
     fn output_schema_renders_as_empty_string_when_unset() {
         let ctx = PromptContext::for_issue(&issue());
-        let out = render("[{{output_schema}}]", &ctx);
+        let out = render("[{{output_schema}}]", &ctx).unwrap();
         assert_eq!(out, "[]");
+    }
+
+    #[test]
+    fn list_field_rejects_subpath() {
+        let ctx = PromptContext::for_issue(&issue());
+        let err = render("{{children.first}}", &ctx).unwrap_err();
+        assert_eq!(err, RenderError::UnknownPath("children.first".into()));
+    }
+
+    #[test]
+    fn scalar_field_rejects_subpath() {
+        let ctx = PromptContext::for_issue(&issue());
+        let err = render("{{title.upper}}", &ctx).unwrap_err();
+        assert_eq!(err, RenderError::UnknownPath("title.upper".into()));
+    }
+
+    #[test]
+    fn template_without_placeholders_is_returned_unchanged() {
+        let ctx = PromptContext::for_issue(&issue());
+        let out = render("plain text\nno braces", &ctx).unwrap();
+        assert_eq!(out, "plain text\nno braces");
     }
 
     #[test]
@@ -674,7 +721,7 @@ Acceptance:
 Output schema:
 {{output_schema}}
 ";
-        let out = render(tpl, &ctx);
+        let out = render(tpl, &ctx).unwrap();
         assert!(out.contains("Issue ENG-7 (Todo): Add fizz to buzz"));
         assert!(out.contains("Role: qa (qa_gate)"));
         assert!(
