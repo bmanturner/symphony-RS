@@ -30,7 +30,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::blocker::RunRef;
-use crate::lease::LeaseOwner;
+use crate::lease::{LeaseClock, LeaseOwner};
 use std::collections::HashMap;
 
 /// Outcome of [`RunLeaseStore::acquire`].
@@ -182,6 +182,135 @@ impl Drop for RunLeaseGuard {
                 let _ = store.release(run_id).await;
             });
         }
+    }
+}
+
+/// Heartbeat helper that tracks a held lease's `(owner, run_id, last
+/// observed `expires_at`, renewal margin)` and re-acquires through
+/// [`RunLeaseStore::acquire`] when the renewal window opens.
+///
+/// `LeaseHeartbeat` is a value object: it holds no timers and spawns no
+/// tasks. The composing runner is expected to call [`Self::due`] on its
+/// own scheduling cadence (a runner tick, a periodic timer, etc.) and
+/// invoke [`Self::pulse`] when due. This keeps the kernel free of wall
+/// clocks and lets test scenarios exercise the renewal logic
+/// deterministically.
+///
+/// # Lex comparison contract
+///
+/// [`Self::due`] compares two strings produced by the same
+/// [`LeaseClock`] implementation: the heartbeat's `last_expires_at`
+/// (originally written by the store at acquisition) and a probe
+/// computed by `clock.timestamps(renewal_margin_ms).expires_at`.
+/// Heartbeat is "due" when the probe is `>=` the recorded expiry,
+/// i.e. less than `renewal_margin_ms` of TTL remains. The comparison
+/// relies on the clock's wire format being lex-monotonic with respect
+/// to wall time — which both [`crate::lease::FixedLeaseClock`] and any
+/// canonical RFC3339 producer satisfy.
+///
+/// # Outcome handling
+///
+/// [`Self::pulse`] forwards the underlying [`LeaseAcquireOutcome`]:
+///
+/// * [`LeaseAcquireOutcome::Acquired`] — `last_expires_at` is updated to
+///   the probe's `expires_at`. Subsequent [`Self::due`] calls reflect
+///   the new TTL window.
+/// * [`LeaseAcquireOutcome::Contended`] — another owner holds the lease.
+///   `last_expires_at` is left untouched so the runner can report or
+///   relinquish. The heartbeat does not retry on its own.
+/// * [`LeaseAcquireOutcome::NotFound`] — the run row was reaped. Same
+///   no-state-change semantics as `Contended`.
+///
+/// Backend errors propagate untouched as [`RunLeaseError`].
+#[derive(Clone)]
+pub struct LeaseHeartbeat {
+    store: Arc<dyn RunLeaseStore>,
+    run_id: RunRef,
+    owner: LeaseOwner,
+    last_expires_at: String,
+    renewal_margin_ms: u64,
+}
+
+impl std::fmt::Debug for LeaseHeartbeat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseHeartbeat")
+            .field("run_id", &self.run_id)
+            .field("owner", &self.owner)
+            .field("last_expires_at", &self.last_expires_at)
+            .field("renewal_margin_ms", &self.renewal_margin_ms)
+            .finish()
+    }
+}
+
+impl LeaseHeartbeat {
+    /// Construct a heartbeat for an already-acquired lease.
+    ///
+    /// `initial_expires_at` should match the value passed to the
+    /// successful [`RunLeaseStore::acquire`] that established this
+    /// lease, so [`Self::due`] reflects the live TTL window.
+    pub fn new(
+        store: Arc<dyn RunLeaseStore>,
+        run_id: RunRef,
+        owner: LeaseOwner,
+        initial_expires_at: impl Into<String>,
+        renewal_margin_ms: u64,
+    ) -> Self {
+        Self {
+            store,
+            run_id,
+            owner,
+            last_expires_at: initial_expires_at.into(),
+            renewal_margin_ms,
+        }
+    }
+
+    /// Run row this heartbeat targets.
+    pub fn run_id(&self) -> RunRef {
+        self.run_id
+    }
+
+    /// Owner identity used for renewals.
+    pub fn owner(&self) -> &LeaseOwner {
+        &self.owner
+    }
+
+    /// Last `expires_at` we successfully wrote (or were constructed with).
+    pub fn last_expires_at(&self) -> &str {
+        &self.last_expires_at
+    }
+
+    /// Renewal margin (ms) — how close to expiry [`Self::due`] fires.
+    pub fn renewal_margin_ms(&self) -> u64 {
+        self.renewal_margin_ms
+    }
+
+    /// True when the renewal window has opened: less than
+    /// `renewal_margin_ms` of TTL remains as observed by `clock`.
+    pub fn due(&self, clock: &dyn LeaseClock) -> bool {
+        let probe = clock.timestamps(self.renewal_margin_ms);
+        probe.expires_at.as_str() >= self.last_expires_at.as_str()
+    }
+
+    /// Re-acquire the lease through [`RunLeaseStore::acquire`].
+    ///
+    /// On [`LeaseAcquireOutcome::Acquired`] the recorded
+    /// `last_expires_at` advances to `clock.timestamps(ttl_ms).expires_at`.
+    /// Other outcomes leave the recorded expiry untouched and are
+    /// returned to the caller for handling.
+    pub async fn pulse(
+        &mut self,
+        clock: &dyn LeaseClock,
+        ttl_ms: u64,
+    ) -> Result<LeaseAcquireOutcome, RunLeaseError> {
+        let ts = clock.timestamps(ttl_ms);
+        let outcome = self
+            .store
+            .acquire(self.run_id, &self.owner, &ts.expires_at, &ts.now)
+            .await?;
+        if matches!(outcome, LeaseAcquireOutcome::Acquired) {
+            self.last_expires_at = ts.expires_at;
+        }
+        Ok(outcome)
     }
 }
 
@@ -592,5 +721,143 @@ mod tests {
         }
         // Exactly one release was emitted.
         assert_eq!(store.release_calls().await, vec![RunRef::new(1)]);
+    }
+
+    // ---- LeaseHeartbeat ---------------------------------------------------
+
+    use crate::lease::FixedLeaseClock;
+
+    /// Establish a held lease for `owner_a` and return the heartbeat plus the
+    /// store the test can reuse.
+    async fn seed_heartbeat(
+        clock: &FixedLeaseClock,
+        ttl_ms: u64,
+        renewal_margin_ms: u64,
+    ) -> (Arc<InMemoryRunLeaseStore>, LeaseHeartbeat) {
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(1)).await;
+        let ts = clock.timestamps(ttl_ms);
+        let outcome = store
+            .acquire(RunRef::new(1), &owner(0), &ts.expires_at, &ts.now)
+            .await
+            .unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::Acquired);
+        let hb = LeaseHeartbeat::new(
+            store.clone(),
+            RunRef::new(1),
+            owner(0),
+            ts.expires_at,
+            renewal_margin_ms,
+        );
+        (store, hb)
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_not_due_when_full_ttl_remains() {
+        let clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (_store, hb) = seed_heartbeat(&clock, 60_000, 15_000).await;
+        assert!(!hb.due(&clock));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_due_inside_renewal_window() {
+        let acquire_clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (_store, hb) = seed_heartbeat(&acquire_clock, 60_000, 15_000).await;
+        // Advance to t=50s — only 10s remains, inside the 15s margin.
+        let later = FixedLeaseClock::new("2026-01-01T00:00:50Z");
+        assert!(hb.due(&later));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pulse_extends_recorded_expiry_on_acquired() {
+        let early = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (store, mut hb) = seed_heartbeat(&early, 60_000, 15_000).await;
+        let original_expiry = hb.last_expires_at().to_string();
+
+        let later = FixedLeaseClock::new("2026-01-01T00:00:50Z");
+        let outcome = hb.pulse(&later, 60_000).await.unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::Acquired);
+
+        assert!(hb.last_expires_at() > original_expiry.as_str());
+        // Store reflects the renewed expiry.
+        let snap = store.snapshot(RunRef::new(1)).await.unwrap();
+        assert_eq!(snap.0, owner(0).to_string());
+        assert_eq!(snap.1, hb.last_expires_at());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pulse_preserves_recorded_expiry_on_contention() {
+        let acquire_clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (store, mut hb) = seed_heartbeat(&acquire_clock, 60_000, 15_000).await;
+        let recorded = hb.last_expires_at().to_string();
+
+        // Forcibly take over the lease with a different owner using a
+        // far-future expiry that beats the takeover-on-expiry rule.
+        let intruder_ts = FixedLeaseClock::new("2030-01-01T00:00:00Z").timestamps(60_000);
+        let intruder = owner(1);
+        // Direct mutation through the store API: previous holder's lease
+        // is unexpired, but we simulate an authority change by clearing
+        // and re-acquiring via the intruder's `release` + `acquire`.
+        let _ = store.release(RunRef::new(1)).await.unwrap();
+        let outcome = store
+            .acquire(
+                RunRef::new(1),
+                &intruder,
+                &intruder_ts.expires_at,
+                &intruder_ts.now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::Acquired);
+
+        // Heartbeat for owner-A pulses against an unexpired owner-B lease.
+        let pulse_clock = FixedLeaseClock::new("2026-01-01T00:00:30Z");
+        let outcome = hb.pulse(&pulse_clock, 60_000).await.unwrap();
+        match outcome {
+            LeaseAcquireOutcome::Contended { holder, .. } => {
+                assert_eq!(holder, owner(1).to_string());
+            }
+            other => panic!("expected Contended, got {other:?}"),
+        }
+        // Recorded expiry untouched.
+        assert_eq!(hb.last_expires_at(), recorded);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pulse_surfaces_not_found_without_state_change() {
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        // No `register_run` — the run row is absent.
+        let mut hb = LeaseHeartbeat::new(
+            store.clone(),
+            RunRef::new(1),
+            owner(0),
+            "2026-01-01T00:01:00Z",
+            15_000,
+        );
+        let recorded = hb.last_expires_at().to_string();
+        let pulse_clock = FixedLeaseClock::new("2026-01-01T00:00:30Z");
+        let outcome = hb.pulse(&pulse_clock, 60_000).await.unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::NotFound);
+        assert_eq!(hb.last_expires_at(), recorded);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_pulse_propagates_backend_errors() {
+        let clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (store, mut hb) = seed_heartbeat(&clock, 60_000, 15_000).await;
+        let recorded = hb.last_expires_at().to_string();
+        store.fail_next("disk full").await;
+        let err = hb.pulse(&clock, 60_000).await.unwrap_err();
+        assert!(matches!(err, RunLeaseError::Backend(msg) if msg == "disk full"));
+        assert_eq!(hb.last_expires_at(), recorded);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_accessors_reflect_construction() {
+        let clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (_store, hb) = seed_heartbeat(&clock, 60_000, 15_000).await;
+        assert_eq!(hb.run_id(), RunRef::new(1));
+        assert_eq!(hb.owner(), &owner(0));
+        assert_eq!(hb.renewal_margin_ms(), 15_000);
     }
 }

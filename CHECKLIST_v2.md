@@ -166,7 +166,10 @@ One unchecked item per implementation iteration. Each item should land with test
     - [x] Wire `BudgetPauseRunner` lease acquisition under the same contract, with tests for write/expiry/cleared-on-terminal across resume/hold paths.
     - [x] Wire `RecoveryRunner` lease acquisition under the same contract (recovery dispatches are themselves runs), with tests for write/expiry/cleared-on-terminal across reaped/orphaned outcomes.
   - [x] Surface lease acquisition failures (contention, missing run row) as a typed dispatch outcome in each runner so the scheduler can park or reroute without losing the dispatch request, with tests for contention parking and missing-run dropping.
-- [ ] Add lease heartbeat and expiration handling.
+- [ ] Add lease heartbeat and expiration handling. (Decomposed below.)
+  - [x] Add a `LeaseHeartbeat` helper to `symphony-core::run_lease` that tracks a held lease's `(owner, run_id, last_expires_at, renewal_margin_ms)`, exposes `due(now)` (lex compare with the renewal-margin window expressed via `LeaseClock`) and `pulse(clock, ttl_ms)` (re-acquires through `RunLeaseStore::acquire`, updates `last_expires_at` on `Acquired`, returns the underlying `LeaseAcquireOutcome` on contention/not-found, propagates backend errors), with deterministic tests covering not-due/due transitions, pulse-extends-expiry, contention preserves prior expiry, not-found surfaces outcome, and backend-error propagation.
+  - [ ] Wire `LeaseHeartbeat` into each production runner so in-flight dispatches periodically refresh their lease before TTL elapses, with tests proving `runs.lease_expires_at` advances during a long-running dispatch and that pulse failures (contention, missing row, backend error) surface as typed runner observations rather than silent drops.
+  - [ ] Surface expired-lease reap candidates from `RunRepository::find_expired_leases` into the `RecoveryQueueTick` source view so the recovery runner dispatches them, with tests proving expired leases trigger recovery dispatches once, released leases do not, and renewals (refreshed `lease_expires_at`) prune already-claimed candidates.
 - [ ] Add global/role/agent/repository concurrency limits.
 - [ ] Add retry policy with max retries, budget awareness, durable budget pauses, and `BudgetExceeded` events.
 - [ ] Add cancellation path that records durable run status.
