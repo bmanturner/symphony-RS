@@ -53,6 +53,7 @@ pub mod recovery_tick;
 pub mod retry;
 pub mod role;
 pub mod routing;
+pub mod run_lease;
 pub mod scheduler_v2;
 pub mod specialist_runner;
 pub mod specialist_tick;
@@ -188,6 +189,9 @@ pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, Rol
 pub use routing::{
     RoutingContext, RoutingDecision, RoutingEngine, RoutingError, RoutingMatch, RoutingMatchMode,
     RoutingRule, RoutingTable,
+};
+pub use run_lease::{
+    InMemoryRunLeaseStore, LeaseAcquireOutcome, RunLeaseError, RunLeaseGuard, RunLeaseStore,
 };
 pub use scheduler_v2::{SchedulerTickReport, SchedulerV2, SchedulerV2Config};
 pub use specialist_runner::{SpecialistDispatchOutcome, SpecialistRunReport, SpecialistRunner};
