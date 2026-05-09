@@ -124,7 +124,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 11 — Scheduler v2
 
-- [ ] Decompose the flat-poll-loop replacement into logical-queue subtasks (this entry).
+- [x] Decompose the flat-poll-loop replacement into logical-queue subtasks (this entry).
   - [x] Add `LogicalQueue` enum (`intake`, `specialist`, `integration`, `qa`, `followup_approval`, `budget_pause`, `recovery`) plus `QueueTickOutcome` to `symphony-core` with serialization tests.
   - [x] Add a `QueueTick` trait abstraction in `symphony-core` describing one per-queue tick (input cadence config, output outcome) with a deterministic test harness.
   - [x] Add an intake queue tick that wraps the existing tracker-poll/active-set fetch behind the new abstraction without changing observable behavior, with tests proving parity with the current flat poll.
@@ -135,7 +135,13 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Add a budget-pause queue tick that surfaces durable budget pauses for operator/policy resume, with tests for resume conditions.
   - [x] Add a recovery queue tick that reconciles expired leases and orphaned workspace claims on each cadence (separate from the operator `recovery` command), with tests for lease expiry reaping.
   - [x] Wire `Scheduler v2` that fans the queue ticks under shared `polling.interval_ms` cadence with `jitter_ms`, replacing the flat `PollLoop` entry point and migrating its existing reconciliation/cancellation semantics to the intake + recovery queues.
-- [ ] Replace single flat poll loop with logical queues: intake, specialist, integration, QA, follow-up approval, budget pause, recovery; keep cadence under `polling.interval_ms`.
+- [ ] Replace single flat poll loop with logical queues: intake, specialist, integration, QA, follow-up approval, budget pause, recovery; keep cadence under `polling.interval_ms`. (Decomposed below.)
+  - [x] Add `SpecialistRunner` that drains `SpecialistDispatchQueue` and invokes the existing `Dispatcher` trait under a max-concurrency `Semaphore`, with parking for capacity-deferred requests, missing-issue counting, parent-cancellation propagation, and reap-completed observability.
+  - [ ] Add an `IntegrationDispatchRunner` over `IntegrationDispatchQueue` mirroring the specialist runner's bounded-concurrency contract, with tests for ready/blocked candidates.
+  - [ ] Add a `QaDispatchRunner` over `QaDispatchQueue` mirroring the runner contract, with tests for ready/blocked candidates and waiver-routed verdicts.
+  - [ ] Add a `FollowupApprovalRunner` and a `BudgetPauseRunner` (operator-decision queues) mirroring the runner contract, with tests for approve/reject and resume paths.
+  - [ ] Add a `RecoveryRunner` that drains `RecoveryDispatchQueue` with parity tests against the flat-loop reconciliation contract.
+  - [ ] Wire the per-queue runners and the new ticks into `symphony-cli/src/run.rs` behind `SchedulerV2`, retiring `PollLoop` as the production entry point and migrating SIGINT drain semantics to the runners' reap surface.
 - [ ] Add durable leases for running work.
 - [ ] Add lease heartbeat and expiration handling.
 - [ ] Add global/role/agent/repository concurrency limits.
