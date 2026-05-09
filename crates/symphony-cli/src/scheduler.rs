@@ -51,21 +51,27 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use async_trait::async_trait;
 use symphony_config::{self as cfg, WorkflowConfig};
 use symphony_core::{
-    ActiveSetStore, BudgetPauseDispatchQueue, BudgetPauseDispatcher, BudgetPauseQueueSource,
-    BudgetPauseQueueTick, BudgetPauseRunner, Dispatcher, ExpiredLeaseCandidate,
-    FollowupApprovalDispatchQueue, FollowupApprovalDispatcher, FollowupApprovalQueueSource,
-    FollowupApprovalQueueTick, FollowupApprovalRunner, IntakeQueueTick, IntegrationDispatchQueue,
-    IntegrationDispatchRunner, IntegrationDispatcher, IntegrationGates, IntegrationQueueSource,
-    IntegrationQueueTick, IssueId, OrphanedWorkspaceClaimCandidate, QaDispatchQueue,
-    QaDispatchRunner, QaDispatcher, QaGates, QaQueueSource, QaQueueTick, QueueTick,
-    QueueTickCadence, RecoveryDispatchQueue, RecoveryQueueError, RecoveryQueueSource,
-    RecoveryQueueTick, RecoveryRunId, RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName,
-    RoutingEngine, RoutingMatch, RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2,
-    SchedulerV2Config, SpecialistDispatchQueue, SpecialistQueueTick, SpecialistRunner, TrackerRead,
-    WorkItemId,
+    ActiveSetStore, BudgetPauseCandidate, BudgetPauseDispatchQueue, BudgetPauseDispatchReason,
+    BudgetPauseDispatchRequest, BudgetPauseDispatcher, BudgetPauseQueueError,
+    BudgetPauseQueueSource, BudgetPauseQueueTick, BudgetPauseRunner, Dispatcher,
+    ExpiredLeaseCandidate, FollowupApprovalCandidate, FollowupApprovalDispatchQueue,
+    FollowupApprovalDispatchReason, FollowupApprovalDispatchRequest, FollowupApprovalDispatcher,
+    FollowupApprovalQueueError, FollowupApprovalQueueSource, FollowupApprovalQueueTick,
+    FollowupApprovalRunner, IntakeQueueTick, IntegrationCandidate, IntegrationDispatchQueue,
+    IntegrationDispatchReason, IntegrationDispatchRequest, IntegrationDispatchRunner,
+    IntegrationDispatcher, IntegrationGates, IntegrationQueueError, IntegrationQueueSource,
+    IntegrationQueueTick, IssueId, OrphanedWorkspaceClaimCandidate, QaCandidate, QaDispatchQueue,
+    QaDispatchReason, QaDispatchRequest, QaDispatchRunner, QaDispatcher, QaGates, QaQueueError,
+    QaQueueSource, QaQueueTick, QueueTick, QueueTickCadence, RecoveryDispatchQueue,
+    RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick, RecoveryRunId,
+    RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName, RoutingEngine, RoutingMatch,
+    RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2, SchedulerV2Config,
+    SpecialistDispatchQueue, SpecialistQueueTick, SpecialistRunner, TrackerRead, WorkItemId,
 };
+use tokio_util::sync::CancellationToken;
 
 /// What [`build_scheduler_v2`] hands back to the composition root.
 ///
@@ -577,6 +583,180 @@ fn role_kinds_from_config(c: &WorkflowConfig) -> RoleKindLookup {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Production stand-in sources / dispatchers
+// ---------------------------------------------------------------------------
+//
+// The four state-backed queues (integration, QA, follow-up approval,
+// budget pause) all expect a [`*QueueSource`] backed by a `symphony-state`
+// repository (e.g. [`symphony_state::integration_queue::IntegrationQueueRepository`])
+// and a [`*Dispatcher`] backed by the role's agent runner. Those adapters
+// have not landed yet — the durable repositories exist but the wiring
+// from `WorkflowConfig` plus a `StateDb` to a kernel-side `Arc<dyn ...Source>`
+// is still TODO. Until that wiring lands, `run.rs` must still be able to
+// compose [`build_scheduler_v2`]; otherwise the production switch from
+// [`PollLoop`] cannot land in one commit.
+//
+// These stand-ins are deliberately narrow: every source returns an empty
+// candidate list (so the corresponding tick is a no-op) and every
+// dispatcher resolves with the queue's "happy" terminal verdict. They
+// are safe defaults — an empty source produces no requests, so the
+// dispatcher's verdict is unreachable until a real source is plumbed in.
+//
+// TODO(symphony-state): replace each `Empty*Source` with an adapter over
+// the corresponding `symphony-state` queue repository
+// (`IntegrationQueueRepository`, `QaQueueRepository`,
+// `FollowupApprovalQueueRepository`, `BudgetPauseQueueRepository`).
+// TODO(agent-runners): replace each `Noop*Dispatcher` with an adapter
+// over the role-specific `AgentRunner` (integration owner, QA gate,
+// follow-up approval handler, budget-pause resume handler).
+
+/// [`IntegrationQueueSource`] that never surfaces a candidate.
+///
+/// Production stand-in until the `IntegrationQueueRepository` adapter
+/// lands. Constructed at the composition root via
+/// [`empty_integration_source`].
+pub(crate) struct EmptyIntegrationSource;
+
+impl IntegrationQueueSource for EmptyIntegrationSource {
+    fn list_ready(
+        &self,
+        _gates: IntegrationGates,
+    ) -> Result<Vec<IntegrationCandidate>, IntegrationQueueError> {
+        Ok(Vec::new())
+    }
+}
+
+pub(crate) fn empty_integration_source() -> Arc<dyn IntegrationQueueSource> {
+    Arc::new(EmptyIntegrationSource)
+}
+
+/// [`IntegrationDispatcher`] that resolves every dispatch as `Completed`.
+///
+/// Unreachable in production while paired with [`EmptyIntegrationSource`]
+/// — the source emits no requests, so this verdict never fires.
+pub(crate) struct NoopIntegrationDispatcher;
+
+#[async_trait]
+impl IntegrationDispatcher for NoopIntegrationDispatcher {
+    async fn dispatch(
+        &self,
+        _request: IntegrationDispatchRequest,
+        _cancel: CancellationToken,
+    ) -> IntegrationDispatchReason {
+        IntegrationDispatchReason::Completed
+    }
+}
+
+pub(crate) fn noop_integration_dispatcher() -> Arc<dyn IntegrationDispatcher> {
+    Arc::new(NoopIntegrationDispatcher)
+}
+
+/// [`QaQueueSource`] that never surfaces a candidate. Production
+/// stand-in until the `QaQueueRepository` adapter lands.
+pub(crate) struct EmptyQaSource;
+
+impl QaQueueSource for EmptyQaSource {
+    fn list_ready(&self, _gates: QaGates) -> Result<Vec<QaCandidate>, QaQueueError> {
+        Ok(Vec::new())
+    }
+}
+
+pub(crate) fn empty_qa_source() -> Arc<dyn QaQueueSource> {
+    Arc::new(EmptyQaSource)
+}
+
+/// [`QaDispatcher`] that resolves every dispatch as `Passed`.
+///
+/// Unreachable in production while paired with [`EmptyQaSource`].
+pub(crate) struct NoopQaDispatcher;
+
+#[async_trait]
+impl QaDispatcher for NoopQaDispatcher {
+    async fn dispatch(
+        &self,
+        _request: QaDispatchRequest,
+        _cancel: CancellationToken,
+    ) -> QaDispatchReason {
+        QaDispatchReason::Passed
+    }
+}
+
+pub(crate) fn noop_qa_dispatcher() -> Arc<dyn QaDispatcher> {
+    Arc::new(NoopQaDispatcher)
+}
+
+/// [`FollowupApprovalQueueSource`] that never surfaces a candidate.
+/// Production stand-in until the `FollowupApprovalQueueRepository`
+/// adapter lands.
+pub(crate) struct EmptyFollowupApprovalSource;
+
+impl FollowupApprovalQueueSource for EmptyFollowupApprovalSource {
+    fn list_pending(&self) -> Result<Vec<FollowupApprovalCandidate>, FollowupApprovalQueueError> {
+        Ok(Vec::new())
+    }
+}
+
+pub(crate) fn empty_followup_approval_source() -> Arc<dyn FollowupApprovalQueueSource> {
+    Arc::new(EmptyFollowupApprovalSource)
+}
+
+/// [`FollowupApprovalDispatcher`] that resolves every dispatch as
+/// `Approved`.
+///
+/// Unreachable in production while paired with
+/// [`EmptyFollowupApprovalSource`].
+pub(crate) struct NoopFollowupApprovalDispatcher;
+
+#[async_trait]
+impl FollowupApprovalDispatcher for NoopFollowupApprovalDispatcher {
+    async fn dispatch(
+        &self,
+        _request: FollowupApprovalDispatchRequest,
+        _cancel: CancellationToken,
+    ) -> FollowupApprovalDispatchReason {
+        FollowupApprovalDispatchReason::Approved
+    }
+}
+
+pub(crate) fn noop_followup_approval_dispatcher() -> Arc<dyn FollowupApprovalDispatcher> {
+    Arc::new(NoopFollowupApprovalDispatcher)
+}
+
+/// [`BudgetPauseQueueSource`] that never surfaces a candidate. Production
+/// stand-in until the `BudgetPauseQueueRepository` adapter lands.
+pub(crate) struct EmptyBudgetPauseSource;
+
+impl BudgetPauseQueueSource for EmptyBudgetPauseSource {
+    fn list_active(&self) -> Result<Vec<BudgetPauseCandidate>, BudgetPauseQueueError> {
+        Ok(Vec::new())
+    }
+}
+
+pub(crate) fn empty_budget_pause_source() -> Arc<dyn BudgetPauseQueueSource> {
+    Arc::new(EmptyBudgetPauseSource)
+}
+
+/// [`BudgetPauseDispatcher`] that resolves every dispatch as `Resumed`.
+///
+/// Unreachable in production while paired with [`EmptyBudgetPauseSource`].
+pub(crate) struct NoopBudgetPauseDispatcher;
+
+#[async_trait]
+impl BudgetPauseDispatcher for NoopBudgetPauseDispatcher {
+    async fn dispatch(
+        &self,
+        _request: BudgetPauseDispatchRequest,
+        _cancel: CancellationToken,
+    ) -> BudgetPauseDispatchReason {
+        BudgetPauseDispatchReason::Resumed
+    }
+}
+
+pub(crate) fn noop_budget_pause_dispatcher() -> Arc<dyn BudgetPauseDispatcher> {
+    Arc::new(NoopBudgetPauseDispatcher)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,41 +796,9 @@ mod tests {
         Arc::new(NoopDispatcher)
     }
 
-    /// Empty integration source — never surfaces a candidate. Used by
-    /// tests that only exercise intake/recovery/specialist behaviour.
-    struct EmptyIntegrationSource;
-
-    impl IntegrationQueueSource for EmptyIntegrationSource {
-        fn list_ready(
-            &self,
-            _gates: IntegrationGates,
-        ) -> Result<Vec<IntegrationCandidate>, IntegrationQueueError> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn empty_integration_source() -> Arc<dyn IntegrationQueueSource> {
-        Arc::new(EmptyIntegrationSource)
-    }
-
-    /// No-op integration dispatcher — would resolve every request as
-    /// `Completed`. Used by tests that don't drive the integration runner.
-    struct NoopIntegrationDispatcher;
-
-    #[async_trait]
-    impl IntegrationDispatcher for NoopIntegrationDispatcher {
-        async fn dispatch(
-            &self,
-            _request: IntegrationDispatchRequest,
-            _cancel: CancellationToken,
-        ) -> IntegrationDispatchReason {
-            IntegrationDispatchReason::Completed
-        }
-    }
-
-    fn noop_integration_dispatcher() -> Arc<dyn IntegrationDispatcher> {
-        Arc::new(NoopIntegrationDispatcher)
-    }
+    // EmptyIntegrationSource / NoopIntegrationDispatcher (and their
+    // factory functions) are defined at module scope as `pub(crate)`
+    // production stand-ins; tests reach them through `use super::*`.
 
     /// Gate-aware integration source: stores per-gate candidate lists,
     /// mirroring `IntegrationQueueRepository::list_ready_for_integration_with_gates`.
@@ -732,113 +880,9 @@ mod tests {
         }
     }
 
-    /// Empty QA source — never surfaces a candidate. Used by tests
-    /// that only exercise other ticks/runners.
-    struct EmptyQaSource;
-
-    impl QaQueueSource for EmptyQaSource {
-        fn list_ready(&self, _gates: QaGates) -> Result<Vec<QaCandidate>, QaQueueError> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn empty_qa_source() -> Arc<dyn QaQueueSource> {
-        Arc::new(EmptyQaSource)
-    }
-
-    /// No-op QA dispatcher — would resolve every request as `Passed`.
-    /// Used by tests that don't drive the QA runner.
-    struct NoopQaDispatcher;
-
-    #[async_trait]
-    impl QaDispatcher for NoopQaDispatcher {
-        async fn dispatch(
-            &self,
-            _request: QaDispatchRequest,
-            _cancel: CancellationToken,
-        ) -> QaDispatchReason {
-            QaDispatchReason::Passed
-        }
-    }
-
-    fn noop_qa_dispatcher() -> Arc<dyn QaDispatcher> {
-        Arc::new(NoopQaDispatcher)
-    }
-
-    /// Empty follow-up approval source — never surfaces a candidate.
-    /// Used by tests that don't exercise the follow-up approval path.
-    struct EmptyFollowupApprovalSource;
-
-    impl FollowupApprovalQueueSource for EmptyFollowupApprovalSource {
-        fn list_pending(
-            &self,
-        ) -> Result<
-            Vec<symphony_core::FollowupApprovalCandidate>,
-            symphony_core::FollowupApprovalQueueError,
-        > {
-            Ok(Vec::new())
-        }
-    }
-
-    fn empty_followup_approval_source() -> Arc<dyn FollowupApprovalQueueSource> {
-        Arc::new(EmptyFollowupApprovalSource)
-    }
-
-    /// No-op follow-up approval dispatcher — would resolve every request
-    /// as `Approved`. Used by tests that don't drive the follow-up
-    /// approval runner.
-    struct NoopFollowupApprovalDispatcher;
-
-    #[async_trait]
-    impl FollowupApprovalDispatcher for NoopFollowupApprovalDispatcher {
-        async fn dispatch(
-            &self,
-            _request: symphony_core::FollowupApprovalDispatchRequest,
-            _cancel: CancellationToken,
-        ) -> symphony_core::FollowupApprovalDispatchReason {
-            symphony_core::FollowupApprovalDispatchReason::Approved
-        }
-    }
-
-    fn noop_followup_approval_dispatcher() -> Arc<dyn FollowupApprovalDispatcher> {
-        Arc::new(NoopFollowupApprovalDispatcher)
-    }
-
-    /// Empty budget-pause source — never surfaces a candidate. Used by
-    /// tests that don't exercise the budget-pause path.
-    struct EmptyBudgetPauseSource;
-
-    impl BudgetPauseQueueSource for EmptyBudgetPauseSource {
-        fn list_active(
-            &self,
-        ) -> Result<Vec<symphony_core::BudgetPauseCandidate>, symphony_core::BudgetPauseQueueError>
-        {
-            Ok(Vec::new())
-        }
-    }
-
-    fn empty_budget_pause_source() -> Arc<dyn BudgetPauseQueueSource> {
-        Arc::new(EmptyBudgetPauseSource)
-    }
-
-    /// No-op budget-pause dispatcher — would resolve every request as
-    /// `Resumed`. Used by tests that don't drive the budget-pause runner.
-    struct NoopBudgetPauseDispatcher;
-
-    #[async_trait]
-    impl BudgetPauseDispatcher for NoopBudgetPauseDispatcher {
-        async fn dispatch(
-            &self,
-            _request: symphony_core::BudgetPauseDispatchRequest,
-            _cancel: CancellationToken,
-        ) -> symphony_core::BudgetPauseDispatchReason {
-            symphony_core::BudgetPauseDispatchReason::Resumed
-        }
-    }
-
-    fn noop_budget_pause_dispatcher() -> Arc<dyn BudgetPauseDispatcher> {
-        Arc::new(NoopBudgetPauseDispatcher)
-    }
+    // Empty/Noop QA, follow-up-approval, and budget-pause sources/
+    // dispatchers are defined at module scope as `pub(crate)` production
+    // stand-ins; tests reach them through `use super::*`.
 
     /// Gate-aware QA source: stores per-gate candidate lists,
     /// mirroring `QaQueueRepository::list_ready_for_qa_with_gates`. The
@@ -2556,5 +2600,69 @@ mod tests {
             .await;
         assert!(report.is_idle());
         assert!(dispatcher.calls().is_empty());
+    }
+
+    /// Pin the stand-in contract: every promoted `Empty*Source` returns
+    /// an empty candidate list regardless of the gate combination it is
+    /// asked about, and every promoted `Noop*Dispatcher` resolves with
+    /// the documented happy-path verdict. The empty sources prevent the
+    /// dispatcher verdicts from ever firing in production today, but the
+    /// contract is asserted in isolation here so a future change cannot
+    /// silently flip "passed → failed" or "approved → rejected" for the
+    /// stand-ins without a test failure.
+    #[tokio::test]
+    async fn production_standins_are_silent_and_happy_path() {
+        // Sources are silent for every gate combination the kernel might
+        // ask about. Iterating both bool dimensions for integration and
+        // the single bool for QA exercises every public gate shape.
+        let int_src = EmptyIntegrationSource;
+        for terminal in [false, true] {
+            for blockers in [false, true] {
+                let gates = IntegrationGates {
+                    require_all_children_terminal: terminal,
+                    require_no_open_blockers: blockers,
+                };
+                assert!(int_src.list_ready(gates).unwrap().is_empty());
+            }
+        }
+        let qa_src = EmptyQaSource;
+        for blockers in [false, true] {
+            let gates = QaGates {
+                require_no_open_blockers: blockers,
+            };
+            assert!(qa_src.list_ready(gates).unwrap().is_empty());
+        }
+        assert!(
+            EmptyFollowupApprovalSource
+                .list_pending()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(EmptyBudgetPauseSource.list_active().unwrap().is_empty());
+
+        // Dispatchers resolve with the documented happy-path verdict.
+        let cancel = CancellationToken::new();
+        let int_req = IntegrationDispatchRequest {
+            parent_id: WorkItemId::new(1),
+            parent_identifier: "ENG-1".into(),
+            parent_title: "title".into(),
+            cause: IntegrationRequestCause::AllChildrenTerminal,
+        };
+        assert_eq!(
+            NoopIntegrationDispatcher
+                .dispatch(int_req, cancel.clone())
+                .await,
+            IntegrationDispatchReason::Completed,
+        );
+        let qa_req = QaDispatchRequest {
+            work_item_id: WorkItemId::new(1),
+            identifier: "ENG-1".into(),
+            title: "title".into(),
+            cause: QaRequestCause::DirectQaRequest,
+        };
+        assert_eq!(
+            NoopQaDispatcher.dispatch(qa_req, cancel.clone()).await,
+            QaDispatchReason::Passed,
+        );
     }
 }

@@ -148,6 +148,7 @@ One unchecked item per implementation iteration. Each item should land with test
     - [x] Extend the `scheduler` builder to register an `IntegrationQueueTick` paired with an `IntegrationDispatchRunner`, with tests for ready/blocked/waived gating end-to-end.
     - [x] Extend the `scheduler` builder to register a `QaQueueTick` paired with a `QaDispatchRunner`, with tests for ready/blocked candidates and waiver-routed verdicts end-to-end.
     - [x] Extend the `scheduler` builder to register `FollowupApprovalQueueTick` + `FollowupApprovalRunner` and `BudgetPauseQueueTick` + `BudgetPauseRunner`, with tests for approve/reject and resume paths end-to-end.
+    - [x] Promote the test-only `Empty{Integration,Qa,FollowupApproval,BudgetPause}Source` and `Noop{Integration,Qa,FollowupApproval,BudgetPause}Dispatcher` helpers in `crates/symphony-cli/src/scheduler.rs` to `pub(crate)` production stand-ins (with TODO pointers to the state-crate adapters that will replace them) so `run.rs` can compose `build_scheduler_v2` before state-backed sources land. Keep `Recording*` and `GateAware*` test-only.
     - [ ] Switch `symphony-cli/src/run.rs` from `PollLoop` to the `SchedulerV2` builder, migrating SIGINT drain semantics to the runners' reap surface and retiring `PollLoop` as the production entry point. Keep `PollLoop` exported for parity tests until phase close.
 - [ ] Add durable leases for running work.
 - [ ] Add lease heartbeat and expiration handling.
