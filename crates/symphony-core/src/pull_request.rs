@@ -272,9 +272,7 @@ impl PullRequestRecord {
             }
             _ => {}
         }
-        if state == PullRequestState::Merged
-            && url.as_deref().is_none_or(|u| u.trim().is_empty())
-        {
+        if state == PullRequestState::Merged && url.as_deref().is_none_or(|u| u.trim().is_empty()) {
             return Err(PullRequestRecordError::MissingUrlForMerged);
         }
 

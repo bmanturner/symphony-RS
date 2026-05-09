@@ -39,6 +39,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+mod git_ops;
+pub use git_ops::{CherryPickOutcome, GitIntegrationOps, MergeOutcome, PushOutcome};
+
 /// Default per-snippet hook timeout (SPEC v2 §5.17: 5 minutes). The
 /// longer default reflects that v2 hooks routinely do branch prep or
 /// worktree creation. Hooks that exceed it are killed and reported as
