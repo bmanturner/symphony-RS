@@ -37,6 +37,7 @@ pub mod qa_blocker;
 pub mod qa_blocker_policy;
 pub mod qa_request;
 pub mod qa_rework;
+pub mod queue_tick;
 pub mod retry;
 pub mod role;
 pub mod routing;
@@ -124,6 +125,7 @@ pub use qa_rework::{
     BlockerReworkInput, BlockerReworkRoute, PriorRunSummary, QaReworkDecision, QaReworkError,
     derive_qa_rework_routing,
 };
+pub use queue_tick::{QueueTick, QueueTickCadence, ScriptedQueueTick, run_queue_tick_n};
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};
 pub use routing::{

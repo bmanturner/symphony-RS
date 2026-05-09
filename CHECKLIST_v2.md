@@ -126,7 +126,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Decompose the flat-poll-loop replacement into logical-queue subtasks (this entry).
   - [x] Add `LogicalQueue` enum (`intake`, `specialist`, `integration`, `qa`, `followup_approval`, `budget_pause`, `recovery`) plus `QueueTickOutcome` to `symphony-core` with serialization tests.
-  - [ ] Add a `QueueTick` trait abstraction in `symphony-core` describing one per-queue tick (input cadence config, output outcome) with a deterministic test harness.
+  - [x] Add a `QueueTick` trait abstraction in `symphony-core` describing one per-queue tick (input cadence config, output outcome) with a deterministic test harness.
   - [ ] Add an intake queue tick that wraps the existing tracker-poll/active-set fetch behind the new abstraction without changing observable behavior, with tests proving parity with the current flat poll.
   - [ ] Add a specialist queue tick that claims routable specialist work items and emits dispatch requests, with tests for first-match and priority routing parity.
   - [ ] Add an integration queue tick that drains `IntegrationQueueRepository` entries respecting gates, with tests for ready/blocked/waived cases.
