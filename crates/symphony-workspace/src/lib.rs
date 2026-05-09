@@ -1031,6 +1031,166 @@ impl GitWorktreeClaimer {
     }
 }
 
+/// Provisioner for the [`ClaimStrategy::ExistingWorktree`] strategy.
+///
+/// Reuses a worktree the operator (or a previous symphony run) already
+/// materialised on disk. Distinct from [`GitWorktreeClaimer`] because
+/// the operator's intent is "use *this* checkout, do not create another
+/// one" — typical for the integration owner's long-lived consolidation
+/// worktree. The claimer never invokes `git worktree add`; it only
+/// asserts the directory is a git working tree and, when configured,
+/// asserts it is checked out on the required branch.
+///
+/// Required-branch verification lives here rather than in the generic
+/// pre-launch verifier (a later checklist item) because it is a
+/// *strategy precondition*: an existing worktree on the wrong branch is
+/// not a workspace at all from the configuration's perspective. Failing
+/// at claim time stops the orchestrator before it dispatches an agent
+/// against a stale checkout.
+///
+/// The claimer never produces `created_now = true`: by definition the
+/// worktree pre-existed the claim. Callers wiring `after_create` hooks
+/// should not fire them on this strategy.
+#[derive(Debug, Clone)]
+pub struct ExistingWorktreeClaimer {
+    path: PathBuf,
+    required_branch: Option<String>,
+    cleanup: CleanupPolicy,
+}
+
+impl ExistingWorktreeClaimer {
+    /// Construct a claimer pointing at an existing worktree.
+    ///
+    /// `path` must already exist and be a directory. Canonicalised so
+    /// downstream containment / cwd checks compare absolute paths and a
+    /// symlink swap cannot redirect the worktree mid-flight. The git
+    /// "is inside a work tree" check is deferred to [`Self::claim`] —
+    /// constructor-time it is enough to know the path resolves.
+    ///
+    /// `required_branch` is the branch the worktree must be checked out
+    /// on at claim time. `None` disables the check (operator owns the
+    /// invariant); `Some(name)` makes mismatch a fatal claim error.
+    pub fn new(
+        path: impl AsRef<Path>,
+        required_branch: Option<String>,
+        cleanup: CleanupPolicy,
+    ) -> WorkspaceResult<Self> {
+        let path = path.as_ref();
+        if !path.is_dir() {
+            return Err(WorkspaceError::InvalidRoot(format!(
+                "existing worktree {} does not exist or is not a directory",
+                path.display()
+            )));
+        }
+        let path = std::fs::canonicalize(path)
+            .map_err(|e| WorkspaceError::InvalidRoot(format!("canonicalize worktree: {e}")))?;
+        Ok(Self {
+            path,
+            required_branch,
+            cleanup,
+        })
+    }
+
+    /// Canonical worktree path the claimer hands back on every claim.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Required branch the claim asserts at claim time, if configured.
+    pub fn required_branch(&self) -> Option<&str> {
+        self.required_branch.as_deref()
+    }
+
+    /// Verify the worktree and return a [`WorkspaceClaim`] for
+    /// `identifier`.
+    ///
+    /// Behaviour:
+    ///
+    /// 1. Run `git -C <path> rev-parse --is-inside-work-tree`. A
+    ///    failure or any output other than `true` is fatal — the
+    ///    operator pointed `existing_worktree` at a directory that is
+    ///    not a git working tree (typical mistake: the bare repo, or a
+    ///    sibling directory).
+    /// 2. Run `git -C <path> rev-parse --abbrev-ref HEAD` to read the
+    ///    current branch. Detached HEAD is reported as `HEAD`; that is
+    ///    surfaced verbatim in the error so the operator knows whether
+    ///    to check out the required branch or remove the strategy.
+    /// 3. If [`Self::required_branch`] is `Some`, compare against the
+    ///    observed branch and fail with [`WorkspaceError::Git`] on
+    ///    mismatch.
+    ///
+    /// `created_now` is always `false` and `base_ref` is always `None`
+    /// — neither concept applies to a pre-existing worktree.
+    /// `verification` stays at [`VerificationStatus::Pending`]; the
+    /// generic cwd / branch / clean-tree verifier from later checklist
+    /// items still runs against this claim before agent launch.
+    pub async fn claim(
+        &self,
+        identifier: &str,
+        work_item_id: Option<i64>,
+    ) -> WorkspaceResult<WorkspaceClaim> {
+        let safe = safe_component(identifier)?;
+
+        let inside = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .await
+            .map_err(|e| WorkspaceError::Git(format!("spawn git rev-parse: {e}")))?;
+        if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+            return Err(WorkspaceError::Git(format!(
+                "{} is not a git working tree (rev-parse status {}, stderr: {})",
+                self.path.display(),
+                inside.status,
+                String::from_utf8_lossy(&inside.stderr).trim()
+            )));
+        }
+
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .map_err(|e| WorkspaceError::Git(format!("spawn git rev-parse HEAD: {e}")))?;
+        if !head.status.success() {
+            return Err(WorkspaceError::Git(format!(
+                "git rev-parse --abbrev-ref HEAD in {} failed ({}): {}",
+                self.path.display(),
+                head.status,
+                String::from_utf8_lossy(&head.stderr).trim()
+            )));
+        }
+        let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        if let Some(required) = &self.required_branch
+            && &current != required
+        {
+            return Err(WorkspaceError::Git(format!(
+                "existing worktree {} is on branch {:?} but required {:?}",
+                self.path.display(),
+                current,
+                required
+            )));
+        }
+
+        Ok(WorkspaceClaim {
+            path: self.path.clone(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some(current),
+            owner: Some(ClaimOwner {
+                identifier: safe,
+                work_item_id,
+            }),
+            cleanup: self.cleanup,
+            verification: VerificationReport::default(),
+            created_now: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2051,5 +2211,158 @@ mod tests {
         let report = VerificationReport::default();
         assert_eq!(report.status, VerificationStatus::Pending);
         assert!(report.checks.is_empty());
+    }
+
+    // ----- ExistingWorktreeClaimer (Phase 6) -------------------------------
+
+    /// Initialise a git repo with one commit on `main` and check out a
+    /// secondary branch so tests can witness branch verification both
+    /// matching and mismatching.
+    #[cfg(unix)]
+    async fn init_repo_with_branches(extra_branch: &str) -> TempDir {
+        let dir = init_repo_with_main_commit().await;
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["checkout", "-q", "-b", extra_branch])
+            .output()
+            .await
+            .expect("git checkout");
+        assert!(out.status.success(), "git checkout: {out:?}");
+        dir
+    }
+
+    /// Constructor must reject a path that does not exist. An operator
+    /// pointing `existing_worktree` at a typo-ed path is a deployment
+    /// bug we want surfaced loudly before any claim attempt.
+    #[test]
+    fn existing_worktree_claimer_rejects_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let err =
+            ExistingWorktreeClaimer::new(tmp.path().join("nope"), None, CleanupPolicy::default())
+                .unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Happy path: an existing worktree on the required branch yields
+    /// a claim whose envelope reflects the strategy. `created_now` must
+    /// stay `false` because the directory pre-existed the claim, and
+    /// `base_ref` must be `None` because the strategy does not branch
+    /// from any specific ref.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_worktree_claim_passes_required_branch_check() {
+        let repo = init_repo_with_branches("feature/integration").await;
+        let claimer = ExistingWorktreeClaimer::new(
+            repo.path(),
+            Some("feature/integration".into()),
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let claim = claimer.claim("ENG-7", Some(11)).await.unwrap();
+
+        assert_eq!(claim.path, claimer.path());
+        assert_eq!(claim.strategy, ClaimStrategy::ExistingWorktree);
+        assert_eq!(claim.base_ref, None);
+        assert_eq!(claim.branch.as_deref(), Some("feature/integration"));
+        let owner = claim.owner.as_ref().expect("owner present");
+        assert_eq!(owner.identifier, "ENG-7");
+        assert_eq!(owner.work_item_id, Some(11));
+        assert_eq!(claim.cleanup, CleanupPolicy::RetainAlways);
+        assert_eq!(claim.verification.status, VerificationStatus::Pending);
+        assert!(
+            !claim.created_now,
+            "existing worktree never reports created_now"
+        );
+    }
+
+    /// Branch mismatch is fatal: dispatching an agent against a
+    /// worktree on the wrong branch would produce wrong-tree commits.
+    /// Failing at claim time is the structural enforcement.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_worktree_claim_rejects_branch_mismatch() {
+        let repo = init_repo_with_branches("feature/x").await;
+        let claimer = ExistingWorktreeClaimer::new(
+            repo.path(),
+            Some("feature/y".into()),
+            CleanupPolicy::default(),
+        )
+        .unwrap();
+
+        let err = claimer.claim("ENG-7", None).await.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Git(msg) if msg.contains("feature/x") && msg.contains("feature/y"))
+        );
+    }
+
+    /// `required_branch = None` disables verification: the claim
+    /// reflects whatever branch the worktree is currently on, without
+    /// failing. Useful for operators who manage branch state out of
+    /// band.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_worktree_claim_without_required_branch_reports_current() {
+        let repo = init_repo_with_branches("ad-hoc").await;
+        let claimer =
+            ExistingWorktreeClaimer::new(repo.path(), None, CleanupPolicy::default()).unwrap();
+
+        let claim = claimer.claim("ENG-7", None).await.unwrap();
+
+        assert_eq!(claim.branch.as_deref(), Some("ad-hoc"));
+    }
+
+    /// Pointing the strategy at a non-git directory must fail at claim
+    /// time with a [`WorkspaceError::Git`]. The constructor only checks
+    /// that the path is a directory; the git-tree assertion is the
+    /// claim's job because it is a runtime invariant.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_worktree_claim_rejects_non_git_directory() {
+        let tmp = TempDir::new().unwrap();
+        let claimer =
+            ExistingWorktreeClaimer::new(tmp.path(), None, CleanupPolicy::default()).unwrap();
+
+        let err = claimer.claim("ENG-7", None).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Git(_)));
+    }
+
+    /// Reserved component (`..`) must be rejected before any git
+    /// invocation, mirroring the other claimers' identifier
+    /// sanitisation contract.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_worktree_claim_rejects_dot_dot_identifier() {
+        let repo = init_repo_with_main_commit().await;
+        let claimer =
+            ExistingWorktreeClaimer::new(repo.path(), None, CleanupPolicy::default()).unwrap();
+
+        let err = claimer.claim("..", None).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Repeated claims for distinct identifiers all share the same
+    /// underlying worktree path — that is the whole point of
+    /// `existing_worktree`. The owner field reflects the latest claim.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_worktree_claim_reuses_path_across_identifiers() {
+        let repo = init_repo_with_branches("integration").await;
+        let claimer = ExistingWorktreeClaimer::new(
+            repo.path(),
+            Some("integration".into()),
+            CleanupPolicy::RetainAlways,
+        )
+        .unwrap();
+
+        let first = claimer.claim("ENG-1", None).await.unwrap();
+        let second = claimer.claim("ENG-2", None).await.unwrap();
+
+        assert_eq!(first.path, second.path);
+        assert_eq!(first.owner.as_ref().unwrap().identifier, "ENG-1");
+        assert_eq!(second.owner.as_ref().unwrap().identifier, "ENG-2");
+        assert!(!first.created_now);
+        assert!(!second.created_now);
     }
 }
