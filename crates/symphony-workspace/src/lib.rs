@@ -422,6 +422,112 @@ pub enum VerificationStatus {
     Failed,
 }
 
+/// Stable check name for the cwd-in-workspace verifier.
+///
+/// Pinned as a constant so log scrapers and tests can grep without
+/// depending on a string literal that might drift. SPEC v2 §8.3 lists
+/// "process cwd equals expected workspace" as the first pre-launch
+/// safety invariant.
+pub const CHECK_CWD_IN_WORKSPACE: &str = "cwd_in_workspace";
+
+/// Verify that `cwd` resolves inside `claim_path`.
+///
+/// This is the SPEC v2 §8.3 "process cwd equals expected workspace"
+/// gate. It is intentionally a pure function so the orchestrator can
+/// invoke it immediately before agent spawn — after `before_run` hooks
+/// have run but before any mutation-capable subprocess starts — and so
+/// tests can drive every branch without filesystem nondeterminism
+/// beyond `tempfile`.
+///
+/// Both paths are canonicalised before comparison so symlinks, `..`
+/// segments, and relative cwds (e.g. `"."`) cannot smuggle a process
+/// outside its workspace. Equality is allowed (cwd == workspace root);
+/// strict containment is allowed (cwd is a descendant). Anything else
+/// fails. Canonicalisation errors fail the check rather than panicking;
+/// agents must not launch when we cannot prove their cwd is safe.
+pub fn verify_cwd_in_workspace(claim_path: &Path, cwd: &Path) -> VerificationCheck {
+    let claim_canon = match claim_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return VerificationCheck {
+                name: CHECK_CWD_IN_WORKSPACE.into(),
+                status: VerificationStatus::Failed,
+                detail: Some(format!(
+                    "canonicalise workspace path {}: {e}",
+                    claim_path.display()
+                )),
+            };
+        }
+    };
+    let cwd_canon = match cwd.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return VerificationCheck {
+                name: CHECK_CWD_IN_WORKSPACE.into(),
+                status: VerificationStatus::Failed,
+                detail: Some(format!("canonicalise cwd {}: {e}", cwd.display())),
+            };
+        }
+    };
+
+    if cwd_canon == claim_canon || cwd_canon.starts_with(&claim_canon) {
+        VerificationCheck {
+            name: CHECK_CWD_IN_WORKSPACE.into(),
+            status: VerificationStatus::Passed,
+            detail: None,
+        }
+    } else {
+        VerificationCheck {
+            name: CHECK_CWD_IN_WORKSPACE.into(),
+            status: VerificationStatus::Failed,
+            detail: Some(format!(
+                "cwd {} is outside workspace {}",
+                cwd_canon.display(),
+                claim_canon.display()
+            )),
+        }
+    }
+}
+
+impl VerificationReport {
+    /// Append `check` and recompute aggregate [`Self::status`].
+    ///
+    /// Aggregate rules: any `Failed` ⇒ `Failed`; otherwise any `Passed`
+    /// ⇒ `Passed`; otherwise unchanged from the prior status. `Skipped`
+    /// alone leaves the aggregate at its previous value so a skipped
+    /// branch check does not retroactively downgrade a passed cwd
+    /// check. This matches SPEC v2 §8.3's "all gates must pass before
+    /// launch" reading: a skip is neither a pass nor a fail.
+    pub fn record(&mut self, check: VerificationCheck) {
+        let incoming = check.status;
+        self.checks.push(check);
+        self.status = match (self.status, incoming) {
+            (_, VerificationStatus::Failed) => VerificationStatus::Failed,
+            (VerificationStatus::Failed, _) => VerificationStatus::Failed,
+            (_, VerificationStatus::Passed) => VerificationStatus::Passed,
+            (current, VerificationStatus::Skipped) => current,
+            (current, VerificationStatus::Pending) => current,
+        };
+    }
+}
+
+impl WorkspaceClaim {
+    /// Run [`verify_cwd_in_workspace`] for this claim and record the
+    /// result on [`Self::verification`]. Returns `true` iff the cwd
+    /// check passed; callers (the orchestrator's pre-launch path)
+    /// MUST NOT spawn an agent when this returns `false`.
+    ///
+    /// Records onto the report rather than replacing it so subsequent
+    /// branch / clean-tree verifiers (later Phase 6 items) compose
+    /// without each one having to re-run prior checks.
+    pub fn verify_cwd(&mut self, cwd: &Path) -> bool {
+        let check = verify_cwd_in_workspace(&self.path, cwd);
+        let passed = matches!(check.status, VerificationStatus::Passed);
+        self.verification.record(check);
+        passed
+    }
+}
+
 /// Abstract per-issue workspace lifecycle.
 ///
 /// The orchestrator calls [`Self::claim`] before launching an agent
@@ -2086,6 +2192,149 @@ mod tests {
         assert_eq!(claim.verification.status, VerificationStatus::Passed);
         assert_eq!(claim.verification.checks.len(), 1);
         assert_eq!(claim.verification.checks[0].name, "cwd_in_workspace");
+    }
+
+    // ----- pre-launch cwd verifier (Phase 6) ------------------------------
+
+    /// Cwd equal to the workspace path itself passes — that is the
+    /// nominal case for an agent launched at workspace root.
+    #[test]
+    fn verify_cwd_passes_when_cwd_equals_claim_path() {
+        let tmp = TempDir::new().unwrap();
+        let check = verify_cwd_in_workspace(tmp.path(), tmp.path());
+        assert_eq!(check.name, CHECK_CWD_IN_WORKSPACE);
+        assert_eq!(check.status, VerificationStatus::Passed);
+        assert!(check.detail.is_none());
+    }
+
+    /// Cwd at a descendant of the workspace path passes — agents are
+    /// allowed to chdir into nested directories under their workspace.
+    #[test]
+    fn verify_cwd_passes_when_cwd_is_descendant() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("src").join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let check = verify_cwd_in_workspace(tmp.path(), &nested);
+        assert_eq!(check.status, VerificationStatus::Passed);
+    }
+
+    /// Cwd outside the workspace fails with a detail naming both
+    /// canonical paths so an operator can diagnose without rerunning.
+    #[test]
+    fn verify_cwd_fails_when_cwd_is_outside_workspace() {
+        let tmp_ws = TempDir::new().unwrap();
+        let tmp_other = TempDir::new().unwrap();
+        let check = verify_cwd_in_workspace(tmp_ws.path(), tmp_other.path());
+        assert_eq!(check.status, VerificationStatus::Failed);
+        let detail = check.detail.expect("failed check must carry detail");
+        assert!(detail.contains("outside workspace"), "got: {detail}");
+    }
+
+    /// A `..` segment that escapes the workspace canonicalises to a
+    /// path outside the workspace and must fail. This is the v2 §8.3
+    /// invariant: a process cwd that *resolves* outside the claim is a
+    /// safety violation regardless of how the path was spelled.
+    #[test]
+    fn verify_cwd_rejects_dotdot_escape() {
+        let parent = TempDir::new().unwrap();
+        let ws = parent.path().join("ws");
+        let sibling = parent.path().join("sibling");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let escaped = ws.join("..").join("sibling");
+        let check = verify_cwd_in_workspace(&ws, &escaped);
+        assert_eq!(check.status, VerificationStatus::Failed);
+    }
+
+    /// A nonexistent cwd cannot be canonicalised and must fail rather
+    /// than panicking — the orchestrator must not launch an agent into
+    /// a directory we cannot prove exists.
+    #[test]
+    fn verify_cwd_fails_when_cwd_missing() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let check = verify_cwd_in_workspace(tmp.path(), &missing);
+        assert_eq!(check.status, VerificationStatus::Failed);
+        assert!(check.detail.is_some());
+    }
+
+    /// `WorkspaceClaim::verify_cwd` records onto the embedded report
+    /// and flips aggregate status to `Passed`. Returns `true` so the
+    /// orchestrator can gate agent launch on a single boolean.
+    #[test]
+    fn workspace_claim_verify_cwd_records_pass() {
+        let tmp = TempDir::new().unwrap();
+        let mut claim = WorkspaceClaim {
+            path: tmp.path().to_path_buf(),
+            strategy: ClaimStrategy::Directory,
+            base_ref: None,
+            branch: None,
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_cwd(tmp.path()));
+        assert_eq!(claim.verification.status, VerificationStatus::Passed);
+        assert_eq!(claim.verification.checks.len(), 1);
+        assert_eq!(claim.verification.checks[0].name, CHECK_CWD_IN_WORKSPACE);
+    }
+
+    /// A failed cwd verification flips the report to `Failed` and the
+    /// method returns `false`.
+    #[test]
+    fn workspace_claim_verify_cwd_records_fail() {
+        let ws = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let mut claim = WorkspaceClaim {
+            path: ws.path().to_path_buf(),
+            strategy: ClaimStrategy::Directory,
+            base_ref: None,
+            branch: None,
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(!claim.verify_cwd(other.path()));
+        assert_eq!(claim.verification.status, VerificationStatus::Failed);
+    }
+
+    /// A subsequent `Failed` check must downgrade an aggregate that
+    /// was previously `Passed` — `Failed` is sticky once any gate fails.
+    #[test]
+    fn verification_report_failed_dominates_passed() {
+        let mut report = VerificationReport::default();
+        report.record(VerificationCheck {
+            name: "a".into(),
+            status: VerificationStatus::Passed,
+            detail: None,
+        });
+        assert_eq!(report.status, VerificationStatus::Passed);
+        report.record(VerificationCheck {
+            name: "b".into(),
+            status: VerificationStatus::Failed,
+            detail: None,
+        });
+        assert_eq!(report.status, VerificationStatus::Failed);
+    }
+
+    /// A `Skipped` check leaves the aggregate at its prior value — a
+    /// skip is neither a pass nor a fail (SPEC v2 §8.3).
+    #[test]
+    fn verification_report_skipped_preserves_prior_status() {
+        let mut report = VerificationReport::default();
+        report.record(VerificationCheck {
+            name: "a".into(),
+            status: VerificationStatus::Passed,
+            detail: None,
+        });
+        report.record(VerificationCheck {
+            name: "b".into(),
+            status: VerificationStatus::Skipped,
+            detail: None,
+        });
+        assert_eq!(report.status, VerificationStatus::Passed);
     }
 
     // ----- branch template renderer (Phase 6) -----------------------------
