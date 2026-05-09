@@ -204,6 +204,24 @@ pub trait RunRepository {
     /// List runs for a work item, ordered by `id` ascending (which is
     /// also creation order under SQLite's autoincrement).
     fn list_runs_for_work_item(&self, work_item_id: WorkItemId) -> StateResult<Vec<RunRecord>>;
+
+    /// Return runs whose durable lease has expired as of `now`.
+    ///
+    /// A run is considered to hold a lease iff `lease_expires_at IS NOT
+    /// NULL`; when the run reaches a terminal status the kernel is
+    /// expected to clear the lease columns. This query therefore returns
+    /// runs that were in flight when the previous orchestrator process
+    /// died — exactly the rows the recovery scheduler must pick up
+    /// (ARCHITECTURE_v2.md §7.2: "On restart, expired leases become
+    /// recoverable work").
+    ///
+    /// `now` is an RFC3339 timestamp string compared lexicographically.
+    /// Lex order matches chronological order only when callers use a
+    /// consistent format (same fractional-second precision, `Z` suffix);
+    /// the kernel produces timestamps from a single source so this holds
+    /// in practice. Results are ordered by `lease_expires_at ASC` so the
+    /// oldest stale lease is reclaimed first.
+    fn find_expired_leases(&self, now: &str) -> StateResult<Vec<RunRecord>>;
 }
 
 const WORK_ITEM_COLUMNS: &str = "id, tracker_id, identifier, parent_id, title, \
@@ -384,6 +402,21 @@ pub(crate) fn update_run_status_in(
     Ok(updated == 1)
 }
 
+pub(crate) fn find_expired_leases_in(conn: &Connection, now: &str) -> StateResult<Vec<RunRecord>> {
+    let sql = format!(
+        "SELECT {RUN_COLUMNS} FROM runs \
+         WHERE lease_expires_at IS NOT NULL AND lease_expires_at < ?1 \
+         ORDER BY lease_expires_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![now], map_run)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn list_runs_for_work_item_in(
     conn: &Connection,
     work_item_id: WorkItemId,
@@ -448,6 +481,10 @@ impl RunRepository for StateDb {
 
     fn list_runs_for_work_item(&self, work_item_id: WorkItemId) -> StateResult<Vec<RunRecord>> {
         list_runs_for_work_item_in(self.conn(), work_item_id)
+    }
+
+    fn find_expired_leases(&self, now: &str) -> StateResult<Vec<RunRecord>> {
+        find_expired_leases_in(self.conn(), now)
     }
 }
 
@@ -640,6 +677,98 @@ mod tests {
         assert!(db.update_run_status(run.id, "running").unwrap());
         assert_eq!(db.get_run(run.id).unwrap().unwrap().status, "running");
         assert!(!db.update_run_status(RunId(123_456), "done").unwrap());
+    }
+
+    fn set_lease(db: &StateDb, run_id: RunId, owner: Option<&str>, expires_at: Option<&str>) {
+        db.conn()
+            .execute(
+                "UPDATE runs SET lease_owner = ?2, lease_expires_at = ?3 WHERE id = ?1",
+                params![run_id.0, owner, expires_at],
+            )
+            .expect("set lease");
+    }
+
+    fn seed_run(db: &mut StateDb, identifier: &str) -> RunId {
+        let wi = db
+            .create_work_item(sample_work_item(identifier, "2026-05-08T00:00:00Z"))
+            .expect("wi");
+        db.create_run(NewRun {
+            work_item_id: wi.id,
+            role: "platform_lead",
+            agent: "claude",
+            status: "running",
+            workspace_claim_id: None,
+            now: "2026-05-08T00:00:00Z",
+        })
+        .expect("run")
+        .id
+    }
+
+    #[test]
+    fn find_expired_leases_returns_only_runs_past_now() {
+        let mut db = open();
+        let stale = seed_run(&mut db, "ENG-1");
+        let fresh = seed_run(&mut db, "ENG-2");
+        let cleared = seed_run(&mut db, "ENG-3");
+
+        set_lease(&db, stale, Some("worker-a"), Some("2026-05-08T00:00:00Z"));
+        set_lease(&db, fresh, Some("worker-b"), Some("2026-05-08T02:00:00Z"));
+        // `cleared` keeps lease_expires_at = NULL — it must never appear.
+        set_lease(&db, cleared, None, None);
+
+        let expired = db
+            .find_expired_leases("2026-05-08T01:00:00Z")
+            .expect("query");
+        let ids: Vec<_> = expired.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![stale]);
+        assert_eq!(expired[0].lease_owner.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn find_expired_leases_orders_oldest_first() {
+        let mut db = open();
+        let mid = seed_run(&mut db, "ENG-1");
+        let oldest = seed_run(&mut db, "ENG-2");
+        let newest = seed_run(&mut db, "ENG-3");
+
+        set_lease(&db, mid, Some("a"), Some("2026-05-08T01:00:00Z"));
+        set_lease(&db, oldest, Some("b"), Some("2026-05-08T00:00:00Z"));
+        set_lease(&db, newest, Some("c"), Some("2026-05-08T02:00:00Z"));
+
+        let expired = db
+            .find_expired_leases("2026-05-08T03:00:00Z")
+            .expect("query");
+        let ids: Vec<_> = expired.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![oldest, mid, newest]);
+    }
+
+    #[test]
+    fn find_expired_leases_excludes_runs_with_no_lease() {
+        let mut db = open();
+        let _r = seed_run(&mut db, "ENG-1");
+        let expired = db
+            .find_expired_leases("2999-01-01T00:00:00Z")
+            .expect("query");
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn find_expired_leases_boundary_is_strictly_less_than() {
+        let mut db = open();
+        let r = seed_run(&mut db, "ENG-1");
+        set_lease(&db, r, Some("w"), Some("2026-05-08T00:00:00Z"));
+
+        // Exact equality is not "expired" — the lease just reached its
+        // deadline; the next tick will reclaim it.
+        let at_boundary = db
+            .find_expired_leases("2026-05-08T00:00:00Z")
+            .expect("query");
+        assert!(at_boundary.is_empty());
+
+        let past = db
+            .find_expired_leases("2026-05-08T00:00:01Z")
+            .expect("query");
+        assert_eq!(past.len(), 1);
     }
 
     #[test]

@@ -34,7 +34,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add repository traits for work items and runs.
 - [x] Add append-only event repository with monotonically increasing sequence.
 - [x] Add transaction helper for state transition + event append.
-- [ ] Add recovery query for expired leases/runs.
+- [x] Add recovery query for expired leases/runs.
 - [ ] Add tests proving state survives process restart using a temp SQLite DB.
 
 ## Phase 3 — Core Domain Types
