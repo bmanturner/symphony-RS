@@ -115,6 +115,13 @@ pub struct BudgetPauseDispatchRequest {
     pub limit_value: f64,
     /// Observed value at pause time.
     pub observed: f64,
+    /// Durable `runs` row this dispatch will animate, when known. The
+    /// budget-pause runner uses this to acquire/release the durable
+    /// lease (CHECKLIST_v2 Phase 11). `None` for legacy producers that
+    /// do not reserve a run row before queueing — those dispatches
+    /// bypass lease acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<crate::blocker::RunRef>,
 }
 
 /// Errors a [`BudgetPauseQueueSource`] may surface to the tick.
@@ -295,6 +302,7 @@ impl QueueTick for BudgetPauseQueueTick {
                 budget_kind: c.budget_kind,
                 limit_value: c.limit_value,
                 observed: c.observed,
+                run_id: None,
             });
             self.claimed
                 .lock()
@@ -591,6 +599,7 @@ mod tests {
             budget_kind: "max_retries".into(),
             limit_value: 3.0,
             observed: 4.0,
+            run_id: None,
         });
         q.enqueue(BudgetPauseDispatchRequest {
             pause_id: BudgetPauseId::new(2),
@@ -598,6 +607,7 @@ mod tests {
             budget_kind: "max_cost_per_issue_usd".into(),
             limit_value: 10.0,
             observed: 11.5,
+            run_id: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -663,8 +673,27 @@ mod tests {
             budget_kind: "max_retries".into(),
             limit_value: 3.0,
             observed: 4.0,
+            run_id: None,
         };
         let json = serde_json::to_string(&r).unwrap();
+        // `run_id: None` should be skipped when serializing.
+        assert!(!json.contains("run_id"));
+        let back: BudgetPauseDispatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn dispatch_request_round_trips_when_run_id_present() {
+        let r = BudgetPauseDispatchRequest {
+            pause_id: BudgetPauseId::new(9),
+            work_item_id: WorkItemId::new(100),
+            budget_kind: "max_retries".into(),
+            limit_value: 3.0,
+            observed: 4.0,
+            run_id: Some(crate::blocker::RunRef::new(99)),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("run_id"));
         let back: BudgetPauseDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
     }
