@@ -41,7 +41,6 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Exclude `qa_gate` from normal implementation child assignment unless workflow explicitly allows manual QA task issues.
 - [ ] Exclude other `integration_owner` roles from normal child assignment unless workflow explicitly allows nested/secondary integration ownership.
 - [ ] Add deterministic rendering for the platform-lead catalog prompt section.
-- [ ] Add tests proving catalog content comes from `WORKFLOW.md` role/routing metadata, not per-role `ASSIGNMENT.md` files.
 - [ ] Add tests proving terse-description fallback emits warnings.
 
 ## Phase 4 — Prompt Assembly Core
