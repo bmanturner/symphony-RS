@@ -2651,6 +2651,9 @@ mod tests {
             parent_title: "title".into(),
             cause: IntegrationRequestCause::AllChildrenTerminal,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         };
         assert_eq!(
             NoopIntegrationDispatcher
