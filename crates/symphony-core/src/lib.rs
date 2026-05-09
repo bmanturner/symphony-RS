@@ -29,6 +29,7 @@ pub mod poll_loop;
 pub mod prompt;
 pub mod pull_request;
 pub mod qa;
+pub mod qa_blocker;
 pub mod qa_request;
 pub mod retry;
 pub mod role;
@@ -95,6 +96,7 @@ pub use qa::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, QaError, QaEvidence, QaOutcome, QaVerdict,
     QaVerdictId,
 };
+pub use qa_blocker::{QaBlockerError, QaBlockerSpec, derive_qa_blockers};
 pub use qa_request::{
     QaDraftPullRequest, QaRequestCause, QaRequestError, QaRunRequest, QaWorkspace,
 };
