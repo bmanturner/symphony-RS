@@ -23,6 +23,7 @@ pub mod poll_loop;
 pub mod qa;
 pub mod retry;
 pub mod role;
+pub mod routing;
 pub mod state_machine;
 pub mod tracker;
 pub mod tracker_trait;
@@ -57,6 +58,10 @@ pub use qa::{
 };
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};
+pub use routing::{
+    RoutingContext, RoutingDecision, RoutingEngine, RoutingError, RoutingMatch, RoutingMatchMode,
+    RoutingRule, RoutingTable,
+};
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
 pub use tracker_trait::{
