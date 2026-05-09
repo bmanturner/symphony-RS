@@ -42,6 +42,7 @@ pub mod queue_tick;
 pub mod retry;
 pub mod role;
 pub mod routing;
+pub mod specialist_tick;
 pub mod state_machine;
 pub mod tracker;
 pub mod tracker_trait;
@@ -133,6 +134,9 @@ pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, Rol
 pub use routing::{
     RoutingContext, RoutingDecision, RoutingEngine, RoutingError, RoutingMatch, RoutingMatchMode,
     RoutingRule, RoutingTable,
+};
+pub use specialist_tick::{
+    RoleKindLookup, SpecialistDispatchQueue, SpecialistDispatchRequest, SpecialistQueueTick,
 };
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
