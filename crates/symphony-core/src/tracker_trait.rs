@@ -6,11 +6,12 @@
 //!
 //! * [`TrackerRead`] — read-only candidate/state/recovery queries the
 //!   poll loop relies on. All current adapters MUST implement this.
-//! * [`TrackerMutations`] — write-side capabilities (create issue, comment,
-//!   add blocker, link parent/child, attach artifact). Adapters opt in;
-//!   workflows that require mutations check capability before dispatching.
-//!   The trait surface is intentionally a marker here — request/response
-//!   types and methods land in a follow-up checklist item.
+//! * [`TrackerMutations`] — write-side capabilities (create issue, update
+//!   issue, comment, add blocker, link parent/child, attach artifact).
+//!   Adapters opt in; workflows that require mutations check
+//!   [`TrackerRead::capabilities`] before dispatching. Each method on the
+//!   trait corresponds to a flag on [`TrackerCapabilities`] and a section
+//!   in SPEC v2 §7.2.
 //!
 //! The split lets workflows detect read-only vs mutation-capable adapters
 //! and lets adapters that genuinely cannot mutate (e.g. an audit-log
@@ -51,6 +52,7 @@
 
 use crate::tracker::{Issue, IssueId, IssueState};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Failures a tracker adapter can report to the orchestrator.
@@ -269,6 +271,201 @@ pub trait TrackerRead: Send + Sync {
     }
 }
 
+/// Request to create a new issue in the tracker (SPEC v2 §7.2 "create issue").
+///
+/// Used by the integration owner during decomposition and by any role
+/// filing follow-up issues (`FollowupIssueRequest` lowers into this once
+/// approved). Fields use `Option`/`Vec` rather than newtype wrappers so
+/// adapters can map them directly onto whatever subset their backend
+/// supports without a second translation layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateIssueRequest {
+    /// Issue title. Required by every supported tracker.
+    pub title: String,
+    /// Markdown/plaintext body. `None` lets the adapter render its own
+    /// default (e.g. an empty Linear description vs GitHub's omitted body).
+    pub body: Option<String>,
+    /// Labels to attach on creation. Adapters compare case-insensitively
+    /// (SPEC §11.3) but preserve casing for display.
+    pub labels: Vec<String>,
+    /// Assignees expressed in adapter-native form (Linear user id, GitHub
+    /// login). Empty vec means "do not assign".
+    pub assignees: Vec<String>,
+    /// Optional parent issue id; adapters that support structural parent
+    /// links (Linear sub-issues) set the link atomically with creation,
+    /// adapters that don't (GitHub) MUST issue a follow-up
+    /// [`LinkParentChildRequest`] rather than silently dropping the link.
+    pub parent: Option<IssueId>,
+    /// Initial state to place the new issue in. `None` means "tracker
+    /// default" (typically the configured first active state).
+    pub initial_state: Option<IssueState>,
+}
+
+/// Result of [`TrackerMutations::create_issue`]. Carries identifiers the
+/// orchestrator persists in `work_items` and uses to hydrate parent/child
+/// edges; the adapter-supplied `url` is observability sugar, not load-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateIssueResponse {
+    /// Stable tracker-internal id (matches [`Issue::id`]).
+    pub id: IssueId,
+    /// Human-readable identifier (`ABC-123` for Linear, `#42` for GitHub).
+    pub identifier: String,
+    /// Tracker-side URL, when the adapter can synthesize one cheaply.
+    pub url: Option<String>,
+}
+
+/// Request to update an existing issue (SPEC v2 §7.2 "update status",
+/// "assign role/agent or equivalent labels").
+///
+/// All mutation fields are `Option`/`Vec` so the same struct expresses
+/// "advance state", "rename title", and "rotate assignees" without a
+/// per-operation enum. Empty vecs are no-ops; the adapter MUST NOT
+/// interpret an empty `add_labels` as "clear all labels" — `remove_labels`
+/// is the only label-removal channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateIssueRequest {
+    /// Issue to update.
+    pub id: IssueId,
+    /// New state, if the caller is advancing workflow status.
+    pub state: Option<IssueState>,
+    /// New title, if renaming.
+    pub title: Option<String>,
+    /// New body, if rewriting.
+    pub body: Option<String>,
+    /// Labels to add. Adapters dedupe against existing labels.
+    pub add_labels: Vec<String>,
+    /// Labels to remove. Removing a label that isn't attached is a no-op,
+    /// not an error.
+    pub remove_labels: Vec<String>,
+    /// Assignees to add (adapter-native ids).
+    pub add_assignees: Vec<String>,
+    /// Assignees to remove (adapter-native ids).
+    pub remove_assignees: Vec<String>,
+}
+
+/// Result of [`TrackerMutations::update_issue`]. The state echo lets the
+/// orchestrator confirm the tracker-observed state, which can differ from
+/// the requested state when the tracker rewrites unknown values to a
+/// configured default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateIssueResponse {
+    /// Issue that was updated.
+    pub id: IssueId,
+    /// Authoritative state the tracker reports after the update; `None`
+    /// when the request did not include a state change.
+    pub state: Option<IssueState>,
+}
+
+/// Request to post a comment / activity entry (SPEC v2 §7.2 "add comment").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddCommentRequest {
+    /// Issue to comment on.
+    pub issue: IssueId,
+    /// Comment body (markdown where supported).
+    pub body: String,
+    /// Optional role name for prefix/footer rendering — purely advisory
+    /// for adapters that can't impersonate users (most can't).
+    pub author_role: Option<String>,
+}
+
+/// Result of [`TrackerMutations::add_comment`]. Comment id is optional
+/// because some adapters (or label-only proxies) cannot return one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddCommentResponse {
+    /// Tracker-side comment id, when available.
+    pub id: Option<String>,
+    /// URL, when the adapter can synthesize one.
+    pub url: Option<String>,
+}
+
+/// Request to express that one issue blocks another (SPEC v2 §7.2 "create
+/// blocker/dependency"). Capability flag `add_blocker` is gated on
+/// structural support — label-only proxies MUST report `add_blocker:
+/// false` and reject this call rather than silently degrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddBlockerRequest {
+    /// Issue that is blocked.
+    pub blocked: IssueId,
+    /// Issue that is doing the blocking.
+    pub blocker: IssueId,
+    /// Optional human-readable reason; surfaces on the tracker UI when
+    /// the backend supports a description on the blocker edge.
+    pub reason: Option<String>,
+}
+
+/// Result of [`TrackerMutations::add_blocker`]. The edge id, when
+/// available, is what the adapter would use to remove the relationship
+/// later — adapters without addressable edges leave it `None` and remove
+/// by `(blocked, blocker)` pair instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddBlockerResponse {
+    /// Tracker-internal id for the blocker/dependency edge, when
+    /// available.
+    pub edge_id: Option<String>,
+}
+
+/// Request to link a parent and child issue (SPEC v2 §7.2 "link
+/// parent/child"). Required for decomposition workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkParentChildRequest {
+    /// Parent (broad) issue.
+    pub parent: IssueId,
+    /// Child issue to attach under the parent.
+    pub child: IssueId,
+}
+
+/// Result of [`TrackerMutations::link_parent_child`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkParentChildResponse {
+    /// Tracker-internal id for the parent/child edge, when available.
+    pub edge_id: Option<String>,
+}
+
+/// Kind of artifact being attached to an issue (SPEC v2 §7.2 "attach
+/// PR/artifact/evidence"). Open-ended `Other` exists because workflows
+/// can configure custom evidence kinds (screenshot, design link, etc)
+/// without a kernel change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ArtifactKind {
+    /// Pull request reference (URL or `owner/repo#N`).
+    PullRequest,
+    /// Run log, transcript, or trace produced by an agent run.
+    RunLog,
+    /// QA verdict evidence (screenshots, command transcripts, etc).
+    QaEvidence,
+    /// Workflow-specific evidence kind named by the workflow config.
+    Other { name: String },
+}
+
+/// Request to attach an artifact to an issue (SPEC v2 §7.2 "attach
+/// PR/artifact/evidence"). Typical callers are the integration owner
+/// (PR ref) and QA (evidence URLs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachArtifactRequest {
+    /// Issue the artifact is being attached to.
+    pub issue: IssueId,
+    /// Discriminator the adapter uses to decide where to render it
+    /// (description block, comment, custom field, …).
+    pub kind: ArtifactKind,
+    /// URI of the artifact. Adapters MUST NOT upload binaries through
+    /// this surface; the artifact is hosted elsewhere and only its URI
+    /// is recorded on the issue.
+    pub uri: String,
+    /// Display label / short caption, when the surface supports one.
+    pub label: Option<String>,
+    /// Free-form note appended near the artifact reference.
+    pub note: Option<String>,
+}
+
+/// Result of [`TrackerMutations::attach_artifact`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachArtifactResponse {
+    /// Tracker-side handle for the attachment, when available
+    /// (comment id, attachment id, custom-field id…).
+    pub id: Option<String>,
+}
+
 /// Mutation-side capabilities a tracker MAY support (SPEC v2 §7.2).
 ///
 /// Adapters opt in by implementing this trait. Workflows that decompose
@@ -276,17 +473,54 @@ pub trait TrackerRead: Send + Sync {
 /// against a mutation-capable adapter; advisory-only workflows can run
 /// with a [`TrackerRead`]-only adapter.
 ///
-/// This trait is intentionally a marker right now: request/response types
-/// and the actual `create_issue` / `add_comment` / `add_blocker` /
-/// `link_parent_child` / `attach_artifact` methods land in a dedicated
-/// follow-up checklist item ("Add mutation request/response types"). The
-/// type is exposed in the public surface today so adapter scaffolding,
-/// capability reporting, and downstream code can already refer to it
-/// without a churn-cycle later.
+/// Each method maps 1:1 to a [`TrackerCapabilities`] flag — an adapter
+/// that returns `add_blocker: false` from [`TrackerRead::capabilities`]
+/// MUST return a [`TrackerError::Misconfigured`] from
+/// [`Self::add_blocker`] rather than silently degrading to a label-only
+/// approximation. The orchestrator reads capabilities at the read seam
+/// before dispatching, so this is a defense-in-depth check, not a hot
+/// path.
 ///
 /// `Send + Sync` for the same dyn-erasure reasons as [`TrackerRead`].
 #[async_trait]
-pub trait TrackerMutations: Send + Sync {}
+pub trait TrackerMutations: Send + Sync {
+    /// Create a new issue (SPEC v2 §7.2 "create issue"). Caller MUST have
+    /// confirmed [`TrackerCapabilities::create_issue`] beforehand.
+    async fn create_issue(&self, request: CreateIssueRequest)
+    -> TrackerResult<CreateIssueResponse>;
+
+    /// Update an existing issue's state, title, body, labels, or
+    /// assignees (SPEC v2 §7.2 "update status" + "assign role/agent or
+    /// equivalent labels"). Caller MUST have confirmed
+    /// [`TrackerCapabilities::update_issue`] beforehand.
+    async fn update_issue(&self, request: UpdateIssueRequest)
+    -> TrackerResult<UpdateIssueResponse>;
+
+    /// Post a comment / activity entry (SPEC v2 §7.2 "add comment").
+    /// Caller MUST have confirmed [`TrackerCapabilities::add_comment`]
+    /// beforehand.
+    async fn add_comment(&self, request: AddCommentRequest) -> TrackerResult<AddCommentResponse>;
+
+    /// Express a structural blocker/dependency edge (SPEC v2 §7.2
+    /// "create blocker/dependency"). Adapters that can only proxy this
+    /// through labels MUST report `add_blocker: false` and reject this
+    /// call.
+    async fn add_blocker(&self, request: AddBlockerRequest) -> TrackerResult<AddBlockerResponse>;
+
+    /// Link a child issue to its parent (SPEC v2 §7.2 "link
+    /// parent/child"). Required by decomposition workflows.
+    async fn link_parent_child(
+        &self,
+        request: LinkParentChildRequest,
+    ) -> TrackerResult<LinkParentChildResponse>;
+
+    /// Attach a PR ref, run log, or QA evidence URI to an issue (SPEC v2
+    /// §7.2 "attach PR/artifact/evidence").
+    async fn attach_artifact(
+        &self,
+        request: AttachArtifactRequest,
+    ) -> TrackerResult<AttachArtifactResponse>;
+}
 
 #[cfg(test)]
 mod tests {
@@ -340,19 +574,231 @@ mod tests {
         assert!(terminal.is_empty());
     }
 
-    /// `TrackerMutations` is intentionally a marker today; this test pins
-    /// the public-surface guarantee that the trait exists, is object-safe,
-    /// and inherits `Send + Sync` so adapters can scaffold against it
-    /// before request/response types land.
-    #[test]
-    fn tracker_mutations_is_object_safe_and_send_sync() {
-        struct ReadOnlyAdapter;
-        #[async_trait]
-        impl TrackerMutations for ReadOnlyAdapter {}
+    /// Pin the public-surface guarantee that [`TrackerMutations`] is
+    /// object-safe, `Send + Sync`, and that every method the orchestrator
+    /// wires into can be invoked through `Arc<dyn TrackerMutations>`.
+    /// The stub adapter rejects every mutation with `Misconfigured` to
+    /// model an adapter that exists in scaffolding but hasn't earned
+    /// any capability flags yet.
+    #[tokio::test]
+    async fn tracker_mutations_is_object_safe_and_every_method_callable_through_dyn() {
+        struct StubMutations;
 
-        let _erased: Arc<dyn TrackerMutations> = Arc::new(ReadOnlyAdapter);
+        #[async_trait]
+        impl TrackerMutations for StubMutations {
+            async fn create_issue(
+                &self,
+                _request: CreateIssueRequest,
+            ) -> TrackerResult<CreateIssueResponse> {
+                Err(TrackerError::Misconfigured("stub".into()))
+            }
+            async fn update_issue(
+                &self,
+                _request: UpdateIssueRequest,
+            ) -> TrackerResult<UpdateIssueResponse> {
+                Err(TrackerError::Misconfigured("stub".into()))
+            }
+            async fn add_comment(
+                &self,
+                _request: AddCommentRequest,
+            ) -> TrackerResult<AddCommentResponse> {
+                Err(TrackerError::Misconfigured("stub".into()))
+            }
+            async fn add_blocker(
+                &self,
+                _request: AddBlockerRequest,
+            ) -> TrackerResult<AddBlockerResponse> {
+                Err(TrackerError::Misconfigured("stub".into()))
+            }
+            async fn link_parent_child(
+                &self,
+                _request: LinkParentChildRequest,
+            ) -> TrackerResult<LinkParentChildResponse> {
+                Err(TrackerError::Misconfigured("stub".into()))
+            }
+            async fn attach_artifact(
+                &self,
+                _request: AttachArtifactRequest,
+            ) -> TrackerResult<AttachArtifactResponse> {
+                Err(TrackerError::Misconfigured("stub".into()))
+            }
+        }
+
+        let mutations: Arc<dyn TrackerMutations> = Arc::new(StubMutations);
+
+        // Each call goes through the vtable; the rejection proves the
+        // method actually dispatched rather than being optimized away.
+        assert!(matches!(
+            mutations
+                .create_issue(CreateIssueRequest {
+                    title: "t".into(),
+                    body: None,
+                    labels: vec![],
+                    assignees: vec![],
+                    parent: None,
+                    initial_state: None,
+                })
+                .await,
+            Err(TrackerError::Misconfigured(_))
+        ));
+        assert!(
+            mutations
+                .update_issue(UpdateIssueRequest {
+                    id: IssueId::new("a"),
+                    state: None,
+                    title: None,
+                    body: None,
+                    add_labels: vec![],
+                    remove_labels: vec![],
+                    add_assignees: vec![],
+                    remove_assignees: vec![],
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            mutations
+                .add_comment(AddCommentRequest {
+                    issue: IssueId::new("a"),
+                    body: "hi".into(),
+                    author_role: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            mutations
+                .add_blocker(AddBlockerRequest {
+                    blocked: IssueId::new("a"),
+                    blocker: IssueId::new("b"),
+                    reason: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            mutations
+                .link_parent_child(LinkParentChildRequest {
+                    parent: IssueId::new("a"),
+                    child: IssueId::new("b"),
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            mutations
+                .attach_artifact(AttachArtifactRequest {
+                    issue: IssueId::new("a"),
+                    kind: ArtifactKind::PullRequest,
+                    uri: "https://example.test/pr/1".into(),
+                    label: None,
+                    note: None,
+                })
+                .await
+                .is_err()
+        );
+
         fn assert_send_sync<T: Send + Sync + ?Sized>() {}
         assert_send_sync::<dyn TrackerMutations>();
+    }
+
+    #[test]
+    fn create_issue_request_round_trips_through_serde_with_optional_fields_omitted() {
+        let req = CreateIssueRequest {
+            title: "decompose payments refactor".into(),
+            body: Some("see acceptance criteria".into()),
+            labels: vec!["needs-triage".into()],
+            assignees: vec!["alice".into()],
+            parent: Some(IssueId::new("PARENT-1")),
+            initial_state: Some(IssueState::new("Todo")),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: CreateIssueRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn update_issue_request_distinguishes_add_remove_label_channels() {
+        let req = UpdateIssueRequest {
+            id: IssueId::new("ABC-1"),
+            state: Some(IssueState::new("In Review")),
+            title: None,
+            body: None,
+            add_labels: vec!["qa-pass".into()],
+            remove_labels: vec!["qa-pending".into()],
+            add_assignees: vec![],
+            remove_assignees: vec![],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: UpdateIssueRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+        assert_ne!(req.add_labels, req.remove_labels);
+    }
+
+    #[test]
+    fn artifact_kind_serializes_with_internal_tag_and_supports_other_named_variant() {
+        let pr = serde_json::to_value(ArtifactKind::PullRequest).unwrap();
+        assert_eq!(pr["type"], "pull_request");
+
+        let other = ArtifactKind::Other {
+            name: "design-doc".into(),
+        };
+        let v = serde_json::to_value(&other).unwrap();
+        assert_eq!(v["type"], "other");
+        assert_eq!(v["name"], "design-doc");
+
+        let back: ArtifactKind = serde_json::from_value(v).unwrap();
+        assert_eq!(back, other);
+    }
+
+    #[test]
+    fn attach_artifact_request_round_trips_with_optional_label_and_note() {
+        let req = AttachArtifactRequest {
+            issue: IssueId::new("PR-LINK"),
+            kind: ArtifactKind::PullRequest,
+            uri: "https://github.com/example/repo/pull/42".into(),
+            label: Some("draft PR".into()),
+            note: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: AttachArtifactRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn add_blocker_and_link_parent_child_distinguish_their_endpoints() {
+        // The two requests are structurally similar but semantically
+        // distinct — pin that the field names don't accidentally drift
+        // into a single shape.
+        let blocker = AddBlockerRequest {
+            blocked: IssueId::new("downstream"),
+            blocker: IssueId::new("upstream"),
+            reason: Some("waiting on schema".into()),
+        };
+        let link = LinkParentChildRequest {
+            parent: IssueId::new("EPIC-1"),
+            child: IssueId::new("TASK-1"),
+        };
+        let blocker_json = serde_json::to_value(&blocker).unwrap();
+        let link_json = serde_json::to_value(&link).unwrap();
+        assert!(blocker_json.get("blocked").is_some());
+        assert!(blocker_json.get("blocker").is_some());
+        assert!(link_json.get("parent").is_some());
+        assert!(link_json.get("child").is_some());
+        assert!(link_json.get("blocked").is_none());
+    }
+
+    #[test]
+    fn add_comment_response_allows_id_and_url_to_be_independently_optional() {
+        // Adapter that returns neither (label-only proxy posting through
+        // a custom field) is valid; the type permits the empty case.
+        let resp = AddCommentResponse {
+            id: None,
+            url: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: AddCommentResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, back);
     }
 
     #[test]

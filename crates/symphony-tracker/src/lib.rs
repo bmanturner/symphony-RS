@@ -18,7 +18,10 @@
 // about the core/tracker split.
 pub use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
 pub use symphony_core::tracker_trait::{
-    TrackerError, TrackerMutations, TrackerRead, TrackerResult,
+    AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse, ArtifactKind,
+    AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+    LinkParentChildRequest, LinkParentChildResponse, TrackerCapabilities, TrackerError,
+    TrackerMutations, TrackerRead, TrackerResult, UpdateIssueRequest, UpdateIssueResponse,
 };
 
 pub mod mock;

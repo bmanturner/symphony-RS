@@ -52,7 +52,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [x] Split current `IssueTracker` into `TrackerRead` and `TrackerMutations` traits, preserving `fetch_terminal_recent` recovery semantics.
 - [x] Add `TrackerCapabilities` so workflows can detect read-only vs mutation-capable adapters.
-- [ ] Add mutation request/response types: create issue, update issue, add comment, add blocker, link parent/child, attach artifact.
+- [x] Add mutation request/response types: create issue, update issue, add comment, add blocker, link parent/child, attach artifact.
 - [ ] Implement mutation no-op/advisory wrapper for read-only trackers.
 - [ ] Extend GitHub adapter with issue create/comment/label-based blocker or relation mapping where feasible.
 - [ ] Extend Linear adapter with issue create/comment/dependency mapping where feasible.

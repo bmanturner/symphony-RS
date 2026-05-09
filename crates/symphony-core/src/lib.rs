@@ -58,7 +58,10 @@ pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, Rol
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
 pub use tracker_trait::{
-    TrackerCapabilities, TrackerError, TrackerMutations, TrackerRead, TrackerResult,
+    AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse, ArtifactKind,
+    AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+    LinkParentChildRequest, LinkParentChildResponse, TrackerCapabilities, TrackerError,
+    TrackerMutations, TrackerRead, TrackerResult, UpdateIssueRequest, UpdateIssueResponse,
 };
 pub use work_item::{
     ClassifyError, StatusClassifier, TrackerStatus, UnknownStatePolicy, WorkItem, WorkItemId,
