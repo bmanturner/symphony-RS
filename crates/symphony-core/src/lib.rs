@@ -27,6 +27,7 @@ pub mod followup_routing;
 pub mod handoff;
 pub mod integration;
 pub mod integration_request;
+pub mod logical_queue;
 pub mod parent_close;
 pub mod poll_loop;
 pub mod prompt;
@@ -96,6 +97,7 @@ pub use integration_request::{
     IntegrationChild, IntegrationGates, IntegrationRequestCause, IntegrationRequestError,
     IntegrationRunRequest, IntegrationWorkspace,
 };
+pub use logical_queue::{LogicalQueue, QueueTickOutcome};
 pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use prompt::{
