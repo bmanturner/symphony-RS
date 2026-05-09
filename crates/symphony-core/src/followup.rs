@@ -262,6 +262,51 @@ pub enum FollowupError {
         /// Its current status.
         current: FollowupStatus,
     },
+    /// [`FollowupIssueRequest::source_link`] was called before the
+    /// follow-up reached [`FollowupStatus::Created`]. The provenance edge
+    /// records *which tracker issue spawned this follow-up*, so it cannot
+    /// be derived until the tracker write has assigned a real
+    /// [`WorkItemId`] to the follow-up.
+    #[error(
+        "followup {id} cannot produce a source link from {current} (must be created and have a tracker work item)"
+    )]
+    NotCreated {
+        /// The follow-up being linked.
+        id: FollowupId,
+        /// Its current status.
+        current: FollowupStatus,
+    },
+}
+
+/// Provenance edge derived from a [`Created`](FollowupStatus::Created)
+/// [`FollowupIssueRequest`] (SPEC v2 §4.10; ARCH §6.4).
+///
+/// Maps cleanly onto the `work_item_edges` `followup_of` row the storage
+/// layer inserts: `source_work_item` is the originating issue
+/// (`parent_id` in the edge schema), `followup_work_item` is the freshly
+/// created follow-up (`child_id`), and `followup_id` lets observers join
+/// the durable follow-up record back to the edge for audit and rendering.
+///
+/// Construct via [`FollowupIssueRequest::source_link`] — the helper
+/// rejects requests that have not yet completed the tracker write so the
+/// kernel cannot accidentally persist a dangling provenance edge that
+/// points at a non-existent work item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FollowupLink {
+    /// Durable follow-up record this link belongs to. Round-tripped so
+    /// downstream observers can join the edge back to the request without
+    /// a second lookup.
+    pub followup_id: FollowupId,
+    /// Issue that *spawned* the follow-up. Becomes the edge's `parent_id`.
+    pub source_work_item: WorkItemId,
+    /// Tracker work item created from the follow-up. Becomes the edge's
+    /// `child_id`.
+    pub followup_work_item: WorkItemId,
+    /// Mirrors [`FollowupIssueRequest::blocking`]. Carried on the link so
+    /// the storage seam can decide the edge `status` (`open` for
+    /// blocking, `linked` for non-blocking) without re-reading the
+    /// follow-up row.
+    pub blocking: bool,
 }
 
 /// Durable follow-up issue request (SPEC v2 §4.10, §5.13).
@@ -472,6 +517,27 @@ impl FollowupIssueRequest {
         self.created_issue_id = Some(created_issue_id);
         self.status = FollowupStatus::Created;
         Ok(())
+    }
+
+    /// Derive the [`FollowupLink`] for the `followup_of` provenance
+    /// edge. Requires the request to be in [`FollowupStatus::Created`]
+    /// (and therefore to have a populated [`Self::created_issue_id`]);
+    /// errors with [`FollowupError::NotCreated`] otherwise so the kernel
+    /// cannot persist an edge that points at an unwritten tracker issue.
+    pub fn source_link(&self) -> Result<FollowupLink, FollowupError> {
+        let followup_work_item = self
+            .created_issue_id
+            .filter(|_| self.status == FollowupStatus::Created)
+            .ok_or(FollowupError::NotCreated {
+                id: self.id,
+                current: self.status,
+            })?;
+        Ok(FollowupLink {
+            followup_id: self.id,
+            source_work_item: self.source_work_item,
+            followup_work_item,
+            blocking: self.blocking,
+        })
     }
 
     /// Cancel a non-terminal request (proposal withdrawn, scope change,
@@ -815,6 +881,91 @@ mod tests {
         assert!(!g.is_blocking_gate());
         g.cancel(None).unwrap();
         assert!(!g.is_blocking_gate());
+    }
+
+    #[test]
+    fn source_link_requires_created_status() {
+        let approved = direct_followup();
+        let err = approved.source_link().unwrap_err();
+        assert_eq!(
+            err,
+            FollowupError::NotCreated {
+                id: approved.id,
+                current: FollowupStatus::Approved,
+            }
+        );
+
+        let proposed = proposed_followup();
+        let err = proposed.source_link().unwrap_err();
+        assert_eq!(
+            err,
+            FollowupError::NotCreated {
+                id: proposed.id,
+                current: FollowupStatus::Proposed,
+            }
+        );
+    }
+
+    #[test]
+    fn source_link_after_mark_created_carries_full_provenance() {
+        let mut f = direct_followup();
+        f.mark_created(WorkItemId::new(99)).unwrap();
+        let link = f.source_link().unwrap();
+        assert_eq!(link.followup_id, f.id);
+        assert_eq!(link.source_work_item, WorkItemId::new(42));
+        assert_eq!(link.followup_work_item, WorkItemId::new(99));
+        assert!(link.blocking, "direct_followup is blocking=true");
+    }
+
+    #[test]
+    fn source_link_carries_non_blocking_flag_through_to_edge_payload() {
+        // proposed_followup is non-blocking; advance it through approval
+        // and creation so source_link is reachable.
+        let mut f = proposed_followup();
+        f.approve(RoleName::new("platform_lead"), "ok").unwrap();
+        f.mark_created(WorkItemId::new(77)).unwrap();
+        let link = f.source_link().unwrap();
+        assert!(!link.blocking);
+        assert_eq!(link.followup_work_item, WorkItemId::new(77));
+    }
+
+    #[test]
+    fn source_link_rejected_after_terminal_off_ramps() {
+        // Cancellation and rejection both leave created_issue_id None,
+        // so source_link must refuse rather than skipping the gate.
+        let mut cancelled = proposed_followup();
+        cancelled.cancel(Some("agent rerun".into())).unwrap();
+        let err = cancelled.source_link().unwrap_err();
+        assert_eq!(
+            err,
+            FollowupError::NotCreated {
+                id: cancelled.id,
+                current: FollowupStatus::Cancelled,
+            }
+        );
+
+        let mut rejected = proposed_followup();
+        rejected
+            .reject(RoleName::new("platform_lead"), "out of scope")
+            .unwrap();
+        let err = rejected.source_link().unwrap_err();
+        assert_eq!(
+            err,
+            FollowupError::NotCreated {
+                id: rejected.id,
+                current: FollowupStatus::Rejected,
+            }
+        );
+    }
+
+    #[test]
+    fn followup_link_round_trips_through_serde() {
+        let mut f = direct_followup();
+        f.mark_created(WorkItemId::new(99)).unwrap();
+        let link = f.source_link().unwrap();
+        let json = serde_json::to_string(&link).unwrap();
+        let back: FollowupLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(link, back);
     }
 
     #[test]

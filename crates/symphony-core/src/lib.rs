@@ -71,7 +71,7 @@ pub use decomposition_runner::{
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use followup::{
-    FollowupError, FollowupId, FollowupIssueRequest, FollowupPolicy, FollowupStatus,
+    FollowupError, FollowupId, FollowupIssueRequest, FollowupLink, FollowupPolicy, FollowupStatus,
 };
 pub use followup_request::{
     FollowupRequestError, FollowupRequestInput, FollowupSpec, derive_followups,
