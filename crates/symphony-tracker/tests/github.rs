@@ -1292,3 +1292,18 @@ async fn mutations_are_dispatchable_through_arc_dyn_tracker_mutations() {
         .expect("dyn dispatch");
     assert!(resp.id.is_some());
 }
+
+#[tokio::test]
+async fn github_tracker_passes_the_mutation_conformance_suite() {
+    // GitHub advertises `add_blocker: false` and `link_parent_child: false`
+    // — the suite probes both off-flags and verifies they reject with
+    // `Misconfigured`. Other mutations are skipped because their flags
+    // are on and the suite intentionally avoids backend-specific wire
+    // setup (covered by the focused tests above).
+    use symphony_tracker::mutation_conformance::run_full_suite as run_mutation_suite;
+    let server = MockServer::start().await;
+    let tracker = Arc::new(tracker_for(&server));
+    let read: Arc<dyn TrackerRead> = tracker.clone();
+    let mutations: Arc<dyn TrackerMutations> = tracker;
+    run_mutation_suite(read.as_ref(), mutations.as_ref()).await;
+}

@@ -31,6 +31,8 @@ pub mod fixtures;
 
 pub mod conformance;
 
+pub mod mutation_conformance;
+
 pub mod linear;
 pub use linear::{LinearConfig, LinearTracker};
 

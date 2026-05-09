@@ -791,3 +791,20 @@ async fn attach_artifact_creates_a_native_attachment() {
         .expect("attach_artifact");
     assert_eq!(resp.id.as_deref(), Some("att-1"));
 }
+
+#[tokio::test]
+async fn linear_tracker_passes_the_mutation_conformance_suite() {
+    // Linear advertises `TrackerCapabilities::FULL`, so the universal
+    // suite finds zero off-flags to probe and returns trivially. The
+    // test still runs as a regression pin: if Linear ever drops a flag,
+    // this call starts probing the corresponding mutation and surfaces
+    // any contract violation. End-to-end happy-path coverage for each
+    // mutation lives in the focused tests above.
+    use symphony_tracker::mutation_conformance::run_full_suite as run_mutation_suite;
+    let scenario = canonical_scenario();
+    let (_server, tracker) = linear_against(scenario).await;
+    let tracker = Arc::new(tracker);
+    let read: Arc<dyn TrackerRead> = tracker.clone();
+    let mutations: Arc<dyn TrackerMutations> = tracker;
+    run_mutation_suite(read.as_ref(), mutations.as_ref()).await;
+}
