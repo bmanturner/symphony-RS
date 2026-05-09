@@ -13,7 +13,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add typed `AgentProfileConfig` decoupled from role names.
 - [x] Add `HermesAgentConfig` command/protocol shape and repackage existing tandem support as a composite strategy over configured agents; keep mock variants test-only.
 - [x] Add typed `RoutingConfig` and `RoutingRule` with explicit `match_mode = first_match | priority` semantics.
-- [ ] Add `PollingConfig`, `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, `FollowupConfig`, `HooksConfig`, and `ObservabilityConfig`. (Decomposed below.)
+- [x] Add `PollingConfig`, `DecompositionConfig`, `IntegrationConfig`, `PullRequestConfig`, `QaConfig`, `FollowupConfig`, `HooksConfig`, and `ObservabilityConfig`. (Decomposed below.)
   - [x] Extend `PollingConfig` with `jitter_ms` and `startup_reconcile_recent_terminal` per SPEC v2 §5.2.
   - [x] Add typed `DecompositionConfig` (SPEC v2 §5.7) with `triggers` substructure and `child_issue_policy` enum.
   - [x] Add typed `IntegrationConfig` (SPEC v2 §5.10) with `merge_strategy`, `conflict_policy`, and `required_for` enums.
@@ -29,7 +29,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 2 — Durable State
 
-- [ ] Add `crates/symphony-state` with SQLite-backed `rusqlite` migrations.
+- [x] Add `crates/symphony-state` with SQLite-backed `rusqlite` migrations.
 - [ ] Create migrations for `work_items`, `work_item_edges`, `runs`, `workspace_claims`, `handoffs`, `qa_verdicts`, `events`, pending tracker syncs, and budget pauses.
 - [ ] Add repository traits for work items and runs.
 - [ ] Add append-only event repository with monotonically increasing sequence.

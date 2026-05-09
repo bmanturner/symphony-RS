@@ -12,6 +12,7 @@ resolver = "3"
 members = [
     "crates/symphony-core",
     "crates/symphony-config",
+    "crates/symphony-state",
     "crates/symphony-tracker",
     "crates/symphony-agent",
     "crates/symphony-workspace",
@@ -89,6 +90,13 @@ crossterm = "0.29"
 anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Persistence: rusqlite is the v2 default durable-state backend. The
+# `bundled` feature compiles SQLite in-tree so we never depend on a system
+# library. Rationale lives in the ARCHITECTURE_v2.md ADR
+# "Durable state becomes mandatory" (2026-05-08); a migration to `sqlx`
+# requires a follow-up ADR.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Filesystem / process: notify watches WORKFLOW.md for hot-reload, which
 # locates `codex` / `claude` binaries on PATH, tempfile gives us throwaway

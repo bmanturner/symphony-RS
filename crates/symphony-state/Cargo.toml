@@ -1,0 +1,15 @@
+[package]
+name = "symphony-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable orchestrator state for Symphony-RS v2 (SQLite via rusqlite)."
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
