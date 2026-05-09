@@ -2650,6 +2650,7 @@ mod tests {
             parent_identifier: "ENG-1".into(),
             parent_title: "title".into(),
             cause: IntegrationRequestCause::AllChildrenTerminal,
+            run_id: None,
         };
         assert_eq!(
             NoopIntegrationDispatcher

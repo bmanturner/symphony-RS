@@ -35,6 +35,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::integration_tick::{IntegrationDispatchQueue, IntegrationDispatchRequest};
+use crate::lease::{LeaseClock, LeaseConfig, LeaseOwner};
+use crate::run_lease::{LeaseAcquireOutcome, RunLeaseGuard, RunLeaseStore};
 use crate::work_item::WorkItemId;
 
 /// Final state of one integration-owner dispatch.
@@ -102,12 +104,30 @@ pub struct IntegrationRunReport {
     /// already saturated. Parked on the runner's internal deferred queue
     /// for the next pass.
     pub deferred_capacity: usize,
+    /// Requests whose lease acquisition was rejected with
+    /// [`LeaseAcquireOutcome::Contended`]. Parked on the runner's
+    /// deferred queue so a future pass (after lease expiry or release)
+    /// can retry.
+    pub deferred_lease_contention: usize,
+    /// Requests whose lease acquisition reported
+    /// [`LeaseAcquireOutcome::NotFound`] (durable run row missing).
+    /// Dropped — the producer is responsible for ensuring run rows
+    /// exist before flagging `run_id` on a request.
+    pub missing_run: usize,
+    /// Backend errors surfaced by the lease store during acquisition.
+    /// The request is parked on the deferred queue so a transient I/O
+    /// blip does not lose the dispatch.
+    pub lease_backend_error: usize,
 }
 
 impl IntegrationRunReport {
     /// `true` iff the pass was a complete no-op.
     pub fn is_idle(&self) -> bool {
-        self.spawned == 0 && self.deferred_capacity == 0
+        self.spawned == 0
+            && self.deferred_capacity == 0
+            && self.deferred_lease_contention == 0
+            && self.missing_run == 0
+            && self.lease_backend_error == 0
     }
 }
 
@@ -119,6 +139,20 @@ pub struct IntegrationDispatchRunner {
     deferred: Mutex<Vec<IntegrationDispatchRequest>>,
     inflight: Mutex<JoinSet<IntegrationDispatchOutcome>>,
     max_concurrent: usize,
+    /// Optional durable-lease wiring. When `Some`, the runner acquires a
+    /// lease on `request.run_id` before spawning the dispatcher and
+    /// releases it on terminal completion. Requests whose `run_id` is
+    /// `None` bypass lease acquisition.
+    leasing: Option<LeaseWiring>,
+}
+
+/// Bundle holding the lease store, owner identity, TTL/renewal config,
+/// and the clock used to derive `(now, expires_at)` per acquisition.
+struct LeaseWiring {
+    store: Arc<dyn RunLeaseStore>,
+    owner: LeaseOwner,
+    config: LeaseConfig,
+    clock: Arc<dyn LeaseClock>,
 }
 
 impl IntegrationDispatchRunner {
@@ -137,7 +171,32 @@ impl IntegrationDispatchRunner {
             deferred: Mutex::new(Vec::new()),
             inflight: Mutex::new(JoinSet::new()),
             max_concurrent,
+            leasing: None,
         }
+    }
+
+    /// Enable durable-lease wiring. Each subsequent dispatch whose
+    /// request carries a `run_id` will acquire the lease on `run_id`,
+    /// spawn the dispatcher only after acquisition succeeds, and release
+    /// the lease at terminal completion regardless of the dispatcher's
+    /// [`IntegrationDispatchReason`]. Requests without a `run_id` are
+    /// dispatched as before.
+    ///
+    /// Calling this method more than once replaces the prior wiring.
+    pub fn with_leasing(
+        mut self,
+        store: Arc<dyn RunLeaseStore>,
+        owner: LeaseOwner,
+        config: LeaseConfig,
+        clock: Arc<dyn LeaseClock>,
+    ) -> Self {
+        self.leasing = Some(LeaseWiring {
+            store,
+            owner,
+            config,
+            clock,
+        });
+        self
     }
 
     /// Configured max concurrency.
@@ -191,6 +250,32 @@ impl IntegrationDispatchRunner {
                 }
             };
 
+            // Durable-lease acquisition. Held through the spawned
+            // dispatch and released on terminal completion. Permit is
+            // only consumed once the lease is acquired so contention or
+            // backend errors do not eat capacity.
+            let guard = match self.try_acquire_lease(&req).await {
+                LeaseAttempt::Acquired(guard) => guard,
+                LeaseAttempt::Skipped => None,
+                LeaseAttempt::Contended => {
+                    drop(permit);
+                    new_deferred.push(req);
+                    report.deferred_lease_contention += 1;
+                    continue;
+                }
+                LeaseAttempt::NotFound => {
+                    drop(permit);
+                    report.missing_run += 1;
+                    continue;
+                }
+                LeaseAttempt::BackendError => {
+                    drop(permit);
+                    new_deferred.push(req);
+                    report.lease_backend_error += 1;
+                    continue;
+                }
+            };
+
             let dispatcher = self.dispatcher.clone();
             let child_cancel = cancel.child_token();
             let parent_id = req.parent_id;
@@ -200,6 +285,15 @@ impl IntegrationDispatchRunner {
             let mut inflight = self.inflight.lock().await;
             inflight.spawn(async move {
                 let reason = dispatcher.dispatch(req_for_dispatch, child_cancel).await;
+                if let Some(guard) = guard
+                    && let Err(err) = guard.release().await
+                {
+                    warn!(
+                        parent_identifier = %parent_identifier,
+                        error = %err,
+                        "integration runner: lease release failed; relying on TTL reaper",
+                    );
+                }
                 drop(permit); // release capacity at task exit
                 IntegrationDispatchOutcome {
                     parent_id,
@@ -226,6 +320,56 @@ impl IntegrationDispatchRunner {
         report
     }
 
+    async fn try_acquire_lease(&self, req: &IntegrationDispatchRequest) -> LeaseAttempt {
+        let Some(wiring) = &self.leasing else {
+            return LeaseAttempt::Acquired(None);
+        };
+        let Some(run_id) = req.run_id else {
+            return LeaseAttempt::Skipped;
+        };
+
+        let ts = wiring.clock.timestamps(wiring.config.default_ttl_ms);
+        match RunLeaseGuard::acquire(
+            wiring.store.clone(),
+            run_id,
+            &wiring.owner,
+            &ts.expires_at,
+            &ts.now,
+        )
+        .await
+        {
+            Ok(Ok(guard)) => LeaseAttempt::Acquired(Some(guard)),
+            Ok(Err(LeaseAcquireOutcome::Contended { holder, expires_at })) => {
+                debug!(
+                    parent_identifier = %req.parent_identifier,
+                    holder = %holder,
+                    expires_at = %expires_at,
+                    "integration runner: lease contended; parking",
+                );
+                LeaseAttempt::Contended
+            }
+            Ok(Err(LeaseAcquireOutcome::NotFound)) => {
+                warn!(
+                    parent_identifier = %req.parent_identifier,
+                    run_id = %run_id.get(),
+                    "integration runner: durable run row missing; dropping request",
+                );
+                LeaseAttempt::NotFound
+            }
+            Ok(Err(LeaseAcquireOutcome::Acquired)) => {
+                unreachable!("RunLeaseGuard::acquire returns Ok(Ok(_)) on Acquired")
+            }
+            Err(err) => {
+                warn!(
+                    parent_identifier = %req.parent_identifier,
+                    error = %err,
+                    "integration runner: lease store backend error; parking",
+                );
+                LeaseAttempt::BackendError
+            }
+        }
+    }
+
     /// Drain every dispatcher task that has finished since the last call.
     pub async fn reap_completed(&self) -> Vec<IntegrationDispatchOutcome> {
         let mut inflight = self.inflight.lock().await;
@@ -245,6 +389,23 @@ impl IntegrationDispatchRunner {
     }
 }
 
+/// Outcome of [`IntegrationDispatchRunner::try_acquire_lease`].
+enum LeaseAttempt {
+    /// Either lease acquired (`Some(guard)`) or no run_id on the
+    /// request and lease wiring not exercised (`None`). Both cases
+    /// proceed to dispatch.
+    Acquired(Option<RunLeaseGuard>),
+    /// Lease wiring is configured but the request had no `run_id`
+    /// reservation. Dispatch proceeds without a lease guard.
+    Skipped,
+    /// Acquisition rejected — another owner holds an unexpired lease.
+    Contended,
+    /// The durable run row is missing.
+    NotFound,
+    /// The lease store reported a backend error (I/O, lock, encoding).
+    BackendError,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +419,17 @@ mod tests {
             parent_identifier: identifier.into(),
             parent_title: format!("title {identifier}"),
             cause: IntegrationRequestCause::DirectIntegrationRequest,
+            run_id: None,
+        }
+    }
+
+    fn req_with_run(id: i64, identifier: &str, run_id: i64) -> IntegrationDispatchRequest {
+        IntegrationDispatchRequest {
+            parent_id: WorkItemId::new(id),
+            parent_identifier: identifier.into(),
+            parent_title: format!("title {identifier}"),
+            cause: IntegrationRequestCause::DirectIntegrationRequest,
+            run_id: Some(crate::blocker::RunRef::new(run_id)),
         }
     }
 
@@ -575,6 +747,268 @@ mod tests {
         let mut ids: Vec<i64> = outcomes.iter().map(|o| o.parent_id.get()).collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    // --- Lease wiring (CHECKLIST_v2 Phase 11) -----------------------
+
+    use crate::blocker::RunRef;
+    use crate::lease::{FixedLeaseClock, LeaseConfig, LeaseOwner};
+    use crate::run_lease::InMemoryRunLeaseStore;
+
+    fn lease_owner() -> LeaseOwner {
+        LeaseOwner::new("test-host", "scheduler-test", 0).unwrap()
+    }
+
+    fn build_lease_runner(
+        max_concurrent: usize,
+        dispatcher: Arc<RecordingDispatcher>,
+        store: Arc<InMemoryRunLeaseStore>,
+        clock_now: &str,
+    ) -> (Arc<IntegrationDispatchQueue>, IntegrationDispatchRunner) {
+        let queue = Arc::new(IntegrationDispatchQueue::new());
+        let runner = IntegrationDispatchRunner::new(queue.clone(), dispatcher, max_concurrent)
+            .with_leasing(
+                store,
+                lease_owner(),
+                LeaseConfig::default(),
+                Arc::new(FixedLeaseClock::new(clock_now)),
+            );
+        (queue, runner)
+    }
+
+    #[tokio::test]
+    async fn lease_acquired_during_dispatch_and_released_on_completed_ready_candidate() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        dispatcher.enable_gate(); // hold dispatch open so we can observe the in-flight lease
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store.clone(), "T0");
+        queue.enqueue(req_with_run(1, "PROJ-1", 42));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_lease_contention, 0);
+        assert_eq!(report.missing_run, 0);
+
+        // Lease is held while the dispatcher is gated.
+        let snap = store
+            .snapshot(RunRef::new(42))
+            .await
+            .expect("lease should be held during dispatch");
+        assert_eq!(snap.0, lease_owner().to_string());
+        assert!(
+            snap.1.starts_with("T0+"),
+            "expires_at should derive from FixedLeaseClock 'now'; got {}",
+            snap.1,
+        );
+
+        // Release the gate so the dispatcher returns; the spawned task
+        // releases the lease as part of terminal completion.
+        dispatcher.release_gate();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, IntegrationDispatchReason::Completed);
+        assert!(
+            store.snapshot(RunRef::new(42)).await.is_none(),
+            "lease must be cleared on Completed terminal release",
+        );
+        assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
+    }
+
+    #[tokio::test]
+    async fn lease_cleared_on_blocked_terminal_release() {
+        // Blocked is the integration-runner equivalent of a "non-ready"
+        // dispatch outcome — typically because the integration owner
+        // filed a blocker mid-session. The lease must still clear.
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        dispatcher.set_reason_for("PROJ-2", IntegrationDispatchReason::Blocked);
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(7)).await;
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store.clone(), "T1");
+        queue.enqueue(req_with_run(2, "PROJ-2", 7));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, IntegrationDispatchReason::Blocked);
+        assert!(store.snapshot(RunRef::new(7)).await.is_none());
+        assert_eq!(store.release_calls().await, vec![RunRef::new(7)]);
+    }
+
+    #[tokio::test]
+    async fn lease_cleared_on_canceled_terminal_release() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(11)).await;
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store.clone(), "T2");
+        queue.enqueue(req_with_run(3, "PROJ-3", 11));
+
+        let cancel = CancellationToken::new();
+        let _ = runner.run_pending(cancel.clone()).await;
+        assert!(store.snapshot(RunRef::new(11)).await.is_some());
+        cancel.cancel();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, IntegrationDispatchReason::Canceled);
+        assert!(store.snapshot(RunRef::new(11)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_cleared_on_failed_terminal_release_for_waived_dispatch() {
+        // "Waived" gating happens upstream in the integration tick — the
+        // runner sees a request that the producer chose to surface
+        // despite a blocker subtree. The dispatcher reports Failed for a
+        // non-blocker error; the lease must still clear.
+        let dispatcher = Arc::new(RecordingDispatcher::new(IntegrationDispatchReason::Failed));
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(13)).await;
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store.clone(), "T3");
+        // AllChildrenTerminal cause models the consolidation path the
+        // upstream tick uses for waived/all-children-done parents.
+        queue.enqueue(IntegrationDispatchRequest {
+            parent_id: WorkItemId::new(4),
+            parent_identifier: "PROJ-4".into(),
+            parent_title: "consolidate".into(),
+            cause: IntegrationRequestCause::AllChildrenTerminal,
+            run_id: Some(RunRef::new(13)),
+        });
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, IntegrationDispatchReason::Failed);
+        assert!(store.snapshot(RunRef::new(13)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_visible_to_expired_scan_only_after_ttl() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(99)).await;
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store.clone(), "T4");
+        queue.enqueue(req_with_run(5, "PROJ-5", 99));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        let snap = store.snapshot(RunRef::new(99)).await.unwrap();
+
+        // Pre-TTL contention by another owner.
+        let other_owner = LeaseOwner::new("other-host", "scheduler-test", 1).unwrap();
+        let pre_ttl = store
+            .acquire(RunRef::new(99), &other_owner, "T4+later", "T4")
+            .await
+            .unwrap();
+        match pre_ttl {
+            crate::run_lease::LeaseAcquireOutcome::Contended { holder, .. } => {
+                assert_eq!(holder, lease_owner().to_string());
+            }
+            other => panic!("expected Contended pre-TTL, got {other:?}"),
+        }
+
+        // Post-TTL takeover succeeds.
+        let after_ttl = format!("{}+999999999999ms", "T4");
+        assert!(after_ttl > snap.1);
+        let post = store
+            .acquire(RunRef::new(99), &other_owner, "T9+later", &after_ttl)
+            .await
+            .unwrap();
+        assert_eq!(post, crate::run_lease::LeaseAcquireOutcome::Acquired);
+
+        // Cleanup: release the gate so the spawned task can finish.
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn contended_lease_parks_request_and_does_not_consume_capacity() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(1)).await;
+        store.register_run(RunRef::new(2)).await;
+
+        // Pre-claim run 1 by another owner so the runner sees contention.
+        let other = LeaseOwner::new("other-host", "scheduler-test", 9).unwrap();
+        let _ = store
+            .acquire(RunRef::new(1), &other, "T0+999ms", "T0")
+            .await
+            .unwrap();
+
+        let (queue, runner) = build_lease_runner(2, dispatcher.clone(), store.clone(), "T0");
+        queue.enqueue(req_with_run(1, "PROJ-1", 1));
+        queue.enqueue(req_with_run(2, "PROJ-2", 2));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_lease_contention, 1);
+        assert_eq!(runner.deferred_count().await, 1);
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn missing_run_drops_request_without_dispatch() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        let store = Arc::new(InMemoryRunLeaseStore::new()); // run not registered
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store, "T0");
+        queue.enqueue(req_with_run(1, "PROJ-1", 404));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 0);
+        assert_eq!(report.missing_run, 1);
+        assert!(dispatcher.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_without_run_id_dispatches_without_lease_acquisition() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store.clone(), "T0");
+        // No run_id on the request; lease wiring should be skipped.
+        queue.enqueue(req(1, "PROJ-1"));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, IntegrationDispatchReason::Completed);
+        assert!(store.release_calls().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_error_parks_request_for_retry() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(1)).await;
+        store.fail_next("disk full").await;
+
+        let (queue, runner) = build_lease_runner(4, dispatcher.clone(), store, "T0");
+        queue.enqueue(req_with_run(1, "PROJ-1", 1));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 0);
+        assert_eq!(report.lease_backend_error, 1);
+        assert_eq!(runner.deferred_count().await, 1);
+        assert!(dispatcher.calls().is_empty());
     }
 
     #[test]

@@ -111,6 +111,13 @@ pub struct IntegrationDispatchRequest {
     pub parent_title: String,
     /// Why the queue surfaced this parent.
     pub cause: IntegrationRequestCause,
+    /// Durable `runs` row this dispatch will animate, when known. The
+    /// integration runner uses this to acquire/release the durable lease
+    /// (CHECKLIST_v2 Phase 11). `None` for legacy producers that do not
+    /// reserve a run row before queueing — those dispatches bypass lease
+    /// acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<crate::blocker::RunRef>,
 }
 
 /// Shared FIFO of pending [`IntegrationDispatchRequest`]s.
@@ -289,6 +296,7 @@ impl QueueTick for IntegrationQueueTick {
                 parent_identifier: c.parent_identifier,
                 parent_title: c.parent_title,
                 cause: c.cause,
+                run_id: None,
             });
             self.claimed
                 .lock()
@@ -695,12 +703,14 @@ mod tests {
             parent_identifier: "PROJ-1".into(),
             parent_title: "first".into(),
             cause: IntegrationRequestCause::DirectIntegrationRequest,
+            run_id: None,
         });
         q.enqueue(IntegrationDispatchRequest {
             parent_id: WorkItemId::new(2),
             parent_identifier: "PROJ-2".into(),
             parent_title: "second".into(),
             cause: IntegrationRequestCause::AllChildrenTerminal,
+            run_id: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -725,8 +735,24 @@ mod tests {
             parent_identifier: "PROJ-7".into(),
             parent_title: "consolidate".into(),
             cause: IntegrationRequestCause::DirectIntegrationRequest,
+            run_id: None,
         };
         let json = serde_json::to_string(&r).unwrap();
+        let back: IntegrationDispatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn dispatch_request_round_trips_when_run_id_present() {
+        let r = IntegrationDispatchRequest {
+            parent_id: WorkItemId::new(8),
+            parent_identifier: "PROJ-8".into(),
+            parent_title: "consolidate".into(),
+            cause: IntegrationRequestCause::AllChildrenTerminal,
+            run_id: Some(crate::blocker::RunRef::new(123)),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"run_id\":123"), "json={json}");
         let back: IntegrationDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
     }
