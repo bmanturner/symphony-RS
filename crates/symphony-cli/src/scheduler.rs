@@ -43,9 +43,12 @@
 //!
 //! [`PollLoop`]: symphony_core::PollLoop
 
-// Pre-wiring: `build_scheduler_v2` is exercised by this module's tests
-// but not yet referenced from `run.rs`. Subsequent decomposition steps
-// add the call site; until then suppress dead-code under `-D warnings`.
+// Several `SchedulerV2Bundle` fields and `ClaimedRunRegistry` methods
+// exist for tests, future state-DB wiring (specialist/integration/QA/
+// follow-up/budget-pause runners record claims through them), and
+// operator-facing observability that is not yet consumed by `run.rs`.
+// Until those callers land, suppress dead-code under `-D warnings`
+// rather than churning the bundle's public contract.
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};

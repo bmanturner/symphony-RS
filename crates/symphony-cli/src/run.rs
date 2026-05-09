@@ -2,31 +2,36 @@
 //!
 //! `run` is the production composition root. It reads `WORKFLOW.md`,
 //! materialises the concrete tracker / agent / workspace adapters chosen
-//! in the front matter, wires them into a [`PollLoop`], and drives the
-//! loop until cancelled. Nothing in this module decides *policy* — every
-//! knob (cadence, concurrency, kind selection) ultimately resolves back
-//! to a typed field on [`WorkflowConfig`].
+//! in the front matter, hands them to [`crate::scheduler::build_scheduler_v2`],
+//! and drives the resulting [`symphony_core::SchedulerV2`] alongside its dispatch
+//! runners until cancelled. Nothing in this module decides *policy* —
+//! every knob (cadence, concurrency, kind selection) ultimately resolves
+//! back to a typed field on [`WorkflowConfig`].
 //!
 //! ## Composition shape
 //!
 //! ```text
-//!                              +-------------------+
-//!     WORKFLOW.md  --LayeredLoader--> WorkflowConfig
-//!                              +-------------------+
-//!                                |          |          |
-//!                          build_tracker  build_     build_agent_runner
-//!                                |    workspace          |
-//!                                v          v            v
-//!                          TrackerRead  Workspace    AgentRunner
-//!                                Manager
-//!                                \         |          /
-//!                                 \        |         /
-//!                                  v       v        v
-//!                                  SymphonyDispatcher
-//!                                          |
-//!                                          v
-//!                                       PollLoop
+//!     WORKFLOW.md --LayeredLoader--> WorkflowConfig
+//!                                            |
+//!         +--------------+--------+----------+--------+
+//!         |              |        |          |        |
+//!   build_tracker  build_workspace  build_agent_runner  (cfg passthrough)
+//!         |              |        |          |
+//!         v              v        v          v
+//!   TrackerRead   WorkspaceManager  SymphonyDispatcher
+//!         \              \         /
+//!          \              v       v
+//!           +-----> build_scheduler_v2 (intake/recovery/specialist/integration/qa/followup/budget)
+//!                              |
+//!                              v
+//!                       SchedulerV2 + dispatch runners
 //! ```
+//!
+//! [`symphony_core::PollLoop`] is no longer the production entry point as of the v2
+//! checklist switch; it remains exported by `symphony-core` for parity
+//! tests that compare the multi-queue scheduler against the flat-loop
+//! contract. New production code paths must go through
+//! [`crate::scheduler::build_scheduler_v2`].
 //!
 //! ## Why one module rather than many small ones
 //!
@@ -42,21 +47,30 @@
 //! ## SIGINT behaviour
 //!
 //! This module wires `tokio::signal::ctrl_c` to a
-//! [`CancellationToken`]. [`PollLoop::run`] then:
+//! [`CancellationToken`] shared by the scheduler and the dispatch
+//! runners' driver task:
 //!
-//! 1. Stops accepting new dispatches.
-//! 2. Fires every per-issue child cancel token so in-flight agent
-//!    sessions tear down cooperatively.
-//! 3. Drains the in-flight join set, but only up to
-//!    `PollLoopConfig::drain_deadline`. Any task still running past
-//!    the deadline is `JoinSet::abort_all()`'d and its claim is
-//!    released as `Canceled`, so a wedged subprocess can never hang
-//!    the daemon's exit.
+//! 1. Cancellation halts [`symphony_core::SchedulerV2::run`] before its next tick — no
+//!    fresh dispatch requests are enqueued onto any logical queue.
+//! 2. The runner driver (see [`run_runner_loop`]) observes the same
+//!    token, exits its tick loop, and switches into a drain phase. It
+//!    polls each runner's [`SpecialistRunner::reap_completed`] surface
+//!    (and the analogous methods on the integration / QA / follow-up
+//!    approval / budget-pause runners) until every `inflight_count`
+//!    reaches zero.
+//! 3. Each spawned dispatcher task already received a child cancel
+//!    token from `run_pending`, so the SIGINT signal propagates through
+//!    to in-flight agent sessions, mirroring the flat poll loop's
+//!    cooperative tear-down. The drain phase is bounded by
+//!    [`DRAIN_DEADLINE`]; tasks still running past the deadline are
+//!    abandoned to process exit (the runners' `reap_completed` surface
+//!    does not yet expose a forcible abort, matching the v2 checklist's
+//!    "migrate SIGINT semantics to the runners' reap surface" scope).
 //!
 //! A second SIGINT is not handled specially — operators who need
 //! "force-kill on second Ctrl-C" semantics get them from the shell
 //! (tokio's default Ctrl-C handler aborts the process on the second
-//! signal). Tightening the drain deadline is the in-process knob.
+//! signal). Tightening [`DRAIN_DEADLINE`] is the in-process knob.
 
 use std::env;
 use std::sync::Arc;
@@ -72,10 +86,14 @@ use symphony_agent::tandem::{TandemRunner, TandemStrategy};
 use symphony_config::{AgentKind, LayeredLoader, TrackerKind, WorkflowConfig};
 use symphony_core::agent::{AgentEvent, AgentRunner, CompletionReason, StartSessionParams};
 use symphony_core::event_bus::EventBus;
-use symphony_core::poll_loop::{Dispatcher, PollLoop, PollLoopConfig};
+use symphony_core::poll_loop::Dispatcher;
 use symphony_core::state_machine::ReleaseReason;
 use symphony_core::tracker::Issue;
 use symphony_core::tracker_trait::TrackerRead;
+use symphony_core::{
+    BudgetPauseRunner, FollowupApprovalRunner, IntegrationDispatchRunner, QaDispatchRunner,
+    SpecialistRunner,
+};
 use symphony_tracker::{
     GitHubConfig, GitHubTracker, LinearConfig, LinearTracker, fixtures as tracker_fixtures,
 };
@@ -119,34 +137,38 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         build_workspace(&loaded.config).with_context(|| "building workspace manager")?;
     let agent = build_agent_runner(&loaded.config).with_context(|| "building agent runner")?;
 
-    let dispatcher = Arc::new(SymphonyDispatcher {
+    let dispatcher: Arc<dyn Dispatcher> = Arc::new(SymphonyDispatcher {
         agent,
         workspace,
         prompt_template: loaded.prompt_template.clone(),
     });
 
-    let cfg = PollLoopConfig {
-        interval: Duration::from_millis(loaded.config.polling.interval_ms),
-        // Standard SPEC §16.2 jitter half-width — kept here rather than
-        // surfaced as a `WORKFLOW.md` knob until a deployment actually
-        // needs to tune it.
-        jitter_ratio: 0.1,
-        max_concurrent: loaded.config.agent.max_concurrent_agents as usize,
-        // SPEC §16 doesn't pin a value here; 30 s mirrors the default
-        // poll interval and is comfortably longer than any
-        // cooperative agent tear-down we've observed in tests.
-        // Surface as a typed config knob if a deployment ever needs
-        // to retune it.
-        drain_deadline: Duration::from_secs(30),
-    };
+    // Compose the v2 multi-queue scheduler. Until durable state-backed
+    // sources/dispatchers for integration / QA / follow-up approval /
+    // budget pause land, the composition root supplies the empty
+    // production stand-ins published by `crate::scheduler` — each
+    // surfaces zero candidates so the corresponding tick is a no-op.
+    let bundle = crate::scheduler::build_scheduler_v2(
+        &loaded.config,
+        tracker,
+        dispatcher,
+        crate::scheduler::empty_integration_source(),
+        crate::scheduler::noop_integration_dispatcher(),
+        crate::scheduler::empty_qa_source(),
+        crate::scheduler::noop_qa_dispatcher(),
+        crate::scheduler::empty_followup_approval_source(),
+        crate::scheduler::noop_followup_approval_dispatcher(),
+        crate::scheduler::empty_budget_pause_source(),
+        crate::scheduler::noop_budget_pause_dispatcher(),
+    );
 
     // The event bus is shared between the orchestrator (the producer)
     // and the optional SSE server (a fan-out consumer). Building it at
     // the composition root lets both sides agree on replay sizing —
     // `observability.sse.replay_buffer` (SPEC v2 §5.14) is the single
-    // knob.
+    // knob. SchedulerV2 does not yet emit into the bus; the durable
+    // event-tail SSE switch is a later checklist item.
     let bus = EventBus::new(loaded.config.observability.sse.replay_buffer);
-    let poll_loop = PollLoop::with_event_bus(tracker, dispatcher, cfg, bus.clone());
 
     let cancel = CancellationToken::new();
     install_ctrl_c(cancel.clone());
@@ -173,7 +195,46 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         None
     };
 
-    poll_loop.run(cancel).await;
+    // Drive the dispatch runners on their own task so the scheduler
+    // tick fan and the dispatcher fan run concurrently. The runner
+    // task owns its own clone of the cancel token; on SIGINT it drops
+    // out of its tick loop and switches into the bounded-deadline drain
+    // phase described in the module docstring.
+    let runner_interval = Duration::from_millis(loaded.config.polling.interval_ms);
+    let specialist_runner = bundle.specialist_runner.clone();
+    let integration_runner = bundle.integration_runner.clone();
+    let qa_runner = bundle.qa_runner.clone();
+    let followup_runner = bundle.followup_approval_runner.clone();
+    let budget_runner = bundle.budget_pause_runner.clone();
+    let runner_task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            run_runner_loop(
+                cancel,
+                specialist_runner,
+                integration_runner,
+                qa_runner,
+                followup_runner,
+                budget_runner,
+                runner_interval,
+                DRAIN_DEADLINE,
+            )
+            .await;
+        })
+    };
+
+    // Drive the scheduler under the operator-facing cancel token. This
+    // returns once the cancel token fires — see SchedulerV2::run for
+    // the cancellation contract.
+    bundle.scheduler.run(cancel.clone()).await;
+
+    // Wait for the runner driver task to finish its drain phase before
+    // returning. The runner driver bounds itself on DRAIN_DEADLINE so
+    // this awaits at most that long beyond scheduler shutdown.
+    match runner_task.await {
+        Ok(()) => info!("dispatch runner driver stopped cleanly"),
+        Err(err) => warn!(error = %err, "dispatch runner driver task did not join cleanly"),
+    }
 
     // Wait for the SSE server to finish its graceful shutdown before
     // returning. `axum::serve(...).with_graceful_shutdown` resolves
@@ -191,13 +252,111 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Drain deadline for the dispatch runner driver after SIGINT.
+///
+/// Mirrors the flat poll loop's prior `drain_deadline` of 30 s; long
+/// enough for cooperative agent tear-down, short enough that a wedged
+/// subprocess cannot hang the daemon's exit. Surface as a typed config
+/// knob if a deployment ever needs to retune it.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Drive the v2 dispatch runners on a fixed cadence until `cancel`
+/// fires, then enter a bounded drain phase.
+///
+/// Each tick walks the five runners in registration order, calling
+/// `run_pending` (which non-blockingly drains its dispatch queue and
+/// spawns dispatcher tasks under bounded concurrency) and then
+/// `reap_completed` (which non-blockingly collects any joined tasks).
+/// On cancellation the loop stops accepting fresh work and switches
+/// into a drain phase that polls `inflight_count` across all runners
+/// until every count is zero or `drain_deadline` elapses.
+///
+/// In production the five runners are wired by
+/// [`crate::scheduler::build_scheduler_v2`]; the function takes them
+/// individually as `Arc<*Runner>` so this driver stays unit-testable
+/// against fake runners.
+#[allow(clippy::too_many_arguments)]
+async fn run_runner_loop(
+    cancel: CancellationToken,
+    specialist: Arc<SpecialistRunner>,
+    integration: Arc<IntegrationDispatchRunner>,
+    qa: Arc<QaDispatchRunner>,
+    followup: Arc<FollowupApprovalRunner>,
+    budget: Arc<BudgetPauseRunner>,
+    interval: Duration,
+    drain_deadline: Duration,
+) {
+    info!(
+        interval_ms = interval.as_millis() as u64,
+        drain_ms = drain_deadline.as_millis() as u64,
+        "dispatch runner driver starting",
+    );
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        // Spawn pass: each runner owns its own bounded concurrency and
+        // deferred queue, so capacity-shedding and parking are local to
+        // the runner. The driver only orchestrates ordering.
+        let _ = specialist.run_pending(cancel.clone()).await;
+        let _ = integration.run_pending(cancel.clone()).await;
+        let _ = qa.run_pending(cancel.clone()).await;
+        let _ = followup.run_pending(cancel.clone()).await;
+        let _ = budget.run_pending(cancel.clone()).await;
+        // Reap pass: non-blocking — `try_join_next` under the hood, so
+        // long-running tasks stay in flight without holding the driver.
+        let _ = specialist.reap_completed().await;
+        let _ = integration.reap_completed().await;
+        let _ = qa.reap_completed().await;
+        let _ = followup.reap_completed().await;
+        let _ = budget.reap_completed().await;
+    }
+
+    // Drain phase: cancel has fired, child cancel tokens are already
+    // propagating into in-flight dispatcher tasks. Poll the runners'
+    // inflight counts until they all hit zero or the deadline elapses.
+    info!("dispatch runner driver entering drain phase");
+    let drain = async {
+        loop {
+            // Reap whatever finished cooperatively first, otherwise the
+            // inflight count would never hit zero.
+            let _ = specialist.reap_completed().await;
+            let _ = integration.reap_completed().await;
+            let _ = qa.reap_completed().await;
+            let _ = followup.reap_completed().await;
+            let _ = budget.reap_completed().await;
+            let inflight = specialist.inflight_count().await
+                + integration.inflight_count().await
+                + qa.inflight_count().await
+                + followup.inflight_count().await
+                + budget.inflight_count().await;
+            if inflight == 0 {
+                return;
+            }
+            // 50 ms is a balance between responsiveness (we exit as soon
+            // as the last task drains) and CPU load on the orchestrator
+            // process during a deliberate shutdown.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    match tokio::time::timeout(drain_deadline, drain).await {
+        Ok(()) => info!("dispatch runner driver drained cleanly"),
+        Err(_) => warn!(
+            deadline_ms = drain_deadline.as_millis() as u64,
+            "dispatch runner driver drain deadline exceeded; abandoning in-flight tasks to process exit",
+        ),
+    }
+}
+
 /// Spawn a task that fires `cancel` on the first SIGINT.
 ///
 /// Idempotent: a second SIGINT is observed only because this function
 /// returns immediately — operators wanting "force-kill on second
 /// SIGINT" semantics get them from the shell (Ctrl-C twice in tokio's
 /// default handler triggers a process abort). The cooperative drain
-/// deadline lives on [`PollLoopConfig::drain_deadline`].
+/// deadline lives on [`DRAIN_DEADLINE`].
 fn install_ctrl_c(cancel: CancellationToken) {
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
@@ -424,7 +583,7 @@ fn yaml_to_json(v: Option<&serde_yaml::Value>) -> Option<serde_json::Value> {
 // Dispatcher
 // ---------------------------------------------------------------------------
 
-/// Per-issue dispatcher used by [`PollLoop`].
+/// Per-issue dispatcher used by the v2 [`SpecialistRunner`].
 ///
 /// Lifecycle for one dispatch:
 ///
@@ -863,6 +1022,92 @@ mod tests {
         };
         let _ws = build_workspace(&cfg).unwrap();
         assert!(nested.is_dir());
+    }
+
+    #[tokio::test]
+    async fn run_runner_loop_exits_promptly_on_cancel_when_idle() {
+        // Compose all five runners with empty queues and the production
+        // stand-in (noop) dispatchers. With no requests in flight the
+        // drain phase should observe zero `inflight_count` on its first
+        // poll and return immediately, well before `drain_deadline`.
+        use symphony_core::{
+            ActiveSetStore, BudgetPauseDispatchQueue, BudgetPauseRunner,
+            FollowupApprovalDispatchQueue, FollowupApprovalRunner, IntegrationDispatchQueue,
+            IntegrationDispatchRunner, QaDispatchQueue, QaDispatchRunner, SpecialistDispatchQueue,
+            SpecialistRunner,
+        };
+
+        struct NoopDispatcher;
+        #[async_trait::async_trait]
+        impl Dispatcher for NoopDispatcher {
+            async fn dispatch(&self, _issue: Issue, _cancel: CancellationToken) -> ReleaseReason {
+                ReleaseReason::Completed
+            }
+        }
+
+        let active_set = Arc::new(ActiveSetStore::new());
+        let specialist = Arc::new(SpecialistRunner::new(
+            Arc::new(SpecialistDispatchQueue::new()),
+            active_set,
+            Arc::new(NoopDispatcher),
+            1,
+        ));
+        let integration = Arc::new(IntegrationDispatchRunner::new(
+            Arc::new(IntegrationDispatchQueue::new()),
+            crate::scheduler::noop_integration_dispatcher(),
+            1,
+        ));
+        let qa = Arc::new(QaDispatchRunner::new(
+            Arc::new(QaDispatchQueue::new()),
+            crate::scheduler::noop_qa_dispatcher(),
+            1,
+        ));
+        let followup = Arc::new(FollowupApprovalRunner::new(
+            Arc::new(FollowupApprovalDispatchQueue::new()),
+            crate::scheduler::noop_followup_approval_dispatcher(),
+            1,
+        ));
+        let budget = Arc::new(BudgetPauseRunner::new(
+            Arc::new(BudgetPauseDispatchQueue::new()),
+            crate::scheduler::noop_budget_pause_dispatcher(),
+            1,
+        ));
+
+        let cancel = CancellationToken::new();
+        let handle = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                run_runner_loop(
+                    cancel,
+                    specialist,
+                    integration,
+                    qa,
+                    followup,
+                    budget,
+                    // Long tick interval; we exit via cancel before the
+                    // first sleep elapses.
+                    Duration::from_secs(60),
+                    // Drain deadline is generous; the assertion below
+                    // checks we exit *well* before this fires.
+                    Duration::from_secs(5),
+                )
+                .await;
+            })
+        };
+
+        // Give the spawned task a chance to enter its select.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+
+        // The driver should observe cancel, run the drain phase (which
+        // sees zero inflight on the first poll), and return well within
+        // a second.
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "run_runner_loop must return promptly when cancelled with no inflight work",
+        );
+        joined.unwrap().expect("runner driver task panicked");
     }
 
     #[tokio::test]
