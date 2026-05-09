@@ -61,6 +61,18 @@ pub struct SpecialistDispatchRequest {
     /// an id. See `SpecialistRunner::with_leasing`.
     #[serde(default)]
     pub run_id: Option<RunRef>,
+    /// Agent profile name bound to the routed role at emission time, if
+    /// any. Plumbed onto the request so concurrency-gated runners can
+    /// derive a [`crate::concurrency_gate::DispatchTriple`] without
+    /// re-resolving workflow config per dispatch. `None` skips the
+    /// `AgentProfile` scope acquisition.
+    #[serde(default)]
+    pub agent_profile: Option<String>,
+    /// Repository slug the dispatch targets, if known. Used by
+    /// concurrency-gated runners to acquire the `Repository` scope.
+    /// `None` skips the `Repository` scope acquisition.
+    #[serde(default)]
+    pub repository: Option<String>,
 }
 
 /// Shared FIFO of pending [`SpecialistDispatchRequest`]s.
@@ -264,6 +276,8 @@ impl QueueTick for SpecialistQueueTick {
                                 role,
                                 rule_index,
                                 run_id: None,
+                                agent_profile: None,
+                                repository: None,
                             });
                             self.claimed
                                 .lock()
@@ -658,6 +672,8 @@ mod tests {
             role: RoleName::from("frontend"),
             rule_index: Some(0),
             run_id: None,
+            agent_profile: None,
+            repository: None,
         });
         q.enqueue(SpecialistDispatchRequest {
             issue_id: "2".into(),
@@ -665,6 +681,8 @@ mod tests {
             role: RoleName::from("backend"),
             rule_index: Some(1),
             run_id: None,
+            agent_profile: None,
+            repository: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
