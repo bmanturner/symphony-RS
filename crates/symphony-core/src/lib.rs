@@ -17,6 +17,7 @@ pub mod event_bus;
 pub mod events;
 pub mod followup;
 pub mod handoff;
+pub mod integration;
 pub mod poll_loop;
 pub mod qa;
 pub mod retry;
@@ -42,6 +43,10 @@ pub use followup::{
 pub use handoff::{
     BranchOrWorkspace, Handoff, HandoffBlockerRequest, HandoffError, HandoffFollowupRequest,
     ReadyFor,
+};
+pub use integration::{
+    IntegrationConflict, IntegrationError, IntegrationId, IntegrationMergeStrategy,
+    IntegrationRecord, IntegrationStatus,
 };
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use qa::{
