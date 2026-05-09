@@ -25,6 +25,7 @@ pub mod followup_policy;
 pub mod followup_request;
 pub mod followup_routing;
 pub mod handoff;
+pub mod intake_tick;
 pub mod integration;
 pub mod integration_request;
 pub mod logical_queue;
@@ -90,6 +91,7 @@ pub use handoff::{
     HandoffVerdictRequest, MalformedHandoff, MalformedHandoffDecision, MalformedHandoffPolicy,
     ReadyFor, ReadyForConsequence,
 };
+pub use intake_tick::{ActiveSetStore, IntakeQueueTick};
 pub use integration::{
     IntegrationConflict, IntegrationError, IntegrationId, IntegrationMergeStrategy,
     IntegrationRecord, IntegrationStatus,
