@@ -37,9 +37,9 @@ use crate::integration_records::{
     IntegrationRecordRow, NewIntegrationRecord, create_integration_record_in,
 };
 use crate::repository::{
-    NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord, create_run_in,
-    create_work_item_in, get_run_in, get_work_item_in, update_run_status_in,
-    update_work_item_status_in,
+    LeaseAcquisition, NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord,
+    acquire_lease_in, create_run_in, create_work_item_in, get_run_in, get_work_item_in,
+    release_lease_in, update_run_status_in, update_work_item_status_in,
 };
 use crate::{StateDb, StateResult};
 
@@ -90,6 +90,36 @@ impl<'conn> StateTransaction<'conn> {
     /// the row does not exist.
     pub fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool> {
         update_run_status_in(&self.tx, id, status)
+    }
+
+    /// Atomically claim the durable lease on a run inside this
+    /// transaction.
+    ///
+    /// Composing lease acquisition with `update_run_status` + an
+    /// `append_event` is what the kernel needs to advance a `queued`
+    /// run to `running` without leaving a half-built world if the
+    /// process dies mid-dispatch: either the lease, status, and
+    /// `run.started` event all land, or none of them do. See
+    /// [`crate::repository::RunRepository::acquire_lease`] for the
+    /// underlying contention semantics — they are unchanged here.
+    pub fn acquire_lease(
+        &mut self,
+        run_id: RunId,
+        owner: &str,
+        expires_at: &str,
+        now: &str,
+    ) -> StateResult<LeaseAcquisition> {
+        acquire_lease_in(&self.tx, run_id, owner, expires_at, now)
+    }
+
+    /// Clear the lease columns on a run inside this transaction.
+    ///
+    /// Pairs with `update_run_status` to a terminal status (success,
+    /// failure, cancellation) and the matching `run.completed` /
+    /// `run.failed` event so the recovery scheduler cannot observe a
+    /// run that has finished but still appears leased.
+    pub fn release_lease(&mut self, run_id: RunId) -> StateResult<bool> {
+        release_lease_in(&self.tx, run_id)
     }
 
     /// Insert a parent/child, blocker, relates-to, or follow-up edge.
@@ -488,6 +518,245 @@ mod tests {
         let events = db.list_events_for_work_item(wi.id).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "run.completed");
+    }
+
+    #[test]
+    fn lease_acquisition_status_and_event_commit_together() {
+        use crate::repository::LeaseAcquisition;
+
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+        let expires = "2026-05-08T00:05:00Z";
+
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "queued",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+
+        db.transaction(|tx| {
+            let outcome = tx.acquire_lease(run.id, "scheduler-1/worker-0", expires, now)?;
+            assert_eq!(outcome, LeaseAcquisition::Acquired);
+            assert!(tx.update_run_status(run.id, "running")?);
+            tx.append_event(NewEvent {
+                event_type: "run.started",
+                work_item_id: Some(wi.id),
+                run_id: Some(run.id),
+                payload: r#"{"owner":"scheduler-1/worker-0"}"#,
+                now,
+            })?;
+            Ok(())
+        })
+        .expect("commit");
+
+        let after = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(after.status, "running");
+        assert_eq!(after.lease_owner.as_deref(), Some("scheduler-1/worker-0"));
+        assert_eq!(after.lease_expires_at.as_deref(), Some(expires));
+        let events = db.list_events_for_work_item(wi.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "run.started");
+        assert_eq!(events[0].run_id, Some(run.id));
+    }
+
+    #[test]
+    fn lease_acquisition_rolls_back_with_failed_transaction() {
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+        let expires = "2026-05-08T00:05:00Z";
+
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "queued",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+
+        let _ = db
+            .transaction::<_, ()>(|tx| {
+                tx.acquire_lease(run.id, "scheduler-1/worker-0", expires, now)?;
+                tx.update_run_status(run.id, "running")?;
+                tx.append_event(NewEvent {
+                    event_type: "run.started",
+                    work_item_id: Some(wi.id),
+                    run_id: Some(run.id),
+                    payload: "{}",
+                    now,
+                })?;
+                Err(crate::StateError::Sqlite(
+                    rusqlite::Error::QueryReturnedNoRows,
+                ))
+            })
+            .expect_err("forced rollback");
+
+        // Lease columns, status, and event all rolled back together —
+        // no half-acquired lease survives a crash mid-dispatch.
+        let after = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(after.status, "queued");
+        assert!(after.lease_owner.is_none());
+        assert!(after.lease_expires_at.is_none());
+        assert!(db.list_events_for_work_item(wi.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lease_release_status_and_event_commit_together() {
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+        let expires = "2026-05-08T00:05:00Z";
+
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "queued",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+        // Seed an existing lease via the public API.
+        db.acquire_lease(run.id, "scheduler-1/worker-0", expires, now)
+            .unwrap();
+
+        db.transaction(|tx| {
+            assert!(tx.release_lease(run.id)?);
+            assert!(tx.update_run_status(run.id, "succeeded")?);
+            tx.append_event(NewEvent {
+                event_type: "run.completed",
+                work_item_id: Some(wi.id),
+                run_id: Some(run.id),
+                payload: r#"{"verdict":"pass"}"#,
+                now,
+            })?;
+            Ok(())
+        })
+        .expect("commit");
+
+        let after = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(after.status, "succeeded");
+        assert!(after.lease_owner.is_none());
+        assert!(after.lease_expires_at.is_none());
+        assert!(
+            db.find_expired_leases("2099-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        let events = db.list_events_for_work_item(wi.id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "run.completed");
+    }
+
+    #[test]
+    fn lease_release_rolls_back_with_failed_transaction() {
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+        let expires = "2026-05-08T00:05:00Z";
+
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "running",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+        db.acquire_lease(run.id, "scheduler-1/worker-0", expires, now)
+            .unwrap();
+
+        let _ = db
+            .transaction::<_, ()>(|tx| {
+                tx.release_lease(run.id)?;
+                tx.update_run_status(run.id, "succeeded")?;
+                tx.append_event(NewEvent {
+                    event_type: "run.completed",
+                    work_item_id: Some(wi.id),
+                    run_id: Some(run.id),
+                    payload: "{}",
+                    now,
+                })?;
+                Err(crate::StateError::Sqlite(
+                    rusqlite::Error::QueryReturnedNoRows,
+                ))
+            })
+            .expect_err("forced rollback");
+
+        // The lease that was supposed to be released stays held: the
+        // recovery scheduler will still see this run as in-flight.
+        let after = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(after.status, "running");
+        assert_eq!(after.lease_owner.as_deref(), Some("scheduler-1/worker-0"));
+        assert_eq!(after.lease_expires_at.as_deref(), Some(expires));
+        assert!(db.list_events_for_work_item(wi.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lease_contention_inside_transaction_is_observable_and_rolls_back_companion_writes() {
+        use crate::repository::LeaseAcquisition;
+
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+        let expires = "2026-05-08T00:05:00Z";
+
+        let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        let run = db
+            .create_run(NewRun {
+                work_item_id: wi.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "queued",
+                workspace_claim_id: None,
+                now,
+            })
+            .unwrap();
+        // Pre-existing holder from another scheduler instance.
+        db.acquire_lease(run.id, "scheduler-1/worker-0", expires, now)
+            .unwrap();
+
+        // Caller asks for the lease, sees Contended, and propagates an
+        // error so the companion status flip + event append roll back.
+        let err = db
+            .transaction::<_, ()>(|tx| {
+                let outcome = tx.acquire_lease(run.id, "scheduler-2/worker-0", expires, now)?;
+                match outcome {
+                    LeaseAcquisition::Contended { .. } => {
+                        // Companion writes that would have run on success:
+                        tx.update_run_status(run.id, "running")?;
+                        tx.append_event(NewEvent {
+                            event_type: "run.started",
+                            work_item_id: Some(wi.id),
+                            run_id: Some(run.id),
+                            payload: "{}",
+                            now,
+                        })?;
+                        Err(crate::StateError::Sqlite(
+                            rusqlite::Error::QueryReturnedNoRows,
+                        ))
+                    }
+                    other => panic!("expected Contended, got {other:?}"),
+                }
+            })
+            .expect_err("contention path forces rollback");
+        assert!(matches!(err, crate::StateError::Sqlite(_)));
+
+        let after = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(after.status, "queued");
+        assert_eq!(after.lease_owner.as_deref(), Some("scheduler-1/worker-0"));
+        assert!(db.list_events_for_work_item(wi.id).unwrap().is_empty());
     }
 
     #[test]
