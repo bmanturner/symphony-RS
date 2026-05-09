@@ -330,6 +330,7 @@ fn handoff_round_trips_with_full_payload() {
         ready_for: ReadyFor::Qa,
         block_reason: None,
         reporting_role: Some(RoleName::new("specialist-rust")),
+        verdict_request: None,
     };
     h.validate().unwrap();
     assert_round_trip(h);

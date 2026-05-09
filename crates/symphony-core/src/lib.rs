@@ -62,7 +62,7 @@ pub use followup::{
 };
 pub use handoff::{
     BranchOrWorkspace, Handoff, HandoffBlockerRequest, HandoffError, HandoffFollowupRequest,
-    ReadyFor,
+    HandoffVerdictRequest, ReadyFor, ReadyForConsequence,
 };
 pub use integration::{
     IntegrationConflict, IntegrationError, IntegrationId, IntegrationMergeStrategy,

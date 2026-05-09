@@ -82,7 +82,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 7 — Structured Agent Handoffs
 
-- [ ] Define agent output schema for handoffs, blockers, follow-ups, verdict requests, and `ready_for` queue consequences.
+- [x] Define agent output schema for handoffs, blockers, follow-ups, verdict requests, and `ready_for` queue consequences.
 - [ ] Update prompt rendering to include role context, workspace claim, parent/child context, blockers, acceptance criteria, and output schema.
 - [ ] Replace tiny string substitution with the strict built-in `{{path.to.value}}` renderer that fails on unknown variables.
 - [ ] Add malformed-handoff handling: fail run or request repair turn by policy.

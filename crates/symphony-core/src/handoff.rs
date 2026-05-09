@@ -23,7 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::blocker::BlockerSeverity;
+use crate::blocker::{BlockerId, BlockerSeverity};
+use crate::qa::{AcceptanceCriterionTrace, QaEvidence, QaVerdict};
 use crate::role::RoleName;
 use crate::work_item::WorkItemId;
 
@@ -75,6 +76,82 @@ impl ReadyFor {
     /// or a structured `block_reason`.
     pub fn requires_block_evidence(self) -> bool {
         matches!(self, Self::Blocked)
+    }
+
+    /// Map this advisory hint to the typed kernel action it requests
+    /// (SPEC v2 §4.7).
+    ///
+    /// The mapping is total and stable: every variant has exactly one
+    /// consequence. The kernel is still free to *downgrade* the
+    /// consequence (e.g. promote a [`ReadyForConsequence::AttemptDone`]
+    /// into [`ReadyForConsequence::EnqueueIntegration`] when the work
+    /// item has incomplete children); this method only records the
+    /// agent's stated intent in typed form.
+    pub fn consequence(self) -> ReadyForConsequence {
+        match self {
+            Self::Integration => ReadyForConsequence::EnqueueIntegration,
+            Self::Qa => ReadyForConsequence::EnqueueQa,
+            Self::HumanReview => ReadyForConsequence::PauseAwaitingHumanReview,
+            Self::Blocked => ReadyForConsequence::HoldBlocked,
+            Self::Done => ReadyForConsequence::AttemptDone,
+        }
+    }
+}
+
+/// Typed kernel-side queue consequence of a [`ReadyFor`] hint
+/// (SPEC v2 §4.7).
+///
+/// `ReadyFor` is the *agent's* vocabulary; `ReadyForConsequence` is the
+/// *kernel's*. The two are kept separate so the kernel can downgrade an
+/// agent's hint (e.g. `done` → `qa`) without changing the durable
+/// handoff payload, and so future kernel-only consequences can be added
+/// without widening the agent-facing schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadyForConsequence {
+    /// Enqueue the work item on the integration-owner queue.
+    EnqueueIntegration,
+    /// Enqueue the work item on the QA queue. The kernel is still
+    /// responsible for refusing to dispatch QA before integration when
+    /// integration is required.
+    EnqueueQa,
+    /// Pause the work item with a durable human-review approval row.
+    PauseAwaitingHumanReview,
+    /// Hold the work item in a blocked state. Requires durable blocker
+    /// rows or a structured `block_reason` per [`Handoff::validate`].
+    HoldBlocked,
+    /// Attempt to mark the work item terminal. The kernel still gates
+    /// on children, integration, blockers, and QA per workflow policy
+    /// and will downgrade this consequence to the next required gate
+    /// when those checks fail.
+    AttemptDone,
+}
+
+impl ReadyForConsequence {
+    /// All variants in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::EnqueueIntegration,
+        Self::EnqueueQa,
+        Self::PauseAwaitingHumanReview,
+        Self::HoldBlocked,
+        Self::AttemptDone,
+    ];
+
+    /// Stable lowercase identifier used in JSON payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EnqueueIntegration => "enqueue_integration",
+            Self::EnqueueQa => "enqueue_qa",
+            Self::PauseAwaitingHumanReview => "pause_awaiting_human_review",
+            Self::HoldBlocked => "hold_blocked",
+            Self::AttemptDone => "attempt_done",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadyForConsequence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -156,6 +233,123 @@ pub struct HandoffFollowupRequest {
     pub propose_only: bool,
 }
 
+/// Agent-emitted QA verdict request carried in a handoff (SPEC v2 §4.9).
+///
+/// QA-gate runs emit this so the kernel can persist a durable
+/// [`crate::QaOutcome`] without re-deriving evidence from free-form
+/// text. The struct is the *request* shape: the kernel assigns the
+/// durable [`crate::QaVerdictId`] and links the verdict to the run on
+/// persistence. The work item is implied by the run that emitted the
+/// handoff and is not re-stated here, mirroring
+/// [`HandoffBlockerRequest`].
+///
+/// The verdict-vs-evidence invariants are enforced once at construction
+/// via [`Self::try_new`], using the same rules as
+/// [`crate::QaOutcome::try_new`] so request and durable record cannot
+/// drift out of sync. Skip the constructor only in tests that
+/// deliberately exercise validation — direct construction works through
+/// public fields, but [`Handoff::validate`] re-runs the same checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffVerdictRequest {
+    /// Typed verdict outcome.
+    pub verdict: QaVerdict,
+    /// Structured evidence the verdict relied on. Required categories
+    /// are policed by `qa.evidence_required` at the kernel seam; this
+    /// type only carries the slots.
+    #[serde(default)]
+    pub evidence: QaEvidence,
+    /// One trace row per acceptance criterion the work item declared.
+    /// May be empty when the work item has no acceptance criteria.
+    #[serde(default)]
+    pub acceptance_trace: Vec<AcceptanceCriterionTrace>,
+    /// Blocker ids the verdict references. Required for
+    /// [`QaVerdict::FailedWithBlockers`]; forbidden for other variants.
+    /// The blockers themselves are typically filed via
+    /// [`Handoff::blockers_created`] in the same handoff and resolved
+    /// to ids by the kernel.
+    #[serde(default)]
+    pub blockers_created: Vec<BlockerId>,
+    /// Role that authored a [`QaVerdict::Waived`] verdict. Required for
+    /// `waived`, forbidden otherwise. Membership in `qa.waiver_roles`
+    /// is checked at the kernel seam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver_role: Option<RoleName>,
+    /// Operator-facing reason. Required for `waived` and for any
+    /// non-passing verdict so the durable record explains itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl HandoffVerdictRequest {
+    /// Construct a verdict request, enforcing the same verdict shape
+    /// invariants [`crate::QaOutcome::try_new`] applies to the durable
+    /// record.
+    pub fn try_new(
+        verdict: QaVerdict,
+        evidence: QaEvidence,
+        acceptance_trace: Vec<AcceptanceCriterionTrace>,
+        blockers_created: Vec<BlockerId>,
+        waiver_role: Option<RoleName>,
+        reason: Option<String>,
+    ) -> Result<Self, HandoffError> {
+        let request = Self {
+            verdict,
+            evidence,
+            acceptance_trace,
+            blockers_created,
+            waiver_role,
+            reason,
+        };
+        request.validate_shape()?;
+        Ok(request)
+    }
+
+    /// Validate the verdict-vs-evidence invariants. Called by
+    /// [`Handoff::validate`] and [`Self::try_new`].
+    pub fn validate_shape(&self) -> Result<(), HandoffError> {
+        for trace in &self.acceptance_trace {
+            if trace.criterion.trim().is_empty() {
+                return Err(HandoffError::EmptyVerdictCriterion);
+            }
+        }
+        match self.verdict {
+            QaVerdict::FailedWithBlockers => {
+                if self.blockers_created.is_empty() {
+                    return Err(HandoffError::VerdictMissingBlockers);
+                }
+            }
+            QaVerdict::Passed => {
+                if !self.blockers_created.is_empty() {
+                    return Err(HandoffError::VerdictUnexpectedBlockers {
+                        verdict: self.verdict,
+                        count: self.blockers_created.len(),
+                    });
+                }
+                if self.acceptance_trace.iter().any(|t| !t.status.is_passing()) {
+                    return Err(HandoffError::VerdictPassWithUnpassedCriterion);
+                }
+            }
+            QaVerdict::FailedNeedsRework | QaVerdict::Inconclusive | QaVerdict::Waived => {
+                if !self.blockers_created.is_empty() {
+                    return Err(HandoffError::VerdictUnexpectedBlockers {
+                        verdict: self.verdict,
+                        count: self.blockers_created.len(),
+                    });
+                }
+            }
+        }
+        let has_reason = self.reason.as_deref().is_some_and(|r| !r.trim().is_empty());
+        if self.verdict.requires_waiver() {
+            if self.waiver_role.is_none() || !has_reason {
+                return Err(HandoffError::VerdictInvalidWaiver);
+            }
+        } else if self.waiver_role.is_some() {
+            return Err(HandoffError::VerdictUnexpectedWaiver(self.verdict));
+        }
+        Ok(())
+    }
+}
+
 /// Validation errors raised by [`Handoff::validate`] before persistence.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandoffError {
@@ -185,6 +379,31 @@ pub enum HandoffError {
     /// `branch_or_workspace` is missing both a branch and a workspace path.
     #[error("handoff branch_or_workspace must record at least one of branch or workspace_path")]
     EmptyBranchOrWorkspace,
+    /// A verdict request's acceptance trace had an empty criterion.
+    #[error("verdict_request acceptance criterion must not be empty")]
+    EmptyVerdictCriterion,
+    /// A `failed_with_blockers` verdict request had no blocker ids.
+    #[error("verdict_request failed_with_blockers requires at least one blocker reference")]
+    VerdictMissingBlockers,
+    /// A non-`failed_with_blockers` verdict request carried blocker ids.
+    #[error("verdict_request {verdict} must not carry blockers_created (got {count})")]
+    VerdictUnexpectedBlockers {
+        /// Verdict that was attached.
+        verdict: QaVerdict,
+        /// How many blocker ids were attached.
+        count: usize,
+    },
+    /// A `waived` verdict request was missing waiver role or reason.
+    #[error("verdict_request waived requires both a waiver role and a non-empty reason")]
+    VerdictInvalidWaiver,
+    /// A non-`waived` verdict request carried waiver metadata.
+    #[error("verdict_request {0} must not carry waiver metadata")]
+    VerdictUnexpectedWaiver(QaVerdict),
+    /// A `passed` verdict request included a non-passing acceptance row.
+    #[error(
+        "verdict_request passed requires every acceptance criterion to be verified or not_applicable"
+    )]
+    VerdictPassWithUnpassedCriterion,
 }
 
 /// Structured run output emitted at end-of-run (SPEC v2 §4.7).
@@ -232,6 +451,11 @@ pub struct Handoff {
     /// Reporting role. Optional; the dispatcher usually knows it already.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reporting_role: Option<RoleName>,
+    /// QA verdict request, populated when a `qa_gate` run emits a
+    /// verdict alongside its handoff. The kernel resolves this into a
+    /// durable [`crate::QaOutcome`] after policy checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_request: Option<HandoffVerdictRequest>,
 }
 
 impl Handoff {
@@ -279,7 +503,16 @@ impl Handoff {
                 }
             }
         }
+        if let Some(request) = &self.verdict_request {
+            request.validate_shape()?;
+        }
         Ok(())
+    }
+
+    /// Convenience accessor for the kernel-side queue consequence of
+    /// [`Self::ready_for`]. See [`ReadyFor::consequence`].
+    pub fn consequence(&self) -> ReadyForConsequence {
+        self.ready_for.consequence()
     }
 
     /// True when [`Self::ready_for`] is one of the gate-deferring variants
@@ -317,6 +550,16 @@ mod tests {
             ready_for: ReadyFor::Qa,
             block_reason: None,
             reporting_role: Some(RoleName::new("backend")),
+            verdict_request: None,
+        }
+    }
+
+    fn passing_trace() -> AcceptanceCriterionTrace {
+        AcceptanceCriterionTrace {
+            criterion: "tests pass".into(),
+            status: crate::qa::AcceptanceCriterionStatus::Verified,
+            evidence: vec!["cargo test --workspace".into()],
+            notes: None,
         }
     }
 
@@ -516,7 +759,219 @@ mod tests {
             ready_for: ReadyFor::Qa,
             block_reason: None,
             reporting_role: Some(RoleName::new("platform_lead")),
+            verdict_request: None,
         };
+        h.validate().unwrap();
+        let json = serde_json::to_string(&h).unwrap();
+        let back: Handoff = serde_json::from_str(&json).unwrap();
+        assert_eq!(h, back);
+    }
+
+    #[test]
+    fn ready_for_consequence_is_total_and_distinct() {
+        let consequences: Vec<_> = ReadyFor::ALL.iter().map(|r| r.consequence()).collect();
+        assert_eq!(
+            consequences,
+            vec![
+                ReadyForConsequence::EnqueueIntegration,
+                ReadyForConsequence::EnqueueQa,
+                ReadyForConsequence::PauseAwaitingHumanReview,
+                ReadyForConsequence::HoldBlocked,
+                ReadyForConsequence::AttemptDone,
+            ]
+        );
+    }
+
+    #[test]
+    fn ready_for_consequence_round_trips_through_serde() {
+        for c in ReadyForConsequence::ALL {
+            let json = serde_json::to_string(&c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.as_str()));
+            let back: ReadyForConsequence = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn handoff_consequence_delegates_to_ready_for() {
+        let mut h = minimal_handoff();
+        for r in ReadyFor::ALL {
+            h.ready_for = r;
+            h.block_reason = if r == ReadyFor::Blocked {
+                Some("waiting".into())
+            } else {
+                None
+            };
+            assert_eq!(h.consequence(), r.consequence());
+        }
+    }
+
+    #[test]
+    fn verdict_request_passed_constructs_with_passing_trace() {
+        let req = HandoffVerdictRequest::try_new(
+            QaVerdict::Passed,
+            QaEvidence::default(),
+            vec![passing_trace()],
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(req.verdict, QaVerdict::Passed);
+    }
+
+    #[test]
+    fn verdict_request_failed_with_blockers_requires_ids() {
+        let err = HandoffVerdictRequest::try_new(
+            QaVerdict::FailedWithBlockers,
+            QaEvidence::default(),
+            vec![],
+            vec![],
+            None,
+            Some("tests fail".into()),
+        )
+        .unwrap_err();
+        assert_eq!(err, HandoffError::VerdictMissingBlockers);
+
+        HandoffVerdictRequest::try_new(
+            QaVerdict::FailedWithBlockers,
+            QaEvidence::default(),
+            vec![],
+            vec![BlockerId::new(7)],
+            None,
+            Some("tests fail".into()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verdict_request_non_failed_rejects_blocker_ids() {
+        for verdict in [
+            QaVerdict::Passed,
+            QaVerdict::FailedNeedsRework,
+            QaVerdict::Inconclusive,
+            QaVerdict::Waived,
+        ] {
+            let waiver = (verdict == QaVerdict::Waived).then(|| RoleName::new("platform_lead"));
+            let reason = (verdict == QaVerdict::Waived).then(|| "ok".to_string());
+            let err = HandoffVerdictRequest::try_new(
+                verdict,
+                QaEvidence::default(),
+                if verdict == QaVerdict::Passed {
+                    vec![passing_trace()]
+                } else {
+                    vec![]
+                },
+                vec![BlockerId::new(1)],
+                waiver,
+                reason,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                HandoffError::VerdictUnexpectedBlockers { verdict, count: 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_request_waived_requires_role_and_reason() {
+        let err = HandoffVerdictRequest::try_new(
+            QaVerdict::Waived,
+            QaEvidence::default(),
+            vec![],
+            vec![],
+            None,
+            Some("ok".into()),
+        )
+        .unwrap_err();
+        assert_eq!(err, HandoffError::VerdictInvalidWaiver);
+
+        HandoffVerdictRequest::try_new(
+            QaVerdict::Waived,
+            QaEvidence::default(),
+            vec![],
+            vec![],
+            Some(RoleName::new("platform_lead")),
+            Some("accepted risk".into()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verdict_request_passed_rejects_unpassed_criterion() {
+        let trace = AcceptanceCriterionTrace {
+            criterion: "ui renders".into(),
+            status: crate::qa::AcceptanceCriterionStatus::Failed,
+            evidence: vec![],
+            notes: None,
+        };
+        let err = HandoffVerdictRequest::try_new(
+            QaVerdict::Passed,
+            QaEvidence::default(),
+            vec![passing_trace(), trace],
+            vec![],
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, HandoffError::VerdictPassWithUnpassedCriterion);
+    }
+
+    #[test]
+    fn verdict_request_rejects_empty_criterion_text() {
+        let trace = AcceptanceCriterionTrace {
+            criterion: "  ".into(),
+            status: crate::qa::AcceptanceCriterionStatus::Verified,
+            evidence: vec![],
+            notes: None,
+        };
+        let err = HandoffVerdictRequest::try_new(
+            QaVerdict::Passed,
+            QaEvidence::default(),
+            vec![trace],
+            vec![],
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, HandoffError::EmptyVerdictCriterion);
+    }
+
+    #[test]
+    fn handoff_validate_runs_verdict_request_invariants() {
+        let mut h = minimal_handoff();
+        h.verdict_request = Some(HandoffVerdictRequest {
+            verdict: QaVerdict::FailedWithBlockers,
+            evidence: QaEvidence::default(),
+            acceptance_trace: vec![],
+            blockers_created: vec![],
+            waiver_role: None,
+            reason: Some("tests fail".into()),
+        });
+        assert_eq!(
+            h.validate().unwrap_err(),
+            HandoffError::VerdictMissingBlockers
+        );
+    }
+
+    #[test]
+    fn handoff_with_verdict_request_round_trips_through_json() {
+        let mut h = minimal_handoff();
+        h.verdict_request = Some(
+            HandoffVerdictRequest::try_new(
+                QaVerdict::Passed,
+                QaEvidence {
+                    tests_run: vec!["cargo test".into()],
+                    ..QaEvidence::default()
+                },
+                vec![passing_trace()],
+                vec![],
+                None,
+                None,
+            )
+            .unwrap(),
+        );
         h.validate().unwrap();
         let json = serde_json::to_string(&h).unwrap();
         let back: Handoff = serde_json::from_str(&json).unwrap();
@@ -536,6 +991,7 @@ mod tests {
         assert!(h.changed_files.is_empty());
         assert!(h.blockers_created.is_empty());
         assert!(h.reporting_role.is_none());
+        assert!(h.verdict_request.is_none());
         h.validate().unwrap();
     }
 }
