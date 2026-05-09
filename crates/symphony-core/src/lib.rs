@@ -17,6 +17,7 @@ pub mod blocker;
 pub mod blocker_gate;
 pub mod budget_pause_runner;
 pub mod budget_pause_tick;
+pub mod concurrency_gate;
 pub mod decomposition;
 pub mod decomposition_applier;
 pub mod decomposition_runner;
@@ -81,6 +82,9 @@ pub use budget_pause_runner::{
 pub use budget_pause_tick::{
     BudgetPauseCandidate, BudgetPauseDispatchQueue, BudgetPauseDispatchRequest, BudgetPauseId,
     BudgetPauseQueueError, BudgetPauseQueueSource, BudgetPauseQueueTick, BudgetPauseStatus,
+};
+pub use concurrency_gate::{
+    ConcurrencyGate, Scope, ScopeAvailability, ScopeContended, ScopeKind, ScopePermitSet,
 };
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
