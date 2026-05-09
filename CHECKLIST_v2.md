@@ -85,7 +85,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Define agent output schema for handoffs, blockers, follow-ups, verdict requests, and `ready_for` queue consequences.
 - [x] Update prompt rendering to include role context, workspace claim, parent/child context, blockers, acceptance criteria, and output schema.
 - [x] Replace tiny string substitution with the strict built-in `{{path.to.value}}` renderer that fails on unknown variables.
-- [ ] Add malformed-handoff handling: fail run or request repair turn by policy.
+- [x] Add malformed-handoff handling: fail run or request repair turn by policy.
 - [ ] Persist handoffs and expose them in `symphony status`.
 - [ ] Add tests for handoff parsing and repair/failure behavior.
 

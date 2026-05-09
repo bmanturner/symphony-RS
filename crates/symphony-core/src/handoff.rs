@@ -523,6 +523,154 @@ impl Handoff {
             ReadyFor::Integration | ReadyFor::Qa | ReadyFor::HumanReview
         )
     }
+
+    /// Parse a raw agent payload into a validated [`Handoff`] (SPEC v2 §4.7).
+    ///
+    /// Returns [`MalformedHandoff::InvalidJson`] when the payload is not
+    /// JSON-decodable as a [`Handoff`], and [`MalformedHandoff::InvalidShape`]
+    /// when the decoded value violates a [`Self::validate`] invariant.
+    /// The kernel feeds the failure into [`MalformedHandoffPolicy::decide`]
+    /// to choose between failing the run and requesting a repair turn.
+    pub fn parse(raw: &str) -> Result<Self, MalformedHandoff> {
+        let handoff: Handoff =
+            serde_json::from_str(raw).map_err(|e| MalformedHandoff::InvalidJson(e.to_string()))?;
+        handoff.validate().map_err(MalformedHandoff::InvalidShape)?;
+        Ok(handoff)
+    }
+}
+
+/// A malformed handoff payload (SPEC v2 §4.7).
+///
+/// Distinguishes JSON-level decode failures from shape-validation failures
+/// so the kernel and operator surfaces can show useful diagnostics on
+/// each repair turn.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MalformedHandoff {
+    /// Raw payload was not valid JSON for a [`Handoff`]. The string is the
+    /// `serde_json` error message — not parsed further because adapters
+    /// already capture the original payload alongside the failure.
+    #[error("malformed handoff: invalid json: {0}")]
+    InvalidJson(String),
+    /// JSON decoded but [`Handoff::validate`] rejected it.
+    #[error("malformed handoff: {0}")]
+    InvalidShape(#[from] HandoffError),
+}
+
+/// Workflow policy for malformed handoffs (SPEC v2 §4.7, PLAN v2 Phase 7).
+///
+/// The kernel applies this policy when [`Handoff::parse`] rejects an
+/// agent's payload. `FailRun` ends the run immediately; `RequestRepairTurn`
+/// asks the agent for a fresh handoff up to `max_attempts` times before
+/// falling back to a failed run.
+///
+/// `max_attempts: 0` is equivalent to `FailRun` and is preserved as a
+/// distinct variant so configs that explicitly opt into "repair, but never
+/// retry" parse without surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MalformedHandoffPolicy {
+    /// Mark the run failed and surface the diagnostic.
+    FailRun,
+    /// Ask the agent for a repair turn, up to `max_attempts` times. After
+    /// the limit the kernel falls back to [`MalformedHandoffDecision::FailRun`].
+    RequestRepairTurn {
+        /// Maximum number of repair turns the kernel is allowed to request
+        /// for a single run before failing it.
+        max_attempts: u32,
+    },
+}
+
+impl Default for MalformedHandoffPolicy {
+    /// The conservative default is a single repair turn, then fail.
+    /// Adapters and rollouts that want stricter behavior set
+    /// [`MalformedHandoffPolicy::FailRun`] explicitly.
+    fn default() -> Self {
+        Self::RequestRepairTurn { max_attempts: 1 }
+    }
+}
+
+/// Kernel-side decision produced by [`MalformedHandoffPolicy::decide`].
+///
+/// Always carries the originating [`MalformedHandoff`] so the kernel can
+/// persist it on the run row (failed run) or feed it back into the next
+/// prompt as repair guidance.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MalformedHandoffDecision {
+    /// Request a repair turn. `attempt` is 1-based and counts the turn the
+    /// kernel is *about* to dispatch.
+    #[error("request handoff repair turn {attempt}/{max_attempts}: {failure}")]
+    RequestRepairTurn {
+        /// 1-based ordinal of the repair turn the kernel will request next.
+        attempt: u32,
+        /// Mirror of [`MalformedHandoffPolicy::RequestRepairTurn::max_attempts`]
+        /// so consumers can render `attempt/max_attempts` without rethreading
+        /// the policy.
+        max_attempts: u32,
+        /// The originating malformed payload.
+        failure: MalformedHandoff,
+    },
+    /// Fail the run. `attempts_used` records how many repair turns the
+    /// kernel already dispatched for this run before giving up.
+    #[error("fail run after {attempts_used} repair turn(s): {failure}")]
+    FailRun {
+        /// Number of repair turns already dispatched for this run.
+        attempts_used: u32,
+        /// The originating malformed payload.
+        failure: MalformedHandoff,
+    },
+}
+
+impl MalformedHandoffDecision {
+    /// True for the [`Self::RequestRepairTurn`] variant.
+    pub fn is_repair_turn(&self) -> bool {
+        matches!(self, Self::RequestRepairTurn { .. })
+    }
+
+    /// True for the [`Self::FailRun`] variant.
+    pub fn is_fail_run(&self) -> bool {
+        matches!(self, Self::FailRun { .. })
+    }
+
+    /// Borrow the originating malformed payload.
+    pub fn failure(&self) -> &MalformedHandoff {
+        match self {
+            Self::RequestRepairTurn { failure, .. } | Self::FailRun { failure, .. } => failure,
+        }
+    }
+}
+
+impl MalformedHandoffPolicy {
+    /// Decide what to do with `failure` given how many repair turns the
+    /// kernel has already dispatched for the run.
+    ///
+    /// `prior_repair_attempts` is the count of repair turns already
+    /// requested *before* this decision — fresh runs pass `0`.
+    pub fn decide(
+        self,
+        failure: MalformedHandoff,
+        prior_repair_attempts: u32,
+    ) -> MalformedHandoffDecision {
+        match self {
+            Self::FailRun => MalformedHandoffDecision::FailRun {
+                attempts_used: prior_repair_attempts,
+                failure,
+            },
+            Self::RequestRepairTurn { max_attempts } => {
+                if prior_repair_attempts < max_attempts {
+                    MalformedHandoffDecision::RequestRepairTurn {
+                        attempt: prior_repair_attempts.saturating_add(1),
+                        max_attempts,
+                        failure,
+                    }
+                } else {
+                    MalformedHandoffDecision::FailRun {
+                        attempts_used: prior_repair_attempts,
+                        failure,
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -976,6 +1124,148 @@ mod tests {
         let json = serde_json::to_string(&h).unwrap();
         let back: Handoff = serde_json::from_str(&json).unwrap();
         assert_eq!(h, back);
+    }
+
+    #[test]
+    fn parse_accepts_well_formed_payload() {
+        let h = minimal_handoff();
+        let raw = serde_json::to_string(&h).unwrap();
+        let back = Handoff::parse(&raw).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_json_with_invalid_json_variant() {
+        let err = Handoff::parse("{ not json").unwrap_err();
+        assert!(matches!(err, MalformedHandoff::InvalidJson(_)));
+    }
+
+    #[test]
+    fn parse_rejects_shape_violation_with_invalid_shape_variant() {
+        // Decodes as a Handoff but fails Handoff::validate (empty summary,
+        // missing branch/workspace).
+        let raw = r#"{
+            "summary": "",
+            "branch_or_workspace": {},
+            "ready_for": "qa"
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            MalformedHandoff::InvalidShape(HandoffError::EmptySummary)
+        ));
+    }
+
+    #[test]
+    fn malformed_policy_default_is_one_repair_turn() {
+        assert_eq!(
+            MalformedHandoffPolicy::default(),
+            MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 1 }
+        );
+    }
+
+    #[test]
+    fn malformed_policy_round_trips_through_serde() {
+        for policy in [
+            MalformedHandoffPolicy::FailRun,
+            MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 0 },
+            MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 3 },
+        ] {
+            let json = serde_json::to_string(&policy).unwrap();
+            let back: MalformedHandoffPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, policy);
+        }
+    }
+
+    #[test]
+    fn fail_run_policy_always_fails_regardless_of_attempts() {
+        let policy = MalformedHandoffPolicy::FailRun;
+        for prior in [0, 1, 7] {
+            let decision = policy.decide(MalformedHandoff::InvalidJson("x".into()), prior);
+            assert!(matches!(
+                decision,
+                MalformedHandoffDecision::FailRun { attempts_used, .. } if attempts_used == prior
+            ));
+            assert!(decision.is_fail_run());
+            assert!(!decision.is_repair_turn());
+        }
+    }
+
+    #[test]
+    fn repair_turn_policy_requests_repair_until_max_attempts() {
+        let policy = MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 2 };
+
+        let first = policy.decide(MalformedHandoff::InvalidJson("a".into()), 0);
+        assert!(matches!(
+            first,
+            MalformedHandoffDecision::RequestRepairTurn {
+                attempt: 1,
+                max_attempts: 2,
+                ..
+            }
+        ));
+
+        let second = policy.decide(MalformedHandoff::InvalidJson("b".into()), 1);
+        assert!(matches!(
+            second,
+            MalformedHandoffDecision::RequestRepairTurn {
+                attempt: 2,
+                max_attempts: 2,
+                ..
+            }
+        ));
+
+        let third = policy.decide(MalformedHandoff::InvalidJson("c".into()), 2);
+        assert!(matches!(
+            third,
+            MalformedHandoffDecision::FailRun {
+                attempts_used: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn repair_turn_policy_with_zero_max_attempts_fails_immediately() {
+        let policy = MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 0 };
+        let decision = policy.decide(MalformedHandoff::InvalidJson("x".into()), 0);
+        assert!(matches!(
+            decision,
+            MalformedHandoffDecision::FailRun {
+                attempts_used: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_decision_failure_accessor_borrows_underlying() {
+        let policy = MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 1 };
+        let decision = policy.decide(
+            MalformedHandoff::InvalidShape(HandoffError::EmptySummary),
+            0,
+        );
+        match decision.failure() {
+            MalformedHandoff::InvalidShape(HandoffError::EmptySummary) => {}
+            other => panic!("unexpected failure: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_decision_renders_useful_display_strings() {
+        let policy = MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 3 };
+        let repair = policy.decide(MalformedHandoff::InvalidJson("bad".into()), 0);
+        let rendered = repair.to_string();
+        assert!(rendered.contains("repair turn 1/3"), "got {rendered}");
+        assert!(rendered.contains("invalid json"), "got {rendered}");
+
+        let fail = MalformedHandoffPolicy::FailRun.decide(
+            MalformedHandoff::InvalidShape(HandoffError::EmptySummary),
+            2,
+        );
+        let rendered = fail.to_string();
+        assert!(rendered.contains("fail run after 2"), "got {rendered}");
+        assert!(rendered.contains("summary"), "got {rendered}");
     }
 
     #[test]
