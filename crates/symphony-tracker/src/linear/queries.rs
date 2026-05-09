@@ -91,6 +91,69 @@ pub use candidate_issues::Variables as CandidateIssuesVariables;
 pub use issue_states_by_ids::Variables as IssueStatesByIdsVariables;
 pub use issues_by_states::Variables as IssuesByStatesVariables;
 
+/// `IssueCreate` — `POST $input` to `issueCreate`. Maps to
+/// [`crate::TrackerMutations::create_issue`].
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "graphql/linear/schema.graphql",
+    query_path = "graphql/linear/queries.graphql",
+    response_derives = "Debug, Clone, PartialEq",
+    variables_derives = "Debug, Clone"
+)]
+pub struct IssueCreate;
+
+/// `IssueUpdate` — partial mutation against an existing issue. Maps to
+/// [`crate::TrackerMutations::update_issue`] and
+/// [`crate::TrackerMutations::link_parent_child`] (which only sets
+/// `parentId`).
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "graphql/linear/schema.graphql",
+    query_path = "graphql/linear/queries.graphql",
+    response_derives = "Debug, Clone, PartialEq",
+    variables_derives = "Debug, Clone"
+)]
+pub struct IssueUpdate;
+
+/// `CommentCreate` — adds a comment. Maps to
+/// [`crate::TrackerMutations::add_comment`].
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "graphql/linear/schema.graphql",
+    query_path = "graphql/linear/queries.graphql",
+    response_derives = "Debug, Clone, PartialEq",
+    variables_derives = "Debug, Clone"
+)]
+pub struct CommentCreate;
+
+/// `IssueRelationCreate` — creates a structural blocker/dependency edge.
+/// Maps to [`crate::TrackerMutations::add_blocker`] with `type = "blocks"`.
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "graphql/linear/schema.graphql",
+    query_path = "graphql/linear/queries.graphql",
+    response_derives = "Debug, Clone, PartialEq",
+    variables_derives = "Debug, Clone"
+)]
+pub struct IssueRelationCreate;
+
+/// `AttachmentCreate` — first-class attachment record. Maps to
+/// [`crate::TrackerMutations::attach_artifact`].
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "graphql/linear/schema.graphql",
+    query_path = "graphql/linear/queries.graphql",
+    response_derives = "Debug, Clone, PartialEq",
+    variables_derives = "Debug, Clone"
+)]
+pub struct AttachmentCreate;
+
+pub use attachment_create::Variables as AttachmentCreateVariables;
+pub use comment_create::Variables as CommentCreateVariables;
+pub use issue_create::Variables as IssueCreateVariables;
+pub use issue_relation_create::Variables as IssueRelationCreateVariables;
+pub use issue_update::Variables as IssueUpdateVariables;
+
 #[cfg(test)]
 mod tests {
     //! These tests exist to catch schema/query drift at *compile* time

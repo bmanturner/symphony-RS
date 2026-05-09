@@ -131,3 +131,62 @@ query IssueStatesByIds($ids: [ID!]!) {
     }
   }
 }
+
+# Mutations issued by `TrackerMutations` for `LinearTracker`.
+#
+# Each mutation maps 1:1 to a SPEC v2 §7.2 trait method. Selection sets
+# stay narrow — only the fields the adapter normalises into the response
+# struct. Linear's `success` flag is checked against `false` and surfaced
+# as `TrackerError::Transport` so retries fall under the orchestrator's
+# reconcile path.
+
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue {
+      id
+      identifier
+      url
+    }
+  }
+}
+
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+    issue {
+      id
+      state {
+        name
+      }
+    }
+  }
+}
+
+mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) {
+    success
+    comment {
+      id
+      url
+    }
+  }
+}
+
+mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) {
+    success
+    issueRelation {
+      id
+    }
+  }
+}
+
+mutation AttachmentCreate($input: AttachmentCreateInput!) {
+  attachmentCreate(input: $input) {
+    success
+    attachment {
+      id
+    }
+  }
+}

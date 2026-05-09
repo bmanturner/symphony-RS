@@ -30,7 +30,10 @@ use std::sync::Arc;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use symphony_core::tracker::{Issue, IssueId, IssueState};
-use symphony_core::tracker_trait::TrackerError;
+use symphony_core::tracker_trait::{
+    AddBlockerRequest, AddCommentRequest, ArtifactKind, AttachArtifactRequest, CreateIssueRequest,
+    LinkParentChildRequest, TrackerError, TrackerMutations, UpdateIssueRequest,
+};
 use symphony_tracker::conformance::{Scenario, canonical_scenario, run_full_suite};
 use symphony_tracker::{LinearConfig, LinearTracker, TrackerRead};
 use url::Url;
@@ -223,6 +226,7 @@ async fn linear_against(scenario: Scenario) -> (MockServer, LinearTracker) {
             .collect(),
         endpoint: Url::parse(&format!("{}/", server.uri())).unwrap(),
         page_size: 50,
+        team_id: None,
     };
     let tracker = LinearTracker::new(cfg).expect("LinearTracker::new");
     (server, tracker)
@@ -302,6 +306,7 @@ async fn fetch_terminal_recent_with_empty_filter_short_circuits_and_does_not_cal
         active_states: vec!["todo".into()],
         endpoint: Url::parse(&format!("{}/", server.uri())).unwrap(),
         page_size: 50,
+        team_id: None,
     };
     let tracker = LinearTracker::new(cfg).unwrap();
 
@@ -329,6 +334,7 @@ async fn tracker_with_status(status: u16, body: &'static str) -> (MockServer, Li
         active_states: vec!["todo".into()],
         endpoint: Url::parse(&format!("{}/", server.uri())).unwrap(),
         page_size: 50,
+        team_id: None,
     })
     .unwrap();
     (server, tracker)
@@ -388,6 +394,7 @@ async fn malformed_json_payload_maps_to_malformed() {
         active_states: vec!["todo".into()],
         endpoint: Url::parse(&format!("{}/", server.uri())).unwrap(),
         page_size: 50,
+        team_id: None,
     })
     .unwrap();
     let err = tracker.fetch_active().await.unwrap_err();
@@ -414,6 +421,7 @@ async fn graphql_errors_array_maps_to_transport() {
         active_states: vec!["todo".into()],
         endpoint: Url::parse(&format!("{}/", server.uri())).unwrap(),
         page_size: 50,
+        team_id: None,
     })
     .unwrap();
     let err = tracker.fetch_active().await.unwrap_err();
@@ -459,6 +467,7 @@ async fn label_lowercasing_happens_at_the_adapter_boundary() {
         active_states: vec!["todo".into()],
         endpoint: Url::parse(&format!("{}/", server.uri())).unwrap(),
         page_size: 50,
+        team_id: None,
     })
     .unwrap();
     let active = tracker.fetch_active().await.unwrap();
@@ -468,4 +477,317 @@ async fn label_lowercasing_happens_at_the_adapter_boundary() {
     // `IssueState`'s contract).
     assert_eq!(active[0].state, IssueState::new("Todo"));
     assert_eq!(active[0].state.as_str(), "Todo");
+}
+
+// ---------------------------------------------------------------------------
+// TrackerMutations — wiremock-driven happy paths for each Linear mutation.
+//
+// Each test stands up a single MockServer that route-matches by GraphQL
+// `operationName` and returns the canned response shape Linear would send.
+// We assert both that the adapter built a syntactically correct mutation
+// (operation name, inputs flow into `variables`) and that the response
+// decodes into the trait-level response struct without fabrication.
+// ---------------------------------------------------------------------------
+
+use wiremock::matchers::body_partial_json;
+
+fn mutation_tracker(server_uri: &str, team_id: Option<&str>) -> LinearTracker {
+    LinearTracker::new(LinearConfig {
+        api_key: SecretString::from("k".to_string()),
+        project_slug: "alpha".into(),
+        active_states: vec!["todo".into()],
+        endpoint: Url::parse(&format!("{}/", server_uri)).unwrap(),
+        page_size: 50,
+        team_id: team_id.map(|s| s.to_string()),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn capabilities_advertise_full_mutation_surface() {
+    // The adapter promises the FULL capability set (SPEC v2 §7.2). This
+    // pins the contract: workflows that gate on structural blockers /
+    // sub-issues are allowed to dispatch against Linear without runtime
+    // probing.
+    use symphony_core::tracker_trait::TrackerCapabilities;
+    let server = MockServer::start().await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    assert_eq!(tracker.capabilities(), TrackerCapabilities::FULL);
+}
+
+#[tokio::test]
+async fn create_issue_routes_through_issue_create_with_parent_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"operationName": "IssueCreate"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "issueCreate": {
+                    "success": true,
+                    "issue": {
+                        "id": "lin-new",
+                        "identifier": "ABC-9",
+                        "url": "https://linear.app/x/issue/ABC-9"
+                    }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), Some("team-1"));
+
+    let resp = tracker
+        .create_issue(CreateIssueRequest {
+            title: "child".into(),
+            body: Some("body".into()),
+            labels: vec![],
+            assignees: vec![],
+            parent: Some(IssueId::new("lin-parent")),
+            initial_state: None,
+        })
+        .await
+        .expect("create_issue");
+    assert_eq!(resp.id, IssueId::new("lin-new"));
+    assert_eq!(resp.identifier, "ABC-9");
+    assert_eq!(
+        resp.url.as_deref(),
+        Some("https://linear.app/x/issue/ABC-9")
+    );
+}
+
+#[tokio::test]
+async fn create_issue_without_team_id_is_misconfigured() {
+    let server = MockServer::start().await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let err = tracker
+        .create_issue(CreateIssueRequest {
+            title: "x".into(),
+            body: None,
+            labels: vec![],
+            assignees: vec![],
+            parent: None,
+            initial_state: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Misconfigured(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn create_issue_rejects_multi_assignee_for_linear() {
+    let server = MockServer::start().await;
+    let tracker = mutation_tracker(&server.uri(), Some("team-1"));
+    let err = tracker
+        .create_issue(CreateIssueRequest {
+            title: "x".into(),
+            body: None,
+            labels: vec![],
+            assignees: vec!["u1".into(), "u2".into()],
+            parent: None,
+            initial_state: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Misconfigured(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn create_issue_with_success_false_maps_to_transport() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "issueCreate": { "success": false, "issue": null } }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), Some("team-1"));
+    let err = tracker
+        .create_issue(CreateIssueRequest {
+            title: "x".into(),
+            body: None,
+            labels: vec![],
+            assignees: vec![],
+            parent: None,
+            initial_state: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Transport(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn update_issue_echoes_observed_state_from_linear() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"operationName": "IssueUpdate"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "issueUpdate": {
+                    "success": true,
+                    "issue": { "id": "lin-1", "state": { "name": "In Review" } }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let resp = tracker
+        .update_issue(UpdateIssueRequest {
+            id: IssueId::new("lin-1"),
+            state: Some(IssueState::new("state-id-rev")),
+            title: None,
+            body: None,
+            add_labels: vec![],
+            remove_labels: vec![],
+            add_assignees: vec![],
+            remove_assignees: vec![],
+        })
+        .await
+        .expect("update_issue");
+    // Tracker-observed state wins so the orchestrator persists what
+    // Linear actually accepted (workflow rules can rewrite transitions).
+    assert_eq!(resp.state, Some(IssueState::new("In Review")));
+}
+
+#[tokio::test]
+async fn update_issue_rejects_label_name_mutations() {
+    let server = MockServer::start().await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let err = tracker
+        .update_issue(UpdateIssueRequest {
+            id: IssueId::new("lin-1"),
+            state: None,
+            title: None,
+            body: None,
+            add_labels: vec!["bug".into()],
+            remove_labels: vec![],
+            add_assignees: vec![],
+            remove_assignees: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TrackerError::Misconfigured(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn add_comment_round_trips_through_comment_create() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({"operationName": "CommentCreate"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "commentCreate": {
+                    "success": true,
+                    "comment": {
+                        "id": "comment-1",
+                        "url": "https://linear.app/x/issue/ABC-1#comment-1"
+                    }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let resp = tracker
+        .add_comment(AddCommentRequest {
+            issue: IssueId::new("lin-1"),
+            body: "looks good".into(),
+            author_role: Some("qa".into()),
+        })
+        .await
+        .expect("add_comment");
+    assert_eq!(resp.id.as_deref(), Some("comment-1"));
+}
+
+#[tokio::test]
+async fn add_blocker_creates_a_blocks_relation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "operationName": "IssueRelationCreate",
+            // The blocker is the *source* issue, blocked is the related.
+            "variables": { "input": { "type": "blocks", "issueId": "B", "relatedIssueId": "A" } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "issueRelationCreate": {
+                    "success": true,
+                    "issueRelation": { "id": "rel-1" }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let resp = tracker
+        .add_blocker(AddBlockerRequest {
+            blocked: IssueId::new("A"),
+            blocker: IssueId::new("B"),
+            reason: Some("regression".into()),
+        })
+        .await
+        .expect("add_blocker");
+    assert_eq!(resp.edge_id.as_deref(), Some("rel-1"));
+}
+
+#[tokio::test]
+async fn link_parent_child_routes_through_issue_update_parent_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "operationName": "IssueUpdate",
+            "variables": { "id": "child-1", "input": { "parentId": "parent-1" } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "issueUpdate": {
+                    "success": true,
+                    "issue": { "id": "child-1", "state": { "name": "Todo" } }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let resp = tracker
+        .link_parent_child(LinkParentChildRequest {
+            parent: IssueId::new("parent-1"),
+            child: IssueId::new("child-1"),
+        })
+        .await
+        .expect("link_parent_child");
+    // Linear stores the relation on the child's parentId field, not as a
+    // discrete edge with its own id.
+    assert!(resp.edge_id.is_none());
+}
+
+#[tokio::test]
+async fn attach_artifact_creates_a_native_attachment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({"operationName": "AttachmentCreate"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "attachmentCreate": {
+                    "success": true,
+                    "attachment": { "id": "att-1" }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let tracker = mutation_tracker(&server.uri(), None);
+    let resp = tracker
+        .attach_artifact(AttachArtifactRequest {
+            issue: IssueId::new("lin-1"),
+            kind: ArtifactKind::PullRequest,
+            uri: "https://github.com/x/y/pull/9".into(),
+            label: Some("PR #9".into()),
+            note: None,
+        })
+        .await
+        .expect("attach_artifact");
+    assert_eq!(resp.id.as_deref(), Some("att-1"));
 }

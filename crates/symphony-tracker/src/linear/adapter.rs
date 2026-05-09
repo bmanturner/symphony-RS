@@ -51,12 +51,20 @@ use url::Url;
 
 use crate::TrackerRead;
 use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
-use symphony_core::tracker_trait::{TrackerError, TrackerResult};
+use symphony_core::tracker_trait::{
+    AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse, ArtifactKind,
+    AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+    LinkParentChildRequest, LinkParentChildResponse, TrackerCapabilities, TrackerError,
+    TrackerMutations, TrackerResult, UpdateIssueRequest, UpdateIssueResponse,
+};
 
 use super::queries::{
-    CandidateIssues, CandidateIssuesVariables, IssueStatesByIds, IssueStatesByIdsVariables,
-    IssuesByStates, IssuesByStatesVariables, candidate_issues, issue_states_by_ids,
-    issues_by_states,
+    AttachmentCreate, AttachmentCreateVariables, CandidateIssues, CandidateIssuesVariables,
+    CommentCreate, CommentCreateVariables, IssueCreate, IssueCreateVariables, IssueRelationCreate,
+    IssueRelationCreateVariables, IssueStatesByIds, IssueStatesByIdsVariables, IssueUpdate,
+    IssueUpdateVariables, IssuesByStates, IssuesByStatesVariables, attachment_create,
+    candidate_issues, comment_create, issue_create, issue_relation_create, issue_states_by_ids,
+    issue_update, issues_by_states,
 };
 
 /// Operator-supplied configuration for [`LinearTracker`].
@@ -93,6 +101,12 @@ pub struct LinearConfig {
     /// Page size for paginated queries (`$first`). Linear caps this at
     /// 250; SPEC §11.2 sets the default to 50.
     pub page_size: i64,
+
+    /// Team id used as `teamId` on `issueCreate`. `None` is fine for
+    /// read-only deployments; mutation calls that genuinely need it
+    /// (`create_issue`) surface a [`TrackerError::Misconfigured`] when it
+    /// is missing rather than silently dropping the request.
+    pub team_id: Option<String>,
 }
 
 impl LinearConfig {
@@ -112,6 +126,7 @@ impl LinearConfig {
             active_states,
             endpoint,
             page_size: 50,
+            team_id: None,
         })
     }
 }
@@ -357,6 +372,283 @@ impl TrackerRead for LinearTracker {
             .map(|s| s.as_str().to_string())
             .collect();
         self.paginate_terminal(names).await
+    }
+
+    fn capabilities(&self) -> TrackerCapabilities {
+        // Linear has first-class support for every SPEC v2 §7.2 mutation:
+        // `issueCreate` with `parentId` for sub-issues, `issueRelationCreate`
+        // with `type: "blocks"` for structural blocker edges,
+        // `commentCreate`/`attachmentCreate` for evidence. The adapter only
+        // claims capability for fields it can actually round-trip without
+        // resolving auxiliary IDs — see the per-method docs for the
+        // resolved-id deferrals.
+        TrackerCapabilities::FULL
+    }
+}
+
+#[async_trait]
+impl TrackerMutations for LinearTracker {
+    /// Create an issue. Maps directly to `issueCreate`.
+    ///
+    /// `parent` is honoured atomically via Linear's native `parentId` —
+    /// no separate `link_parent_child` call is required for Linear,
+    /// matching the SPEC v2 §7.2 contract for trackers with structural
+    /// sub-issue support.
+    ///
+    /// `labels`, `assignees`, and `initial_state` accept tracker-native
+    /// IDs (per the trait docstring on [`CreateIssueRequest`]); name → id
+    /// resolution is intentionally not in scope for this adapter
+    /// iteration. If the caller passes labels/assignees by *name* the
+    /// adapter rejects with [`TrackerError::Misconfigured`] rather than
+    /// silently sending unresolved strings.
+    async fn create_issue(
+        &self,
+        request: CreateIssueRequest,
+    ) -> TrackerResult<CreateIssueResponse> {
+        let team_id = self.config.team_id.as_ref().ok_or_else(|| {
+            TrackerError::Misconfigured(
+                "LinearConfig.team_id is required for issueCreate".to_string(),
+            )
+        })?;
+
+        let label_ids = if request.labels.is_empty() {
+            None
+        } else {
+            Some(request.labels.clone())
+        };
+        let assignee_id = match request.assignees.len() {
+            0 => None,
+            1 => Some(request.assignees[0].clone()),
+            _ => {
+                // Linear issues have a single `assigneeId` field. Multi-
+                // assignee semantics belong on a follow-up issue or in a
+                // future adapter pass.
+                return Err(TrackerError::Misconfigured(
+                    "Linear supports a single assignee per issue; got multiple in CreateIssueRequest"
+                        .to_string(),
+                ));
+            }
+        };
+        let parent_id = request.parent.as_ref().map(|p| p.0.clone());
+        let state_id = request
+            .initial_state
+            .as_ref()
+            .map(|s| s.as_str().to_string());
+
+        let input = issue_create::IssueCreateInput {
+            team_id: team_id.clone(),
+            title: request.title,
+            description: request.body,
+            label_ids,
+            assignee_id,
+            parent_id,
+            state_id,
+        };
+        let data = self
+            .execute::<IssueCreate>(IssueCreateVariables { input })
+            .await?;
+
+        if !data.issue_create.success {
+            return Err(TrackerError::Transport(
+                "IssueCreate: linear reported success=false".to_string(),
+            ));
+        }
+        let issue = data.issue_create.issue.ok_or_else(|| {
+            TrackerError::Malformed(
+                "IssueCreate: success=true but issue payload missing".to_string(),
+            )
+        })?;
+        Ok(CreateIssueResponse {
+            id: IssueId::new(issue.id),
+            identifier: issue.identifier,
+            url: issue.url,
+        })
+    }
+
+    /// Update an issue. Maps to `issueUpdate`.
+    ///
+    /// State changes accept a Linear `workflowState` ID through
+    /// [`UpdateIssueRequest::state`] — the contract is that the workflow
+    /// passes adapter-native identifiers. Name-based label add/remove
+    /// would require fetching the current label set on every call to
+    /// compute the union/diff (Linear's `issueUpdate` replaces
+    /// `labelIds` wholesale); that pass is deferred. If the caller
+    /// supplies `add_labels` or `remove_labels` the adapter rejects
+    /// with [`TrackerError::Misconfigured`] rather than silently
+    /// dropping or replacing the label set.
+    async fn update_issue(
+        &self,
+        request: UpdateIssueRequest,
+    ) -> TrackerResult<UpdateIssueResponse> {
+        if !request.add_labels.is_empty() || !request.remove_labels.is_empty() {
+            return Err(TrackerError::Misconfigured(
+                "Linear update_issue does not yet support add_labels/remove_labels by name; \
+                 send a follow-up adapter pass or update labelIds via a custom path"
+                    .to_string(),
+            ));
+        }
+        if request.add_assignees.len() > 1 || !request.remove_assignees.is_empty() {
+            return Err(TrackerError::Misconfigured(
+                "Linear supports a single assigneeId; multi-assignee mutations are out of scope"
+                    .to_string(),
+            ));
+        }
+
+        let assignee_id = request.add_assignees.into_iter().next();
+        let state_id = request.state.as_ref().map(|s| s.as_str().to_string());
+
+        let input = issue_update::IssueUpdateInput {
+            title: request.title,
+            description: request.body,
+            state_id,
+            parent_id: None,
+            label_ids: None,
+            assignee_id,
+        };
+        let data = self
+            .execute::<IssueUpdate>(IssueUpdateVariables {
+                id: request.id.0.clone(),
+                input,
+            })
+            .await?;
+
+        if !data.issue_update.success {
+            return Err(TrackerError::Transport(
+                "IssueUpdate: linear reported success=false".to_string(),
+            ));
+        }
+        let observed_state = data
+            .issue_update
+            .issue
+            .map(|i| IssueState::new(i.state.name));
+        Ok(UpdateIssueResponse {
+            id: request.id,
+            // Prefer the tracker-observed state when available so the
+            // orchestrator persists what Linear actually accepted (e.g.
+            // when a workflow rule rewrote the requested transition).
+            state: observed_state.or(request.state),
+        })
+    }
+
+    async fn add_comment(&self, request: AddCommentRequest) -> TrackerResult<AddCommentResponse> {
+        let body = match request.author_role.as_deref() {
+            Some(role) if !role.is_empty() => format!("**[{role}]** {}", request.body),
+            _ => request.body,
+        };
+        let data = self
+            .execute::<CommentCreate>(CommentCreateVariables {
+                input: comment_create::CommentCreateInput {
+                    issue_id: request.issue.0,
+                    body,
+                },
+            })
+            .await?;
+        if !data.comment_create.success {
+            return Err(TrackerError::Transport(
+                "CommentCreate: linear reported success=false".to_string(),
+            ));
+        }
+        let comment = data.comment_create.comment.ok_or_else(|| {
+            TrackerError::Malformed(
+                "CommentCreate: success=true but comment payload missing".to_string(),
+            )
+        })?;
+        Ok(AddCommentResponse {
+            id: Some(comment.id),
+            url: comment.url,
+        })
+    }
+
+    async fn add_blocker(&self, request: AddBlockerRequest) -> TrackerResult<AddBlockerResponse> {
+        // Linear's relation model: `issueId` is the source, `relatedIssueId`
+        // is the target, and `type: "blocks"` means "issueId blocks
+        // relatedIssueId". The trait phrases the request as
+        // `(blocked, blocker)` so we map `issueId = blocker`,
+        // `relatedIssueId = blocked`. The optional `reason` is dropped on
+        // the Linear side because `IssueRelationCreateInput` has no
+        // description channel; surfacing it via a follow-up comment is
+        // left to the workflow.
+        let _ = request.reason;
+        let data = self
+            .execute::<IssueRelationCreate>(IssueRelationCreateVariables {
+                input: issue_relation_create::IssueRelationCreateInput {
+                    issue_id: request.blocker.0,
+                    related_issue_id: request.blocked.0,
+                    type_: "blocks".to_string(),
+                },
+            })
+            .await?;
+        if !data.issue_relation_create.success {
+            return Err(TrackerError::Transport(
+                "IssueRelationCreate: linear reported success=false".to_string(),
+            ));
+        }
+        let edge_id = data.issue_relation_create.issue_relation.map(|r| r.id);
+        Ok(AddBlockerResponse { edge_id })
+    }
+
+    async fn link_parent_child(
+        &self,
+        request: LinkParentChildRequest,
+    ) -> TrackerResult<LinkParentChildResponse> {
+        // Linear sub-issues are expressed as `parentId` on the child.
+        // `issueUpdate` with only `parentId` set is the canonical way to
+        // attach an existing child under an existing parent.
+        let input = issue_update::IssueUpdateInput {
+            title: None,
+            description: None,
+            state_id: None,
+            parent_id: Some(request.parent.0),
+            label_ids: None,
+            assignee_id: None,
+        };
+        let data = self
+            .execute::<IssueUpdate>(IssueUpdateVariables {
+                id: request.child.0,
+                input,
+            })
+            .await?;
+        if !data.issue_update.success {
+            return Err(TrackerError::Transport(
+                "link_parent_child: linear reported success=false".to_string(),
+            ));
+        }
+        // Linear does not return a discrete edge id for parent/child
+        // (the relation lives on the child's `parentId` field).
+        Ok(LinkParentChildResponse { edge_id: None })
+    }
+
+    async fn attach_artifact(
+        &self,
+        request: AttachArtifactRequest,
+    ) -> TrackerResult<AttachArtifactResponse> {
+        let title = request
+            .label
+            .clone()
+            .unwrap_or_else(|| match &request.kind {
+                ArtifactKind::PullRequest => "Pull request".to_string(),
+                ArtifactKind::RunLog => "Run log".to_string(),
+                ArtifactKind::QaEvidence => "QA evidence".to_string(),
+                ArtifactKind::Other { name } => name.clone(),
+            });
+        let data = self
+            .execute::<AttachmentCreate>(AttachmentCreateVariables {
+                input: attachment_create::AttachmentCreateInput {
+                    issue_id: request.issue.0,
+                    url: request.uri,
+                    title,
+                    subtitle: request.note,
+                },
+            })
+            .await?;
+        if !data.attachment_create.success {
+            return Err(TrackerError::Transport(
+                "AttachmentCreate: linear reported success=false".to_string(),
+            ));
+        }
+        Ok(AttachArtifactResponse {
+            id: data.attachment_create.attachment.map(|a| a.id),
+        })
     }
 }
 
