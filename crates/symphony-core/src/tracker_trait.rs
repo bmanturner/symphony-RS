@@ -96,6 +96,101 @@ pub enum TrackerError {
 /// Convenience alias used throughout the trait surface.
 pub type TrackerResult<T> = Result<T, TrackerError>;
 
+/// Per-adapter mutation capability report (SPEC v2 §7.2).
+///
+/// Workflows that decompose parents into children, file blockers, or attach
+/// PR/artifact evidence MUST run against a mutation-capable adapter. The
+/// capability bag is checked at the read seam — *before* any
+/// [`TrackerMutations`] dispatch — so an advisory/proposal-mode workflow
+/// can still run against a read-only tracker without ever asking for the
+/// mutation trait object.
+///
+/// Adapters report their capabilities via [`TrackerRead::capabilities`].
+/// The default impl returns [`TrackerCapabilities::READ_ONLY`], so adapters
+/// that opt in to [`TrackerMutations`] need only override the method to
+/// flip the relevant flags. Capability flags map 1:1 to the mutation
+/// operations enumerated in SPEC v2 §7.2; flipping a flag is a public
+/// promise that the adapter implements that mutation reliably enough for
+/// production workflow use, not just that the trait method exists.
+///
+/// Granularity is intentional: GitHub Issues can `create_issue` and
+/// `add_comment` but expresses "blockers" only as labels, while Linear has
+/// first-class issue dependencies. A workflow that needs structural
+/// blocker links can reject a GitHub-only configuration without paying for
+/// a runtime probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackerCapabilities {
+    /// Adapter can create new issues (SPEC v2 §7.2 "create issue").
+    pub create_issue: bool,
+    /// Adapter can update issue status / fields (SPEC v2 §7.2 "update status").
+    pub update_issue: bool,
+    /// Adapter can post comments / activity entries (SPEC v2 §7.2 "add comment").
+    pub add_comment: bool,
+    /// Adapter can express structural blocker/dependency edges
+    /// (SPEC v2 §7.2 "create blocker/dependency"). Label-only proxies do
+    /// NOT count — workflows that gate on this expect first-class edges.
+    pub add_blocker: bool,
+    /// Adapter can link a child issue to its parent (SPEC v2 §7.2
+    /// "link parent/child"). Required for decomposition workflows.
+    pub link_parent_child: bool,
+    /// Adapter can attach PR refs, run logs, or QA evidence to an issue
+    /// (SPEC v2 §7.2 "attach PR/artifact/evidence").
+    pub attach_artifact: bool,
+}
+
+impl TrackerCapabilities {
+    /// Capability set for an adapter that implements [`TrackerRead`] only.
+    /// Used as the default return value of [`TrackerRead::capabilities`].
+    pub const READ_ONLY: Self = Self {
+        create_issue: false,
+        update_issue: false,
+        add_comment: false,
+        add_blocker: false,
+        link_parent_child: false,
+        attach_artifact: false,
+    };
+
+    /// Capability set for an adapter that supports every mutation listed
+    /// in SPEC v2 §7.2. Convenience constant for tests and for adapters
+    /// that genuinely cover the full surface.
+    pub const FULL: Self = Self {
+        create_issue: true,
+        update_issue: true,
+        add_comment: true,
+        add_blocker: true,
+        link_parent_child: true,
+        attach_artifact: true,
+    };
+
+    /// True when the adapter reports no mutation capability at all.
+    /// Workflows in advisory/proposal mode are safe; autonomous workflows
+    /// MUST refuse to dispatch (SPEC v2 §7.2 final paragraph).
+    pub const fn is_read_only(&self) -> bool {
+        !(self.create_issue
+            || self.update_issue
+            || self.add_comment
+            || self.add_blocker
+            || self.link_parent_child
+            || self.attach_artifact)
+    }
+
+    /// True when the adapter reports any mutation capability. Inverse of
+    /// [`Self::is_read_only`]; provided for readability at call sites that
+    /// branch on "can we mutate at all".
+    pub const fn supports_any_mutation(&self) -> bool {
+        !self.is_read_only()
+    }
+}
+
+impl Default for TrackerCapabilities {
+    /// Defaults to [`TrackerCapabilities::READ_ONLY`] so a freshly
+    /// constructed adapter or test stub reports the safest possible
+    /// capability set until it explicitly opts in.
+    fn default() -> Self {
+        Self::READ_ONLY
+    }
+}
+
 /// Read-only view onto an issue-tracking backend.
 ///
 /// One implementation per backend (Linear, GitHub Issues, …) plus
@@ -156,6 +251,22 @@ pub trait TrackerRead: Send + Sync {
         &self,
         terminal_states: &[IssueState],
     ) -> TrackerResult<Vec<Issue>>;
+
+    /// Report the adapter's mutation capability bag (SPEC v2 §7.2).
+    ///
+    /// Workflows query this at the read seam *before* attempting any
+    /// mutation dispatch, so even an `Arc<dyn TrackerRead>` is enough to
+    /// decide whether autonomous mode is safe or the workflow must fall
+    /// back to advisory/proposal mode.
+    ///
+    /// The default impl returns [`TrackerCapabilities::READ_ONLY`] —
+    /// adapters that also implement [`TrackerMutations`] override this
+    /// method to flip the relevant flags. Returning capabilities the
+    /// adapter cannot fulfil is a contract violation: the orchestrator
+    /// will trust the report and dispatch mutations against it.
+    fn capabilities(&self) -> TrackerCapabilities {
+        TrackerCapabilities::READ_ONLY
+    }
 }
 
 /// Mutation-side capabilities a tracker MAY support (SPEC v2 §7.2).
@@ -264,5 +375,104 @@ mod tests {
     fn tracker_error_is_send_and_sync_so_it_can_cross_task_boundaries() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TrackerError>();
+    }
+
+    #[test]
+    fn tracker_capabilities_read_only_constant_has_every_flag_off() {
+        let caps = TrackerCapabilities::READ_ONLY;
+        assert!(caps.is_read_only());
+        assert!(!caps.supports_any_mutation());
+        assert!(!caps.create_issue);
+        assert!(!caps.update_issue);
+        assert!(!caps.add_comment);
+        assert!(!caps.add_blocker);
+        assert!(!caps.link_parent_child);
+        assert!(!caps.attach_artifact);
+    }
+
+    #[test]
+    fn tracker_capabilities_full_constant_has_every_flag_on() {
+        let caps = TrackerCapabilities::FULL;
+        assert!(!caps.is_read_only());
+        assert!(caps.supports_any_mutation());
+        assert!(caps.create_issue);
+        assert!(caps.update_issue);
+        assert!(caps.add_comment);
+        assert!(caps.add_blocker);
+        assert!(caps.link_parent_child);
+        assert!(caps.attach_artifact);
+    }
+
+    #[test]
+    fn tracker_capabilities_default_matches_read_only_so_new_adapters_are_safe() {
+        assert_eq!(
+            TrackerCapabilities::default(),
+            TrackerCapabilities::READ_ONLY
+        );
+    }
+
+    #[test]
+    fn tracker_capabilities_partial_mutation_is_not_read_only() {
+        let mut caps = TrackerCapabilities::READ_ONLY;
+        caps.add_comment = true;
+        assert!(!caps.is_read_only());
+        assert!(caps.supports_any_mutation());
+        // Other flags stay off — workflows that need structural blockers
+        // can reject this adapter even though comments are available.
+        assert!(!caps.add_blocker);
+        assert!(!caps.create_issue);
+    }
+
+    #[tokio::test]
+    async fn default_capabilities_method_reports_read_only_for_read_only_adapter() {
+        let tracker: Arc<dyn TrackerRead> = Arc::new(StubTracker);
+        let caps = tracker.capabilities();
+        assert!(caps.is_read_only());
+        assert_eq!(caps, TrackerCapabilities::READ_ONLY);
+    }
+
+    #[tokio::test]
+    async fn adapter_can_override_capabilities_to_advertise_mutation_support() {
+        struct MutatingStub;
+
+        #[async_trait]
+        impl TrackerRead for MutatingStub {
+            async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
+                Ok(Vec::new())
+            }
+            async fn fetch_state(&self, _ids: &[IssueId]) -> TrackerResult<Vec<Issue>> {
+                Ok(Vec::new())
+            }
+            async fn fetch_terminal_recent(
+                &self,
+                _terminal_states: &[IssueState],
+            ) -> TrackerResult<Vec<Issue>> {
+                Ok(Vec::new())
+            }
+            fn capabilities(&self) -> TrackerCapabilities {
+                TrackerCapabilities {
+                    create_issue: true,
+                    add_comment: true,
+                    link_parent_child: true,
+                    ..TrackerCapabilities::READ_ONLY
+                }
+            }
+        }
+
+        let tracker: Arc<dyn TrackerRead> = Arc::new(MutatingStub);
+        let caps = tracker.capabilities();
+        assert!(!caps.is_read_only());
+        assert!(caps.create_issue);
+        assert!(caps.add_comment);
+        assert!(caps.link_parent_child);
+        assert!(!caps.add_blocker);
+        assert!(!caps.update_issue);
+        assert!(!caps.attach_artifact);
+    }
+
+    #[test]
+    fn tracker_capabilities_is_send_sync_and_copy_so_it_crosses_task_boundaries() {
+        fn assert_send_sync_copy<T: Send + Sync + Copy>() {}
+        assert_send_sync_copy::<TrackerCapabilities>();
     }
 }

@@ -57,7 +57,9 @@ pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleReques
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
-pub use tracker_trait::{TrackerError, TrackerMutations, TrackerRead, TrackerResult};
+pub use tracker_trait::{
+    TrackerCapabilities, TrackerError, TrackerMutations, TrackerRead, TrackerResult,
+};
 pub use work_item::{
     ClassifyError, StatusClassifier, TrackerStatus, UnknownStatePolicy, WorkItem, WorkItemId,
     WorkItemStatusClass,
