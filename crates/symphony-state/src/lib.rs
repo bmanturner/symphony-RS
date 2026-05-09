@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 pub mod migrations;
+pub mod repository;
 
 use std::path::Path;
 
@@ -121,7 +122,6 @@ impl StateDb {
 
     /// Borrow the underlying connection. Used by repository modules
     /// inside this crate; not part of the cross-crate API contract.
-    #[cfg(test)]
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
