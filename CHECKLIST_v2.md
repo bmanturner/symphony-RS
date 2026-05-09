@@ -101,7 +101,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add git integration operation abstraction in `symphony-workspace` using the git CLI: merge/cherry-pick/shared-branch verification and push.
 - [x] Add gate requiring all child issues terminal before integration unless explicitly waived.
 - [x] Add gate requiring no open blockers before draft PR creation and QA request.
-- [ ] Add tests for child completion, blocker prevention, draft PR creation, successful integration handoff, merge conflict repair, and conflict/block path.
+- [x] Add tests for child completion, blocker prevention, draft PR creation, successful integration handoff, merge conflict repair, and conflict/block path.
 
 ## Phase 9 — QA Gate Flow
 
