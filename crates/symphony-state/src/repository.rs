@@ -224,7 +224,7 @@ pub trait RunRepository {
     fn find_expired_leases(&self, now: &str) -> StateResult<Vec<RunRecord>>;
 }
 
-const WORK_ITEM_COLUMNS: &str = "id, tracker_id, identifier, parent_id, title, \
+pub(crate) const WORK_ITEM_COLUMNS: &str = "id, tracker_id, identifier, parent_id, title, \
      status_class, tracker_status, assigned_role, assigned_agent, priority, \
      workspace_policy, branch_policy, created_at, updated_at";
 
@@ -232,7 +232,7 @@ const RUN_COLUMNS: &str = "id, work_item_id, role, agent, status, workspace_clai
      lease_owner, lease_expires_at, started_at, ended_at, cost, tokens, \
      result_summary, error, created_at";
 
-fn map_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemRecord> {
+pub(crate) fn map_work_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemRecord> {
     Ok(WorkItemRecord {
         id: WorkItemId(row.get(0)?),
         tracker_id: row.get(1)?,
