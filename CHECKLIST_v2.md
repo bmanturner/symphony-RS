@@ -86,10 +86,10 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Update prompt rendering to include role context, workspace claim, parent/child context, blockers, acceptance criteria, and output schema.
 - [x] Replace tiny string substitution with the strict built-in `{{path.to.value}}` renderer that fails on unknown variables.
 - [x] Add malformed-handoff handling: fail run or request repair turn by policy.
-- [ ] Persist handoffs and expose them in `symphony status`.
+- [x] Persist handoffs and expose them in `symphony status`.
   - [x] Add `HandoffRepository` to `symphony-state` (insert + list-by-work-item + latest), backed by the existing `handoffs` table, with composition through `StateTransaction`.
   - [x] Wire `symphony status` to surface the latest persisted handoff per work item when a state DB is configured.
-- [ ] Add tests for handoff parsing and repair/failure behavior.
+- [x] Add tests for handoff parsing and repair/failure behavior.
 
 ## Phase 8 — Integration Owner Flow
 

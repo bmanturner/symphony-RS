@@ -1284,4 +1284,193 @@ mod tests {
         assert!(h.verdict_request.is_none());
         h.validate().unwrap();
     }
+
+    #[test]
+    fn parse_propagates_blocker_request_shape_error() {
+        // Decodes successfully but Handoff::validate rejects the blocker
+        // request because its reason is whitespace-only.
+        let raw = r#"{
+            "summary": "did the thing",
+            "branch_or_workspace": { "branch": "feat/foo" },
+            "ready_for": "blocked",
+            "blockers_created": [
+                { "blocking_id": 12, "reason": "   ", "severity": "medium" }
+            ]
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            MalformedHandoff::InvalidShape(HandoffError::EmptyBlockerReason)
+        ));
+    }
+
+    #[test]
+    fn parse_propagates_blocked_without_evidence_via_invalid_shape() {
+        let raw = r#"{
+            "summary": "ran into a wall",
+            "branch_or_workspace": { "branch": "feat/foo" },
+            "ready_for": "blocked"
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            MalformedHandoff::InvalidShape(HandoffError::BlockedWithoutEvidence)
+        ));
+    }
+
+    #[test]
+    fn parse_propagates_non_blocked_block_reason_error() {
+        let raw = r#"{
+            "summary": "did stuff",
+            "branch_or_workspace": { "branch": "feat/foo" },
+            "ready_for": "qa",
+            "block_reason": "stuck"
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            MalformedHandoff::InvalidShape(HandoffError::NonBlockedBlockReason(ReadyFor::Qa))
+        ));
+    }
+
+    #[test]
+    fn parse_propagates_verdict_request_shape_error() {
+        // verdict=failed_with_blockers requires at least one blocker id.
+        let raw = r#"{
+            "summary": "qa report",
+            "branch_or_workspace": { "branch": "feat/foo" },
+            "ready_for": "qa",
+            "verdict_request": {
+                "verdict": "failed_with_blockers",
+                "evidence": {},
+                "acceptance_trace": [],
+                "blockers_created": [],
+                "reason": "tests fail"
+            }
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(
+            err,
+            MalformedHandoff::InvalidShape(HandoffError::VerdictMissingBlockers)
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_payload_with_wrong_field_type_as_invalid_json() {
+        // ready_for is a typed enum; passing a number triggers a serde_json
+        // decode error, surfaced as InvalidJson rather than InvalidShape.
+        let raw = r#"{
+            "summary": "x",
+            "branch_or_workspace": { "branch": "feat/foo" },
+            "ready_for": 7
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(err, MalformedHandoff::InvalidJson(_)));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_ready_for_variant_as_invalid_json() {
+        let raw = r#"{
+            "summary": "x",
+            "branch_or_workspace": { "branch": "feat/foo" },
+            "ready_for": "ship_it"
+        }"#;
+        let err = Handoff::parse(raw).unwrap_err();
+        assert!(matches!(err, MalformedHandoff::InvalidJson(_)));
+    }
+
+    #[test]
+    fn repair_loop_succeeds_when_agent_returns_valid_payload_on_retry() {
+        // Simulates the kernel's repair loop: malformed payload, request a
+        // repair turn, agent returns a valid payload on attempt 2.
+        let policy = MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 2 };
+        let payloads = [
+            "{ not json",
+            &serde_json::to_string(&minimal_handoff()).unwrap().clone(),
+        ]
+        .map(String::from);
+
+        let mut prior_attempts = 0;
+        let mut final_handoff: Option<Handoff> = None;
+        for raw in payloads.iter() {
+            match Handoff::parse(raw) {
+                Ok(h) => {
+                    final_handoff = Some(h);
+                    break;
+                }
+                Err(failure) => {
+                    let decision = policy.decide(failure, prior_attempts);
+                    assert!(
+                        decision.is_repair_turn(),
+                        "expected repair turn at {prior_attempts}"
+                    );
+                    prior_attempts += 1;
+                }
+            }
+        }
+
+        assert!(final_handoff.is_some());
+        assert_eq!(prior_attempts, 1);
+    }
+
+    #[test]
+    fn repair_loop_falls_back_to_fail_run_when_attempts_exhausted() {
+        // Every payload is malformed; after `max_attempts` repair turns the
+        // policy switches to FailRun and the kernel ends the run.
+        let policy = MalformedHandoffPolicy::RequestRepairTurn { max_attempts: 2 };
+        let bad_payloads = ["{ not json", "{ still bad", "{ still bad either"];
+
+        let mut prior_attempts = 0;
+        let mut last_decision: Option<MalformedHandoffDecision> = None;
+        for raw in bad_payloads.iter() {
+            let failure = Handoff::parse(raw).unwrap_err();
+            let decision = policy.decide(failure, prior_attempts);
+            if decision.is_repair_turn() {
+                prior_attempts += 1;
+            }
+            last_decision = Some(decision);
+            if last_decision.as_ref().unwrap().is_fail_run() {
+                break;
+            }
+        }
+
+        match last_decision.unwrap() {
+            MalformedHandoffDecision::FailRun { attempts_used, .. } => {
+                assert_eq!(attempts_used, 2);
+            }
+            other => panic!("expected fail run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fail_run_policy_short_circuits_repair_loop_on_first_malformed_payload() {
+        let policy = MalformedHandoffPolicy::FailRun;
+        let failure = Handoff::parse("not even close").unwrap_err();
+        let decision = policy.decide(failure.clone(), 0);
+        assert!(decision.is_fail_run());
+        match decision.failure() {
+            MalformedHandoff::InvalidJson(_) => {}
+            other => panic!("expected invalid json failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_round_trip_drives_consequence_for_every_ready_for_variant() {
+        // Locks in that a parsed handoff yields the same kernel consequence
+        // as the typed builder for every ReadyFor variant — the kernel
+        // routes runs based on ready_for after parse, so this is the full
+        // happy-path contract.
+        for r in ReadyFor::ALL {
+            let mut h = minimal_handoff();
+            h.ready_for = r;
+            h.block_reason = if r == ReadyFor::Blocked {
+                Some("waiting on vendor".into())
+            } else {
+                None
+            };
+            let raw = serde_json::to_string(&h).unwrap();
+            let parsed = Handoff::parse(&raw).unwrap();
+            assert_eq!(parsed.consequence(), r.consequence());
+        }
+    }
 }
