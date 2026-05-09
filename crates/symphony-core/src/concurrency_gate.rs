@@ -272,6 +272,130 @@ pub struct ScopeContended {
     pub in_flight: u32,
 }
 
+/// The `(role, agent_profile, repository)` triple a dispatch derives
+/// its scope permits from.
+///
+/// `role` is always present — every dispatch has a role. `agent_profile`
+/// and `repository` are optional: a workflow that has not yet bound an
+/// agent profile to a role, or a tracker without a repository slug,
+/// simply skips that scope rather than acquiring against an empty key.
+///
+/// Construct via [`DispatchTriple::new`] and read back the canonical
+/// scope-request list with [`DispatchTriple::scopes`]. The shape is
+/// fixed and ordered so downstream tests can assert it deterministically:
+///
+/// 1. [`Scope::Global`]
+/// 2. [`Scope::Role`] (always)
+/// 3. [`Scope::AgentProfile`] (iff `agent_profile.is_some()`)
+/// 4. [`Scope::Repository`] (iff `repository.is_some()`)
+///
+/// This subtask intentionally does not change runner behavior — it only
+/// fixes the request shape so subsequent per-runner subtasks can wire
+/// acquisition uniformly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchTriple {
+    role: String,
+    agent_profile: Option<String>,
+    repository: Option<String>,
+}
+
+impl DispatchTriple {
+    /// Construct a dispatch triple from a role and optional agent
+    /// profile / repository slug. An empty `role` string is allowed at
+    /// the gate layer — workflow validation rejects empties upstream.
+    pub fn new(
+        role: impl Into<String>,
+        agent_profile: Option<String>,
+        repository: Option<String>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            agent_profile,
+            repository,
+        }
+    }
+
+    /// Borrow the role label.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    /// Borrow the agent profile name, if bound.
+    pub fn agent_profile(&self) -> Option<&str> {
+        self.agent_profile.as_deref()
+    }
+
+    /// Borrow the repository slug, if bound.
+    pub fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+
+    /// Canonical scope-request derivation for this triple.
+    ///
+    /// See [`DispatchTriple`] for the fixed ordering. The returned
+    /// `Vec<Scope>` is the exact argument runners pass to
+    /// [`ConcurrencyGate::try_acquire`].
+    pub fn scopes(&self) -> Vec<Scope> {
+        let mut out = Vec::with_capacity(4);
+        out.push(Scope::Global);
+        out.push(Scope::Role(self.role.clone()));
+        if let Some(profile) = &self.agent_profile {
+            out.push(Scope::AgentProfile(profile.clone()));
+        }
+        if let Some(repo) = &self.repository {
+            out.push(Scope::Repository(repo.clone()));
+        }
+        out
+    }
+}
+
+/// Bundle a [`ConcurrencyGate`] with a dispatch's [`DispatchTriple`] so
+/// runners share one acquire surface.
+///
+/// Each dispatch builds a [`RunnerScopes`] from its triple, calls
+/// [`RunnerScopes::try_acquire`] before invoking the agent, and holds
+/// the returned [`ScopePermitSet`] for the lifetime of the dispatch —
+/// `Drop` releases every held permit on terminal completion.
+///
+/// This struct is intentionally thin: no runner consumes it yet. The
+/// next checklist subtasks plumb it through individual runners.
+#[derive(Debug, Clone)]
+pub struct RunnerScopes {
+    gate: ConcurrencyGate,
+    triple: DispatchTriple,
+}
+
+impl RunnerScopes {
+    /// Build a [`RunnerScopes`] from a gate clone and a dispatch triple.
+    pub fn new(gate: ConcurrencyGate, triple: DispatchTriple) -> Self {
+        Self { gate, triple }
+    }
+
+    /// Borrow the underlying triple.
+    pub fn triple(&self) -> &DispatchTriple {
+        &self.triple
+    }
+
+    /// Borrow the underlying gate.
+    pub fn gate(&self) -> &ConcurrencyGate {
+        &self.gate
+    }
+
+    /// The exact scope-request list this dispatch will acquire.
+    ///
+    /// Equivalent to `self.triple().scopes()`, surfaced as a method so
+    /// callers can read the request without reaching into the triple.
+    pub fn request(&self) -> Vec<Scope> {
+        self.triple.scopes()
+    }
+
+    /// Try to acquire one permit per scope in [`RunnerScopes::request`],
+    /// atomically. Forwards to [`ConcurrencyGate::try_acquire`].
+    pub fn try_acquire(&self) -> Result<ScopePermitSet, ScopeContended> {
+        self.gate.try_acquire(&self.request())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +578,127 @@ mod tests {
         let permit = gate.try_acquire(&[]).unwrap();
         assert!(permit.is_empty());
         assert_eq!(permit.len(), 0);
+    }
+
+    #[test]
+    fn dispatch_triple_full_request_includes_four_scopes_in_order() {
+        let triple = DispatchTriple::new(
+            "specialist",
+            Some("claude".into()),
+            Some("acme/widgets".into()),
+        );
+        let scopes = triple.scopes();
+        assert_eq!(
+            scopes,
+            vec![
+                Scope::Global,
+                Scope::Role("specialist".into()),
+                Scope::AgentProfile("claude".into()),
+                Scope::Repository("acme/widgets".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_triple_drops_agent_profile_when_unbound() {
+        let triple = DispatchTriple::new("integration_owner", None, Some("acme/widgets".into()));
+        assert_eq!(
+            triple.scopes(),
+            vec![
+                Scope::Global,
+                Scope::Role("integration_owner".into()),
+                Scope::Repository("acme/widgets".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_triple_drops_repository_when_unbound() {
+        let triple = DispatchTriple::new("qa", Some("claude".into()), None);
+        assert_eq!(
+            triple.scopes(),
+            vec![
+                Scope::Global,
+                Scope::Role("qa".into()),
+                Scope::AgentProfile("claude".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_triple_minimal_request_is_global_then_role() {
+        let triple = DispatchTriple::new("specialist", None, None);
+        assert_eq!(
+            triple.scopes(),
+            vec![Scope::Global, Scope::Role("specialist".into())]
+        );
+    }
+
+    #[test]
+    fn dispatch_triple_accessors_round_trip() {
+        let triple = DispatchTriple::new("qa", Some("claude".into()), Some("acme/widgets".into()));
+        assert_eq!(triple.role(), "qa");
+        assert_eq!(triple.agent_profile(), Some("claude"));
+        assert_eq!(triple.repository(), Some("acme/widgets"));
+    }
+
+    #[test]
+    fn runner_scopes_request_matches_triple_scopes() {
+        let gate = ConcurrencyGate::new();
+        let triple = DispatchTriple::new(
+            "specialist",
+            Some("claude".into()),
+            Some("acme/widgets".into()),
+        );
+        let scopes = RunnerScopes::new(gate, triple.clone());
+        assert_eq!(scopes.request(), triple.scopes());
+        assert_eq!(scopes.triple(), &triple);
+    }
+
+    #[test]
+    fn runner_scopes_try_acquire_uses_canonical_shape() {
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(role("specialist"), 1);
+        let triple = DispatchTriple::new("specialist", Some("claude".into()), None);
+        let scopes = RunnerScopes::new(gate.clone(), triple);
+
+        let permit = scopes.try_acquire().unwrap();
+        // Role is at cap=1; another acquire on the same triple must
+        // contend on Role (proving Role is in the request).
+        let err = scopes.try_acquire().unwrap_err();
+        assert_eq!(err.scope, role("specialist"));
+        drop(permit);
+
+        // After release, a fresh acquire succeeds again.
+        let _again = scopes.try_acquire().unwrap();
+    }
+
+    #[test]
+    fn runner_scopes_try_acquire_contends_on_repository_when_bound() {
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(repo("acme/widgets"), 1);
+        let triple = DispatchTriple::new("specialist", None, Some("acme/widgets".into()));
+        let scopes = RunnerScopes::new(gate, triple);
+
+        let _hold = scopes.try_acquire().unwrap();
+        let err = scopes.try_acquire().unwrap_err();
+        assert_eq!(err.scope, repo("acme/widgets"));
+    }
+
+    #[test]
+    fn runner_scopes_with_no_caps_acquires_unbounded() {
+        let gate = ConcurrencyGate::new();
+        let triple = DispatchTriple::new(
+            "specialist",
+            Some("claude".into()),
+            Some("acme/widgets".into()),
+        );
+        let scopes = RunnerScopes::new(gate, triple);
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(scopes.try_acquire().unwrap());
+        }
+        assert_eq!(held.len(), 16);
     }
 
     #[test]

@@ -84,7 +84,8 @@ pub use budget_pause_tick::{
     BudgetPauseQueueError, BudgetPauseQueueSource, BudgetPauseQueueTick, BudgetPauseStatus,
 };
 pub use concurrency_gate::{
-    ConcurrencyGate, Scope, ScopeAvailability, ScopeContended, ScopeKind, ScopePermitSet,
+    ConcurrencyGate, DispatchTriple, RunnerScopes, Scope, ScopeAvailability, ScopeContended,
+    ScopeKind, ScopePermitSet,
 };
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
