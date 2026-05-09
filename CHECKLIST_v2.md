@@ -77,7 +77,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add shared integration branch strategy for explicit same-branch workflows.
 - [x] Add cwd verification immediately before agent launch.
 - [x] Add git branch/ref verification immediately before mutation-capable runs.
-- [ ] Add clean-tree policy enforcement.
+- [x] Add clean-tree policy enforcement.
 - [ ] Add tests for path traversal, wrong cwd, wrong branch, dirty tree, and shared branch policy.
 
 ## Phase 7 — Structured Agent Handoffs

@@ -568,6 +568,93 @@ pub async fn verify_branch_matches_required(
     }
 }
 
+/// Stable check name for the clean-tree verifier.
+///
+/// Pinned so log scrapers and tests do not depend on a literal that
+/// might drift. SPEC v2 §8.3 lists "tree cleanliness matches policy"
+/// as the third pre-launch invariant, after `cwd_in_workspace` and
+/// `branch_matches_required`. The policy switch lives on
+/// `BranchPolicyConfig::require_clean_tree_before_run`; this check
+/// reports the *fact* of cleanliness, and the claim wrapper applies
+/// the policy.
+pub const CHECK_CLEAN_TREE: &str = "clean_tree";
+
+/// Verify that the worktree at `claim_path` has no uncommitted or
+/// untracked changes.
+///
+/// Implementation: `git -C <claim_path> status --porcelain`. Empty
+/// output ⇒ clean. Any output (modified, added, untracked, conflict)
+/// ⇒ dirty, and the failing detail includes a truncated dump of the
+/// porcelain output so an operator can diagnose without rerunning.
+///
+/// `--porcelain=v1` is intentional: its grammar is stable across git
+/// versions, and a dirty repo by any of its categories (M, A, D, R,
+/// C, U, ??) must fail the gate. We do not distinguish "only
+/// untracked" from "modified tracked files" — SPEC §8.3 reads
+/// cleanliness as a single invariant, and a stray untracked file on
+/// an integration worktree is exactly the surprise this gate is
+/// meant to catch before a mutation-capable run.
+///
+/// Spawn or non-zero-exit errors fail the gate rather than panicking;
+/// agents must not launch when we cannot prove the tree is clean.
+pub async fn verify_clean_tree(claim_path: &Path) -> VerificationCheck {
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(claim_path)
+        .args(["status", "--porcelain=v1"])
+        .output()
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return VerificationCheck {
+                name: CHECK_CLEAN_TREE.into(),
+                status: VerificationStatus::Failed,
+                detail: Some(format!("spawn git status in {}: {e}", claim_path.display())),
+            };
+        }
+    };
+    if !out.status.success() {
+        return VerificationCheck {
+            name: CHECK_CLEAN_TREE.into(),
+            status: VerificationStatus::Failed,
+            detail: Some(format!(
+                "git status --porcelain in {} exited {}: {}",
+                claim_path.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        };
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        VerificationCheck {
+            name: CHECK_CLEAN_TREE.into(),
+            status: VerificationStatus::Passed,
+            detail: None,
+        }
+    } else {
+        // Cap the dump so a worktree with thousands of untracked
+        // files cannot blow up a log line.
+        const MAX: usize = 500;
+        let dump = if trimmed.len() > MAX {
+            format!("{}…", &trimmed[..MAX])
+        } else {
+            trimmed.to_string()
+        };
+        VerificationCheck {
+            name: CHECK_CLEAN_TREE.into(),
+            status: VerificationStatus::Failed,
+            detail: Some(format!(
+                "worktree {} is dirty:\n{}",
+                claim_path.display(),
+                dump
+            )),
+        }
+    }
+}
+
 impl VerificationReport {
     /// Append `check` and recompute aggregate [`Self::status`].
     ///
@@ -629,6 +716,34 @@ impl WorkspaceClaim {
             return true;
         };
         let check = verify_branch_matches_required(&self.path, &required).await;
+        let passed = matches!(check.status, VerificationStatus::Passed);
+        self.verification.record(check);
+        passed
+    }
+
+    /// Run [`verify_clean_tree`] for this claim and record the result
+    /// on [`Self::verification`]. Returns `true` iff the gate passed
+    /// (clean tree, or skipped because policy did not require it);
+    /// callers (the orchestrator's pre-launch path) MUST NOT spawn a
+    /// mutation-capable agent when this returns `false`.
+    ///
+    /// `required` is the policy switch from
+    /// `BranchPolicyConfig::require_clean_tree_before_run`. When
+    /// `false`, the verifier records a `Skipped` check (so the
+    /// verification report is self-describing for log scrapers) and
+    /// returns `true`. When `true`, it shells out to git status and
+    /// records a `Passed`/`Failed` check. SPEC v2 §8.3's "skip is
+    /// neither a pass nor a fail" rule applies.
+    pub async fn verify_clean_tree(&mut self, required: bool) -> bool {
+        if !required {
+            self.verification.record(VerificationCheck {
+                name: CHECK_CLEAN_TREE.into(),
+                status: VerificationStatus::Skipped,
+                detail: Some("clean-tree policy disabled".into()),
+            });
+            return true;
+        }
+        let check = verify_clean_tree(&self.path).await;
         let passed = matches!(check.status, VerificationStatus::Passed);
         self.verification.record(check);
         passed
@@ -2568,6 +2683,156 @@ mod tests {
         assert!(claim.verify_branch().await);
         assert_eq!(claim.verification.status, VerificationStatus::Passed);
         assert_eq!(claim.verification.checks.len(), 2);
+    }
+
+    // ----- pre-launch clean-tree verifier (Phase 6) -----------------------
+
+    /// A freshly initialised repo with one committed file and nothing
+    /// else passes the clean-tree gate.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_clean_tree_passes_on_clean_repo() {
+        let repo = init_repo_with_main_commit().await;
+        let check = verify_clean_tree(repo.path()).await;
+        assert_eq!(check.name, CHECK_CLEAN_TREE);
+        assert_eq!(check.status, VerificationStatus::Passed);
+        assert!(check.detail.is_none());
+    }
+
+    /// An untracked file makes the tree dirty and fails the gate. The
+    /// failing detail names the offending path so an operator can
+    /// diagnose without rerunning git status by hand.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_clean_tree_fails_on_untracked_file() {
+        let repo = init_repo_with_main_commit().await;
+        std::fs::write(repo.path().join("stray.txt"), "x").unwrap();
+        let check = verify_clean_tree(repo.path()).await;
+        assert_eq!(check.status, VerificationStatus::Failed);
+        let detail = check.detail.expect("failed check must carry detail");
+        assert!(detail.contains("stray.txt"), "got: {detail}");
+    }
+
+    /// A modified-but-uncommitted tracked file fails the gate. This is
+    /// the canonical "agent left work on disk between runs" scenario.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_clean_tree_fails_on_modified_tracked_file() {
+        let repo = init_repo_with_main_commit().await;
+        std::fs::write(repo.path().join("README.md"), "changed").unwrap();
+        let check = verify_clean_tree(repo.path()).await;
+        assert_eq!(check.status, VerificationStatus::Failed);
+        let detail = check.detail.expect("failed check must carry detail");
+        assert!(detail.contains("README.md"), "got: {detail}");
+    }
+
+    /// A non-git path fails the gate (git status exits non-zero)
+    /// rather than panicking — defensive guard for the orchestrator
+    /// pre-launch path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_clean_tree_fails_when_path_is_not_git() {
+        let tmp = TempDir::new().unwrap();
+        let check = verify_clean_tree(tmp.path()).await;
+        assert_eq!(check.status, VerificationStatus::Failed);
+        assert!(check.detail.is_some());
+    }
+
+    /// `WorkspaceClaim::verify_clean_tree(true)` records a `Passed`
+    /// check on a clean repo and flips the aggregate to `Passed`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_claim_verify_clean_tree_records_pass() {
+        let repo = init_repo_with_main_commit().await;
+        let mut claim = WorkspaceClaim {
+            path: repo.path().to_path_buf(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some("main".into()),
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_clean_tree(true).await);
+        assert_eq!(claim.verification.status, VerificationStatus::Passed);
+        assert_eq!(claim.verification.checks.len(), 1);
+        assert_eq!(claim.verification.checks[0].name, CHECK_CLEAN_TREE);
+    }
+
+    /// A dirty tree under the claim's path flips the aggregate to
+    /// `Failed` and the method returns `false`. The orchestrator
+    /// MUST NOT launch a mutation-capable agent after this.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_claim_verify_clean_tree_records_fail() {
+        let repo = init_repo_with_main_commit().await;
+        std::fs::write(repo.path().join("stray.txt"), "x").unwrap();
+        let mut claim = WorkspaceClaim {
+            path: repo.path().to_path_buf(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some("main".into()),
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(!claim.verify_clean_tree(true).await);
+        assert_eq!(claim.verification.status, VerificationStatus::Failed);
+    }
+
+    /// `verify_clean_tree(false)` records a `Skipped` check and
+    /// returns `true` without shelling out to git — policy disabled
+    /// is neither a pass nor a fail. Verified by pointing at a
+    /// non-git path: if the verifier ran git, it would fail; the
+    /// `true` return proves it short-circuited on the policy switch.
+    #[tokio::test]
+    async fn workspace_claim_verify_clean_tree_skips_when_policy_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut claim = WorkspaceClaim {
+            path: tmp.path().to_path_buf(),
+            strategy: ClaimStrategy::Directory,
+            base_ref: None,
+            branch: None,
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_clean_tree(false).await);
+        assert_eq!(claim.verification.status, VerificationStatus::Pending);
+        assert_eq!(claim.verification.checks.len(), 1);
+        assert_eq!(
+            claim.verification.checks[0].status,
+            VerificationStatus::Skipped
+        );
+        assert_eq!(claim.verification.checks[0].name, CHECK_CLEAN_TREE);
+    }
+
+    /// Composing cwd, branch, and clean-tree verifiers yields a
+    /// `Passed` aggregate when all three gates pass — the canonical
+    /// pre-launch sequence the orchestrator runs against a
+    /// worktree-backed claim with clean-tree policy on.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_claim_cwd_branch_clean_tree_compose_to_passed() {
+        let repo = init_repo_with_main_commit().await;
+        let mut claim = WorkspaceClaim {
+            path: repo.path().to_path_buf(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some("main".into()),
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_cwd(repo.path()));
+        assert!(claim.verify_branch().await);
+        assert!(claim.verify_clean_tree(true).await);
+        assert_eq!(claim.verification.status, VerificationStatus::Passed);
+        assert_eq!(claim.verification.checks.len(), 3);
     }
 
     /// A subsequent `Failed` check must downgrade an aggregate that
