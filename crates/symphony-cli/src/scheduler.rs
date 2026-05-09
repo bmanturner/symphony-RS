@@ -7,18 +7,21 @@
 //! once is too large for one commit; this module is the seam each
 //! subsequent decomposition step extends.
 //!
-//! [`build_scheduler_v2`] currently registers the **intake** and
-//! **recovery** ticks. The recovery tick is driven by the shared
-//! [`ActiveSetStore`] plus an in-memory [`ClaimedRunRegistry`] that
-//! stands in for the durable `runs` table until a state DB is plumbed
-//! in: any claim whose `IssueId` is no longer in the active set
-//! surfaces as an [`ExpiredLeaseCandidate`], matching the flat poll
-//! loop's `Reconciled { dropped }` reconciliation contract. Specialist
-//! / integration / QA / follow-up-approval / budget-pause ticks layer
-//! on top of the same store and registry in subsequent decomposition
-//! steps. The returned scheduler is not yet wired into
-//! [`crate::run::run`]; that switch is the last decomposition step.
-//! Until then the production entry point remains [`PollLoop`].
+//! [`build_scheduler_v2`] currently registers the **intake**,
+//! **recovery**, and **specialist** ticks plus a [`SpecialistRunner`]
+//! that drains the specialist dispatch queue under
+//! `cfg.agent.max_concurrent_agents` capacity. The recovery tick is
+//! driven by the shared [`ActiveSetStore`] plus an in-memory
+//! [`ClaimedRunRegistry`] that stands in for the durable `runs` table
+//! until a state DB is plumbed in: any claim whose `IssueId` is no
+//! longer in the active set surfaces as an [`ExpiredLeaseCandidate`],
+//! matching the flat poll loop's `Reconciled { dropped }`
+//! reconciliation contract. Integration / QA / follow-up-approval /
+//! budget-pause ticks layer on top of the same store and registry in
+//! subsequent decomposition steps. The returned scheduler is not yet
+//! wired into [`crate::run::run`]; that switch is the last
+//! decomposition step. Until then the production entry point remains
+//! [`PollLoop`].
 //!
 //! [`PollLoop`]: symphony_core::PollLoop
 
@@ -30,12 +33,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use symphony_config::WorkflowConfig;
+use symphony_config::{self as cfg, WorkflowConfig};
 use symphony_core::{
-    ActiveSetStore, ExpiredLeaseCandidate, IntakeQueueTick, IssueId,
+    ActiveSetStore, Dispatcher, ExpiredLeaseCandidate, IntakeQueueTick, IssueId,
     OrphanedWorkspaceClaimCandidate, QueueTick, QueueTickCadence, RecoveryDispatchQueue,
     RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick, RecoveryRunId,
-    RecoveryWorkspaceClaimId, SchedulerV2, SchedulerV2Config, TrackerRead, WorkItemId,
+    RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName, RoutingEngine, RoutingMatch,
+    RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2, SchedulerV2Config,
+    SpecialistDispatchQueue, SpecialistQueueTick, SpecialistRunner, TrackerRead, WorkItemId,
 };
 
 /// What [`build_scheduler_v2`] hands back to the composition root.
@@ -69,6 +74,19 @@ pub struct SchedulerV2Bundle {
     /// (and the eventual `run.rs` switch) can observe it without
     /// reaching into the tick.
     pub recovery_dispatch: Arc<RecoveryDispatchQueue>,
+    /// FIFO of pending [`symphony_core::SpecialistDispatchRequest`]s
+    /// emitted by the specialist queue tick. Drained by
+    /// [`Self::specialist_runner`] under bounded concurrency. Held on
+    /// the bundle so the eventual `run.rs` switch (and tests) can
+    /// observe queue state directly without reaching into the tick.
+    pub specialist_dispatch: Arc<SpecialistDispatchQueue>,
+    /// Bounded-concurrency consumer for [`Self::specialist_dispatch`],
+    /// pre-wired with `cfg.agent.max_concurrent_agents` capacity and
+    /// the supplied [`Dispatcher`] (production: `SymphonyDispatcher`).
+    /// The composition root drives [`SpecialistRunner::run_pending`] and
+    /// [`SpecialistRunner::reap_completed`] on its own cadence; the
+    /// scheduler tick fan only enqueues requests.
+    pub specialist_runner: Arc<SpecialistRunner>,
 }
 
 /// One in-flight claim recorded in [`ClaimedRunRegistry`].
@@ -206,22 +224,33 @@ impl RecoveryQueueSource for ActiveSetRecoverySource {
     }
 }
 
-/// Build a [`SchedulerV2`] with the intake tick wired up.
+/// Build a [`SchedulerV2`] with the intake, recovery, and specialist
+/// queue ticks wired up.
 ///
 /// Cadence is mapped from [`WorkflowConfig::polling`]:
 /// `interval_ms` → `SchedulerV2Config::interval`,
-/// `jitter_ms` → `SchedulerV2Config::jitter`. The intake tick reuses
-/// the same cadence for now — there is no per-queue cadence config in
-/// `WORKFLOW.md` yet, and SPEC v2 §5.2 names a single `polling.*`
-/// block.
+/// `jitter_ms` → `SchedulerV2Config::jitter`. Every tick reuses the
+/// same cadence for now — there is no per-queue cadence config in
+/// `WORKFLOW.md` yet, and SPEC v2 §5.2 names a single `polling.*` block.
+///
+/// The specialist tick reads the workflow's `routing.*` and `roles.*`
+/// blocks: rules, default role, match mode, and per-role `kind` are
+/// mirrored into the kernel-side [`RoutingEngine`] + [`RoleKindLookup`].
+/// `dispatcher` is the per-issue [`Dispatcher`] (production:
+/// `SymphonyDispatcher`) reused under the configured
+/// `agent.max_concurrent_agents` capacity. The runner is exposed on the
+/// returned bundle so the composition root can drive
+/// `run_pending` / `reap_completed` on its own cadence — the scheduler
+/// only enqueues dispatch requests.
 ///
 /// This function is intentionally additive: it does not register
-/// specialist / integration / QA / follow-up approval / budget-pause /
-/// recovery ticks yet. Those come in subsequent decomposition steps,
-/// which will extend this builder rather than introduce a parallel one.
+/// integration / QA / follow-up approval / budget-pause ticks yet.
+/// Those come in subsequent decomposition steps, which will extend
+/// this builder rather than introduce a parallel one.
 pub fn build_scheduler_v2(
     cfg: &WorkflowConfig,
     tracker: Arc<dyn TrackerRead>,
+    dispatcher: Arc<dyn Dispatcher>,
 ) -> SchedulerV2Bundle {
     let cadence = QueueTickCadence::from_millis(cfg.polling.interval_ms, cfg.polling.jitter_ms);
     let scheduler_cfg = SchedulerV2Config::from_cadence(cadence);
@@ -242,13 +271,88 @@ pub fn build_scheduler_v2(
         cadence,
     ));
 
-    let scheduler = SchedulerV2::with_ticks(scheduler_cfg, vec![intake, recovery]);
+    let specialist_dispatch = Arc::new(SpecialistDispatchQueue::new());
+    let specialist: Box<dyn QueueTick> = Box::new(SpecialistQueueTick::new(
+        active_set.clone(),
+        routing_engine_from_config(cfg),
+        role_kinds_from_config(cfg),
+        specialist_dispatch.clone(),
+        cadence,
+    ));
+
+    // SPEC v2 §5.5: `agent.max_concurrent_agents` is the global ceiling
+    // on simultaneously running specialist sessions. Per-role caps live
+    // on `RoleConfig::max_concurrent` and will layer in once role-aware
+    // dispatch lands; until then the runner enforces the global cap.
+    let max_concurrent = cfg.agent.max_concurrent_agents as usize;
+    let specialist_runner = Arc::new(SpecialistRunner::new(
+        specialist_dispatch.clone(),
+        active_set.clone(),
+        dispatcher,
+        max_concurrent,
+    ));
+
+    let scheduler = SchedulerV2::with_ticks(scheduler_cfg, vec![intake, recovery, specialist]);
     SchedulerV2Bundle {
         scheduler,
         active_set,
         claimed_runs,
         recovery_dispatch,
+        specialist_dispatch,
+        specialist_runner,
     }
+}
+
+/// Mirror `cfg.routing` into the kernel-side [`RoutingTable`].
+///
+/// The two crates intentionally maintain parallel `RoutingMatchMode` /
+/// `RoutingRule` / `RoutingMatch` types so the kernel does not depend
+/// on `symphony-config`. This converter is the seam that bridges them
+/// at the composition root.
+fn routing_engine_from_config(c: &WorkflowConfig) -> RoutingEngine {
+    let table = RoutingTable {
+        default_role: c
+            .routing
+            .default_role
+            .as_ref()
+            .map(|s| RoleName::from(s.as_str())),
+        match_mode: match c.routing.match_mode {
+            cfg::RoutingMatchMode::FirstMatch => RoutingMatchMode::FirstMatch,
+            cfg::RoutingMatchMode::Priority => RoutingMatchMode::Priority,
+        },
+        rules: c
+            .routing
+            .rules
+            .iter()
+            .map(|r| RoutingRule {
+                priority: r.priority,
+                when: RoutingMatch {
+                    labels_any: r.when.labels_any.clone(),
+                    paths_any: r.when.paths_any.clone(),
+                    issue_size: r.when.issue_size.clone(),
+                },
+                assign_role: RoleName::from(r.assign_role.as_str()),
+            })
+            .collect(),
+    };
+    RoutingEngine::new(table)
+}
+
+/// Mirror `cfg.roles` (name → kind) into the kernel-side
+/// [`RoleKindLookup`] used by the specialist tick to skip kernel-special
+/// roles (`integration_owner`, `qa_gate`).
+fn role_kinds_from_config(c: &WorkflowConfig) -> RoleKindLookup {
+    RoleKindLookup::from_pairs(c.roles.iter().map(|(name, role)| {
+        let kind = match role.kind {
+            cfg::RoleKind::IntegrationOwner => RoleKind::IntegrationOwner,
+            cfg::RoleKind::QaGate => RoleKind::QaGate,
+            cfg::RoleKind::Specialist => RoleKind::Specialist,
+            cfg::RoleKind::Reviewer => RoleKind::Reviewer,
+            cfg::RoleKind::Operator => RoleKind::Operator,
+            cfg::RoleKind::Custom => RoleKind::Custom,
+        };
+        (name.clone(), kind)
+    }))
 }
 
 #[cfg(test)]
@@ -257,10 +361,79 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
-    use symphony_config::PollingConfig;
+    use symphony_config::{
+        AgentConfig, PollingConfig, RoleConfig, RoutingConfig, RoutingMatch as CfgRoutingMatch,
+        RoutingMatchMode as CfgRoutingMatchMode, RoutingRule as CfgRoutingRule,
+    };
+    use symphony_core::ReleaseReason;
     use symphony_core::tracker::{Issue, IssueId, IssueState};
     use symphony_core::tracker_trait::{TrackerError, TrackerResult};
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
+
+    /// No-op dispatcher used by tests that don't exercise the
+    /// specialist runner directly. The builder requires a dispatcher
+    /// since the specialist runner is wired unconditionally; supplying
+    /// a no-op here keeps the existing intake/recovery parity tests
+    /// independent of dispatcher behaviour.
+    struct NoopDispatcher;
+
+    #[async_trait]
+    impl Dispatcher for NoopDispatcher {
+        async fn dispatch(&self, _issue: Issue, _cancel: CancellationToken) -> ReleaseReason {
+            ReleaseReason::Completed
+        }
+    }
+
+    fn noop_dispatcher() -> Arc<dyn Dispatcher> {
+        Arc::new(NoopDispatcher)
+    }
+
+    /// Records every dispatch invocation and resolves with a configured
+    /// [`ReleaseReason`]. Optional gate so capacity tests can keep
+    /// dispatchers pending until released.
+    struct RecordingDispatcher {
+        calls: StdMutex<Vec<String>>,
+        gate: Notify,
+        gate_enabled: StdMutex<bool>,
+        reason: ReleaseReason,
+    }
+
+    impl RecordingDispatcher {
+        fn new(reason: ReleaseReason) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                gate: Notify::new(),
+                gate_enabled: StdMutex::new(false),
+                reason,
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn enable_gate(&self) {
+            *self.gate_enabled.lock().unwrap() = true;
+        }
+        fn release_gate(&self) {
+            *self.gate_enabled.lock().unwrap() = false;
+            self.gate.notify_waiters();
+        }
+    }
+
+    #[async_trait]
+    impl Dispatcher for RecordingDispatcher {
+        async fn dispatch(&self, issue: Issue, cancel: CancellationToken) -> ReleaseReason {
+            self.calls.lock().unwrap().push(issue.identifier.clone());
+            let gated = *self.gate_enabled.lock().unwrap();
+            if gated {
+                tokio::select! {
+                    _ = self.gate.notified() => {}
+                    _ = cancel.cancelled() => return ReleaseReason::Canceled,
+                }
+            }
+            self.reason
+        }
+    }
 
     /// Minimal `TrackerRead` returning a fixed snapshot. Mirrors the
     /// shape used in `intake_tick`'s own tests so we exercise the
@@ -317,22 +490,90 @@ mod tests {
         }
     }
 
+    /// Build a workflow config that routes every issue with the given
+    /// label to a single specialist role, capped at `max_concurrent`
+    /// simultaneous dispatches. Used by the specialist-runner tests so
+    /// the tick actually emits `SpecialistDispatchRequest`s.
+    fn cfg_with_specialist(
+        interval_ms: u64,
+        max_concurrent: u32,
+        label: &str,
+        role: &str,
+    ) -> WorkflowConfig {
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(role.to_string(), specialist_role());
+        WorkflowConfig {
+            polling: PollingConfig {
+                interval_ms,
+                jitter_ms: 0,
+                ..PollingConfig::default()
+            },
+            agent: AgentConfig {
+                max_concurrent_agents: max_concurrent,
+                ..AgentConfig::default()
+            },
+            roles,
+            routing: RoutingConfig {
+                default_role: None,
+                match_mode: CfgRoutingMatchMode::FirstMatch,
+                rules: vec![CfgRoutingRule {
+                    priority: None,
+                    when: CfgRoutingMatch {
+                        labels_any: vec![label.to_string()],
+                        paths_any: Vec::new(),
+                        issue_size: None,
+                    },
+                    assign_role: role.to_string(),
+                }],
+            },
+            ..WorkflowConfig::default()
+        }
+    }
+
+    fn specialist_role() -> RoleConfig {
+        RoleConfig {
+            kind: cfg::RoleKind::Specialist,
+            description: None,
+            agent: None,
+            max_concurrent: None,
+            can_decompose: None,
+            can_assign: None,
+            can_request_qa: None,
+            can_close_parent: None,
+            can_file_blockers: None,
+            can_file_followups: None,
+            required_for_done: None,
+        }
+    }
+
+    fn issue_with_label(id: &str, identifier: &str, label: &str) -> Issue {
+        let mut i = Issue::minimal(id, identifier, "title", "Todo");
+        i.labels = vec![label.to_string()];
+        i
+    }
+
     #[tokio::test]
-    async fn builder_registers_intake_and_recovery_ticks() {
+    async fn builder_registers_intake_recovery_and_specialist_ticks() {
         let cfg = cfg_with(50, 0);
         let tracker = Arc::new(StaticTracker::new(issues(2))) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker);
-        // Intake + recovery: subsequent decomposition steps grow this.
-        assert_eq!(bundle.scheduler.tick_count(), 2);
+        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
+        // Intake + recovery + specialist; integration / QA / follow-up
+        // approval / budget-pause ticks layer on in subsequent steps.
+        assert_eq!(bundle.scheduler.tick_count(), 3);
         assert!(bundle.claimed_runs.is_empty());
         assert!(bundle.recovery_dispatch.is_empty());
+        assert!(bundle.specialist_dispatch.is_empty());
+        assert_eq!(
+            bundle.specialist_runner.max_concurrent(),
+            cfg.agent.max_concurrent_agents as usize,
+        );
     }
 
     #[tokio::test]
     async fn builder_maps_polling_config_into_scheduler_cadence() {
         let cfg = cfg_with(123, 45);
         let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker);
+        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
         let sc = bundle.scheduler.config();
         assert_eq!(sc.interval, Duration::from_millis(123));
         assert_eq!(sc.jitter, Duration::from_millis(45));
@@ -342,7 +583,7 @@ mod tests {
     async fn tick_once_publishes_active_set_into_shared_store() {
         let cfg = cfg_with(10, 0);
         let tracker = Arc::new(StaticTracker::new(issues(3))) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker);
+        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
         let SchedulerV2Bundle {
             mut scheduler,
             active_set,
@@ -351,7 +592,8 @@ mod tests {
 
         assert!(active_set.is_empty());
         let report = scheduler.tick_once().await;
-        assert_eq!(report.outcomes.len(), 2);
+        // intake + recovery + specialist
+        assert_eq!(report.outcomes.len(), 3);
         assert_eq!(report.outcomes[0].processed, 3);
         assert_eq!(active_set.len(), 3);
         assert_eq!(
@@ -368,7 +610,7 @@ mod tests {
     async fn run_advances_under_configured_cadence_until_cancelled() {
         let cfg = cfg_with(2, 0);
         let tracker = Arc::new(StaticTracker::new(issues(1))) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker);
+        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
         let SchedulerV2Bundle {
             scheduler,
             active_set,
@@ -428,7 +670,11 @@ mod tests {
     async fn recovery_tick_surfaces_expired_lease_when_issue_leaves_active_set() {
         let cfg = cfg_with(10, 0);
         let tracker_inner = Arc::new(StaticTracker::new(issues(3)));
-        let bundle = build_scheduler_v2(&cfg, tracker_inner.clone() as Arc<dyn TrackerRead>);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker_inner.clone() as Arc<dyn TrackerRead>,
+            noop_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             claimed_runs,
@@ -472,7 +718,11 @@ mod tests {
     async fn recovery_tick_skips_claims_that_were_forgotten_before_leaving_active_set() {
         let cfg = cfg_with(10, 0);
         let tracker_inner = Arc::new(StaticTracker::new(issues(2)));
-        let bundle = build_scheduler_v2(&cfg, tracker_inner.clone() as Arc<dyn TrackerRead>);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker_inner.clone() as Arc<dyn TrackerRead>,
+            noop_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             claimed_runs,
@@ -501,7 +751,11 @@ mod tests {
     async fn recovery_tick_re_emits_after_claim_replayed_for_returning_issue() {
         let cfg = cfg_with(10, 0);
         let tracker_inner = Arc::new(StaticTracker::new(issues(1)));
-        let bundle = build_scheduler_v2(&cfg, tracker_inner.clone() as Arc<dyn TrackerRead>);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker_inner.clone() as Arc<dyn TrackerRead>,
+            noop_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             claimed_runs,
@@ -527,5 +781,182 @@ mod tests {
         tracker_inner.set_active(Vec::new());
         scheduler.tick_once().await;
         assert_eq!(dropped_run_ids(&recovery_dispatch.drain()), vec![302]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Specialist tick + runner end-to-end coverage.
+    //
+    // Each scenario builds the scheduler with a routing/role config that
+    // routes a labelled issue to a specialist role, ticks the scheduler
+    // (which fans the specialist tick → enqueues a dispatch request),
+    // then drives the runner exposed on the bundle. The runner is the
+    // load-bearing piece this checklist step adds.
+    // ---------------------------------------------------------------------
+
+    async fn tracker_with_labelled(
+        active: Vec<Issue>,
+    ) -> (Arc<StaticTracker>, Arc<dyn TrackerRead>) {
+        let inner = Arc::new(StaticTracker::new(active));
+        let dyn_ref: Arc<dyn TrackerRead> = inner.clone();
+        (inner, dyn_ref)
+    }
+
+    /// Specialist runner runs requests under capacity, parks the rest
+    /// across passes, and never exceeds the configured ceiling.
+    #[tokio::test]
+    async fn specialist_runner_defers_requests_when_capacity_saturated() {
+        let cfg = cfg_with_specialist(10, 1, "frontend", "frontend");
+        let (_t, tracker) = tracker_with_labelled(vec![
+            issue_with_label("id-1", "ENG-1", "frontend"),
+            issue_with_label("id-2", "ENG-2", "frontend"),
+            issue_with_label("id-3", "ENG-3", "frontend"),
+        ])
+        .await;
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate(); // hold every dispatch open
+
+        let bundle = build_scheduler_v2(&cfg, tracker, dispatcher.clone() as Arc<dyn Dispatcher>);
+        let SchedulerV2Bundle {
+            mut scheduler,
+            specialist_dispatch,
+            specialist_runner,
+            ..
+        } = bundle;
+
+        // Tick the scheduler: intake publishes active set, specialist
+        // tick enqueues 3 dispatch requests.
+        scheduler.tick_once().await;
+        assert_eq!(specialist_dispatch.len(), 3);
+
+        // Pass 1: capacity = 1 → spawn 1, park 2.
+        let report = specialist_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_capacity, 2);
+        assert_eq!(report.missing_issue, 0);
+        assert_eq!(specialist_runner.deferred_count().await, 2);
+        assert_eq!(specialist_runner.inflight_count().await, 1);
+
+        // Release the gate so the in-flight dispatcher completes; reap
+        // the outcome and verify the next pass spawns the next deferred.
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&specialist_runner, 1).await;
+
+        dispatcher.enable_gate();
+        let r2 = specialist_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(r2.spawned, 1);
+        assert_eq!(r2.deferred_capacity, 1);
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&specialist_runner, 1).await;
+
+        let r3 = specialist_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(r3.spawned, 1);
+        assert_eq!(r3.deferred_capacity, 0);
+        let _ = wait_for_outcomes(&specialist_runner, 1).await;
+
+        let mut all = dispatcher.calls();
+        all.sort();
+        assert_eq!(all, vec!["ENG-1", "ENG-2", "ENG-3"]);
+    }
+
+    /// Cancelling the parent token tears down in-flight dispatchers
+    /// cooperatively — the spawned future observes a cancelled child
+    /// token and returns [`ReleaseReason::Canceled`].
+    #[tokio::test]
+    async fn specialist_runner_propagates_parent_cancellation_to_dispatch() {
+        let cfg = cfg_with_specialist(10, 4, "frontend", "frontend");
+        let (_t, tracker) =
+            tracker_with_labelled(vec![issue_with_label("id-1", "ENG-1", "frontend")]).await;
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate(); // hold the dispatch open
+
+        let bundle = build_scheduler_v2(&cfg, tracker, dispatcher.clone() as Arc<dyn Dispatcher>);
+        let SchedulerV2Bundle {
+            mut scheduler,
+            specialist_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+
+        let cancel = CancellationToken::new();
+        let report = specialist_runner.run_pending(cancel.clone()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(specialist_runner.inflight_count().await, 1);
+
+        cancel.cancel();
+        let outcomes = wait_for_outcomes(&specialist_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].identifier, "ENG-1");
+        assert_eq!(outcomes[0].release_reason, ReleaseReason::Canceled);
+    }
+
+    /// `reap_completed` returns one outcome per finished dispatcher and
+    /// leaves still-running tasks in place — observability surface the
+    /// composition root will poll on its own cadence.
+    #[tokio::test]
+    async fn specialist_runner_reap_completed_returns_finished_outcomes() {
+        let cfg = cfg_with_specialist(10, 4, "frontend", "frontend");
+        let (_t, tracker) = tracker_with_labelled(vec![
+            issue_with_label("id-1", "ENG-1", "frontend"),
+            issue_with_label("id-2", "ENG-2", "frontend"),
+        ])
+        .await;
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+
+        let bundle = build_scheduler_v2(&cfg, tracker, dispatcher.clone() as Arc<dyn Dispatcher>);
+        let SchedulerV2Bundle {
+            mut scheduler,
+            specialist_dispatch,
+            specialist_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(specialist_dispatch.len(), 2);
+
+        let report = specialist_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 2);
+
+        let outcomes = wait_for_outcomes(&specialist_runner, 2).await;
+        let mut ids: Vec<String> = outcomes.iter().map(|o| o.identifier.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["ENG-1".to_string(), "ENG-2".to_string()]);
+        assert_eq!(specialist_runner.inflight_count().await, 0);
+
+        // Calling reap again is idempotent — nothing pending, returns
+        // empty.
+        assert!(specialist_runner.reap_completed().await.is_empty());
+    }
+
+    /// Wait until at least `n` outcomes have been reaped or a generous
+    /// per-test timeout fires.
+    async fn wait_for_outcomes(
+        runner: &SpecialistRunner,
+        n: usize,
+    ) -> Vec<symphony_core::SpecialistDispatchOutcome> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut acc = Vec::new();
+        while acc.len() < n {
+            acc.extend(runner.reap_completed().await);
+            if acc.len() >= n {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {n} outcomes; got {} so far",
+                    acc.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        acc
     }
 }
