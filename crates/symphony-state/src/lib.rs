@@ -18,6 +18,7 @@ pub mod handoffs;
 pub mod integration_queue;
 pub mod integration_records;
 pub mod migrations;
+pub mod pull_request_records;
 pub mod repository;
 pub mod transaction;
 

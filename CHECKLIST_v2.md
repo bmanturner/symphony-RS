@@ -97,7 +97,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Implement integration-owner run request with child handoffs and branch/workspace claims.
 - [ ] Add integration record and pull request record persistence.
   - [x] Add `integration_records` table migration and `IntegrationRecordRepository` to `symphony-state`.
-  - [ ] Add `PullRequestRecord` domain type to `symphony-core` and `pull_request_records` table migration plus `PullRequestRecordRepository` to `symphony-state`.
+  - [x] Add `PullRequestRecord` domain type to `symphony-core` and `pull_request_records` table migration plus `PullRequestRecordRepository` to `symphony-state`.
 - [ ] Add git integration operation abstraction in `symphony-workspace` using the git CLI: merge/cherry-pick/shared-branch verification and push.
 - [ ] Add gate requiring all child issues terminal before integration unless explicitly waived.
 - [ ] Add gate requiring no open blockers before draft PR creation and QA request.

@@ -290,7 +290,57 @@ const V2_INTEGRATION_RECORDS: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 2] = [V2_INITIAL_SCHEMA, V2_INTEGRATION_RECORDS];
+/// Adds the `pull_request_records` table. The kernel writes one row per
+/// material PR change observed by the integration owner (open, update,
+/// mark-ready, merge, close) per SPEC v2 §5.11. Earlier rows are
+/// preserved as audit; the parent-closeout gate and the QA brief read
+/// the latest row.
+///
+/// `provider` and `state` are constrained to the variants surfaced by
+/// `symphony-core::pull_request`. The link back to the originating
+/// integration record is `ON DELETE SET NULL` for the same reason as
+/// `runs` on `integration_records`: the PR row is durable evidence and
+/// must outlive an integration-record purge.
+const V2_PULL_REQUEST_RECORDS: Migration = Migration {
+    version: 2_026_050_803,
+    name: "v2_pull_request_records",
+    sql: r#"
+        CREATE TABLE pull_request_records (
+            id                      INTEGER PRIMARY KEY,
+            parent_work_item_id     INTEGER NOT NULL
+                REFERENCES work_items(id) ON DELETE CASCADE,
+            owner_role              TEXT    NOT NULL,
+            run_id                  INTEGER
+                REFERENCES runs(id) ON DELETE SET NULL,
+            integration_record_id   INTEGER
+                REFERENCES integration_records(id) ON DELETE SET NULL,
+            provider                TEXT    NOT NULL
+                CHECK (provider IN ('github')),
+            state                   TEXT    NOT NULL
+                CHECK (state IN ('draft', 'ready', 'merged', 'closed')),
+            number                  INTEGER,
+            url                     TEXT,
+            head_branch             TEXT    NOT NULL,
+            base_branch             TEXT,
+            head_sha                TEXT,
+            title                   TEXT    NOT NULL,
+            body                    TEXT,
+            ci_status               TEXT,
+            created_at              TEXT    NOT NULL
+        );
+
+        CREATE INDEX idx_pull_request_records_parent
+            ON pull_request_records(parent_work_item_id);
+        CREATE INDEX idx_pull_request_records_state
+            ON pull_request_records(state);
+    "#,
+};
+
+const MIGRATIONS: [Migration; 3] = [
+    V2_INITIAL_SCHEMA,
+    V2_INTEGRATION_RECORDS,
+    V2_PULL_REQUEST_RECORDS,
+];
 
 #[cfg(test)]
 mod tests {
@@ -340,7 +390,7 @@ mod tests {
         let db = open_migrated();
         assert_eq!(
             db.applied_versions().unwrap(),
-            vec![2_026_050_801, 2_026_050_802]
+            vec![2_026_050_801, 2_026_050_802, 2_026_050_803]
         );
     }
 
@@ -349,10 +399,16 @@ mod tests {
         let mut db = StateDb::open_in_memory().expect("open");
         let first = db.migrate(migrations()).expect("first apply");
         let second = db.migrate(migrations()).expect("second apply");
-        assert_eq!(first.applied, vec![2_026_050_801, 2_026_050_802]);
+        assert_eq!(
+            first.applied,
+            vec![2_026_050_801, 2_026_050_802, 2_026_050_803]
+        );
         assert!(first.skipped.is_empty());
         assert!(second.applied.is_empty());
-        assert_eq!(second.skipped, vec![2_026_050_801, 2_026_050_802]);
+        assert_eq!(
+            second.skipped,
+            vec![2_026_050_801, 2_026_050_802, 2_026_050_803]
+        );
     }
 
     fn insert_work_item(db: &StateDb, identifier: &str) -> i64 {
@@ -533,6 +589,62 @@ mod tests {
             })
             .expect("count");
         assert_eq!(count, 0, "FK cascade should clear integration_records");
+    }
+
+    #[test]
+    fn pull_request_state_check_rejects_unknown() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        let err = db.conn().execute(
+            "INSERT INTO pull_request_records
+                (parent_work_item_id, owner_role, provider, state,
+                 head_branch, title, created_at)
+             VALUES (?1, 'platform_lead', 'github', 'maybe',
+                     'feat/x', 'title', '2026-05-08T00:00:00Z')",
+            params![wi],
+        );
+        assert!(err.is_err(), "CHECK should reject unknown PR state");
+    }
+
+    #[test]
+    fn pull_request_provider_check_rejects_unknown() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        let err = db.conn().execute(
+            "INSERT INTO pull_request_records
+                (parent_work_item_id, owner_role, provider, state,
+                 head_branch, title, created_at)
+             VALUES (?1, 'platform_lead', 'gitlab', 'draft',
+                     'feat/x', 'title', '2026-05-08T00:00:00Z')",
+            params![wi],
+        );
+        assert!(err.is_err(), "CHECK should reject unknown PR provider");
+    }
+
+    #[test]
+    fn pull_request_records_cascade_when_parent_deleted() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO pull_request_records
+                    (parent_work_item_id, owner_role, provider, state,
+                     head_branch, title, created_at)
+                 VALUES (?1, 'platform_lead', 'github', 'draft',
+                         'feat/x', 'title', '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("insert pull_request_records row");
+        db.conn()
+            .execute("DELETE FROM work_items WHERE id = ?1", params![wi])
+            .expect("delete work_item");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pull_request_records", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 0, "FK cascade should clear pull_request_records");
     }
 
     #[test]
