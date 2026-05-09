@@ -37,6 +37,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::blocker::RunRef;
+use crate::concurrency_gate::{
+    ConcurrencyGate, DispatchTriple, RunnerScopes, ScopeContended, ScopeKind, ScopePermitSet,
+};
 use crate::lease::{LeaseClock, LeaseConfig, LeaseOwner};
 use crate::qa_tick::{QaDispatchQueue, QaDispatchRequest};
 use crate::run_lease::{
@@ -135,6 +138,15 @@ pub struct QaRunReport {
     /// The request is parked on the deferred queue so a transient I/O
     /// blip does not lose the dispatch.
     pub lease_backend_error: usize,
+    /// Requests parked because at least one
+    /// [`crate::concurrency_gate::ConcurrencyGate`] scope was at cap.
+    /// Length matches `scope_contentions.len()` — the typed observations
+    /// are surfaced separately so callers can route them.
+    pub deferred_scope_contention: usize,
+    /// Typed in-flight observations for every dispatch that was deferred
+    /// because a scope was at cap on this pass. Emitted in walk order so
+    /// downstream observers can correlate against the parked dispatches.
+    pub scope_contentions: Vec<ScopeContendedObservation>,
 }
 
 impl QaRunReport {
@@ -145,6 +157,43 @@ impl QaRunReport {
             && self.deferred_lease_contention == 0
             && self.missing_run == 0
             && self.lease_backend_error == 0
+            && self.deferred_scope_contention == 0
+            && self.scope_contentions.is_empty()
+    }
+}
+
+/// Per-pass typed observation surfaced when a QA dispatch could not
+/// acquire its [`RunnerScopes`] permit set because at least one scope
+/// was at cap.
+///
+/// Pairs the request's tracker-facing identifier with the
+/// [`ScopeContended`] reported by [`ConcurrencyGate::try_acquire`] so a
+/// downstream observer (the durable-event subtask, the operator log, a
+/// status TUI) can answer "why is this QA dispatch not running" without
+/// re-deriving the scope keys from workflow config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeContendedObservation {
+    /// Tracker-facing identifier the parked request carries.
+    pub identifier: String,
+    /// The kind of scope that contended.
+    pub scope_kind: ScopeKind,
+    /// The scope key (role/profile/repo label, or `""` for `Global`).
+    pub scope_key: String,
+    /// In-flight permits on the contended scope at rejection.
+    pub in_flight: u32,
+    /// Configured cap on the contended scope.
+    pub cap: u32,
+}
+
+impl ScopeContendedObservation {
+    fn from_contention(identifier: String, contended: &ScopeContended) -> Self {
+        Self {
+            identifier,
+            scope_kind: contended.scope.kind(),
+            scope_key: contended.scope.key().to_owned(),
+            in_flight: contended.in_flight,
+            cap: contended.cap,
+        }
     }
 }
 
@@ -194,6 +243,13 @@ pub struct QaDispatchRunner {
     /// snapshots the map and renews each due lease through the
     /// configured wiring's clock.
     heartbeats: Arc<Mutex<HashMap<RunRef, HeartbeatRegistration>>>,
+    /// Optional multi-scope concurrency gate. When `Some`, every
+    /// dispatch carrying a `role` acquires
+    /// `{Global, Role, AgentProfile?, Repository?}` permits before the
+    /// agent runs and releases them on terminal completion. When `None`
+    /// (or when a request has no `role`), only the local capacity
+    /// semaphore caps concurrency.
+    concurrency_gate: Option<ConcurrencyGate>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -223,7 +279,23 @@ impl QaDispatchRunner {
             max_concurrent,
             leasing: None,
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
+            concurrency_gate: None,
         }
+    }
+
+    /// Wire a [`ConcurrencyGate`] into the runner.
+    ///
+    /// Each subsequent dispatch whose request carries a `role` builds a
+    /// [`DispatchTriple`] from `(role, agent_profile, repository)`, calls
+    /// [`RunnerScopes::try_acquire`], and only proceeds when every
+    /// configured scope has headroom. A contended scope produces a
+    /// [`ScopeContendedObservation`] on the pass report and the request
+    /// is parked on the deferred queue for a future pass — capacity and
+    /// lease are *not* consumed when the gate rejects. Requests without
+    /// a `role` bypass the gate entirely.
+    pub fn with_concurrency_gate(mut self, gate: ConcurrencyGate) -> Self {
+        self.concurrency_gate = Some(gate);
+        self
     }
 
     /// Enable durable-lease wiring. Each subsequent dispatch whose
@@ -296,6 +368,35 @@ impl QaDispatchRunner {
                 }
             };
 
+            // Multi-scope concurrency gate. A contended scope must not
+            // consume the local capacity permit — drop it before parking
+            // so a different routable dispatch can take that slot in the
+            // same pass. Lease acquisition runs after this so a parked
+            // dispatch never holds a lease while waiting on a scope cap.
+            let scope_permits = match self.try_acquire_scopes(&req) {
+                Ok(set) => set,
+                Err(contended) => {
+                    drop(permit);
+                    report
+                        .scope_contentions
+                        .push(ScopeContendedObservation::from_contention(
+                            req.identifier.clone(),
+                            &contended,
+                        ));
+                    debug!(
+                        identifier = %req.identifier,
+                        scope_kind = ?contended.scope.kind(),
+                        scope_key = %contended.scope.key(),
+                        in_flight = contended.in_flight,
+                        cap = contended.cap,
+                        "qa runner: scope contended; parking",
+                    );
+                    new_deferred.push(req);
+                    report.deferred_scope_contention += 1;
+                    continue;
+                }
+            };
+
             // Durable-lease acquisition. Held through the spawned
             // dispatch and released on terminal completion. Permit is
             // only consumed once the lease is acquired so contention or
@@ -304,17 +405,20 @@ impl QaDispatchRunner {
                 LeaseAttempt::Acquired(leased) => leased,
                 LeaseAttempt::Skipped => None,
                 LeaseAttempt::Contended => {
+                    drop(scope_permits);
                     drop(permit);
                     new_deferred.push(req);
                     report.deferred_lease_contention += 1;
                     continue;
                 }
                 LeaseAttempt::NotFound => {
+                    drop(scope_permits);
                     drop(permit);
                     report.missing_run += 1;
                     continue;
                 }
                 LeaseAttempt::BackendError => {
+                    drop(scope_permits);
                     drop(permit);
                     new_deferred.push(req);
                     report.lease_backend_error += 1;
@@ -362,6 +466,9 @@ impl QaDispatchRunner {
                 if let Some(run_id) = heartbeat_run_id {
                     heartbeats.lock().await.remove(&run_id);
                 }
+                // Release scope permits exactly once on terminal exit;
+                // ScopePermitSet::Drop is idempotent across the move.
+                drop(scope_permits);
                 drop(permit);
                 QaDispatchOutcome {
                     work_item_id,
@@ -386,6 +493,31 @@ impl QaDispatchRunner {
         }
 
         report
+    }
+
+    /// Attempt to acquire scope permits for `req` against the configured
+    /// [`ConcurrencyGate`]. Returns `Ok(None)` when no gate is wired or
+    /// the request lacks a `role`, `Ok(Some(set))` when every scope had
+    /// headroom, and `Err(_)` when any scope was at cap (no permits held
+    /// — the inner gate already rolled back partial acquisitions).
+    fn try_acquire_scopes(
+        &self,
+        req: &QaDispatchRequest,
+    ) -> Result<Option<ScopePermitSet>, ScopeContended> {
+        let Some(gate) = &self.concurrency_gate else {
+            return Ok(None);
+        };
+        let Some(role) = req.role.as_ref() else {
+            return Ok(None);
+        };
+        let triple = DispatchTriple::new(
+            role.as_str().to_owned(),
+            req.agent_profile.clone(),
+            req.repository.clone(),
+        );
+        RunnerScopes::new(gate.clone(), triple)
+            .try_acquire()
+            .map(Some)
     }
 
     async fn try_acquire_lease(&self, req: &QaDispatchRequest) -> LeaseAttempt {
@@ -566,6 +698,9 @@ mod tests {
             title: format!("title {identifier}"),
             cause: QaRequestCause::DirectQaRequest,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         }
     }
 
@@ -576,6 +711,28 @@ mod tests {
             title: format!("title {identifier}"),
             cause: QaRequestCause::DirectQaRequest,
             run_id: Some(crate::blocker::RunRef::new(run_id)),
+            role: None,
+            agent_profile: None,
+            repository: None,
+        }
+    }
+
+    fn req_full(
+        id: i64,
+        identifier: &str,
+        role: &str,
+        agent_profile: Option<&str>,
+        repository: Option<&str>,
+    ) -> QaDispatchRequest {
+        QaDispatchRequest {
+            work_item_id: WorkItemId::new(id),
+            identifier: identifier.into(),
+            title: format!("title {identifier}"),
+            cause: QaRequestCause::DirectQaRequest,
+            run_id: None,
+            role: Some(crate::role::RoleName::new(role)),
+            agent_profile: agent_profile.map(str::to_owned),
+            repository: repository.map(str::to_owned),
         }
     }
 
@@ -1534,5 +1691,164 @@ mod tests {
         assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
         assert!(store.snapshot(RunRef::new(42)).await.is_none());
         assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    // ---- Concurrency-gate wiring (CHECKLIST_v2 Phase 11) -----------
+
+    use crate::concurrency_gate::Scope;
+
+    #[tokio::test]
+    async fn qa_role_cap_serializes_dispatch_independent_of_specialist_cap() {
+        // QA's role cap must hold even when global capacity allows more.
+        // The specialist cap is irrelevant here: a QA-only gate proves
+        // the QA runner consults its own scope, not a shared one.
+        let queue = Arc::new(QaDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(QaDispatchReason::Passed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("qa".into()), 1);
+        // A specialist-role cap of 99 must not affect QA dispatch.
+        gate.set_cap(Scope::Role("backend".into()), 99);
+
+        let runner =
+            QaDispatchRunner::new(queue.clone(), dispatcher.clone(), 4).with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(1, "PROJ-1", "qa", None, None));
+        queue.enqueue(req_full(2, "PROJ-2", "qa", None, None));
+        queue.enqueue(req_full(3, "PROJ-3", "qa", None, None));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 2);
+        assert_eq!(report.scope_contentions.len(), 2);
+        for obs in &report.scope_contentions {
+            assert_eq!(obs.scope_kind, ScopeKind::Role);
+            assert_eq!(obs.scope_key, "qa");
+            assert_eq!(obs.cap, 1);
+            assert_eq!(obs.in_flight, 1);
+        }
+        let parked: Vec<&str> = report
+            .scope_contentions
+            .iter()
+            .map(|o| o.identifier.as_str())
+            .collect();
+        assert_eq!(parked, vec!["PROJ-2", "PROJ-3"]);
+
+        // Local capacity is unaffected: parked dispatches did not
+        // consume permits.
+        assert_eq!(runner.inflight_count().await, 1);
+        assert_eq!(runner.deferred_count().await, 2);
+
+        dispatcher.enable_gate();
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+
+        // Next pass: one parked dispatch acquires the freed Role permit
+        // and spawns; the second re-defers because cap=1.
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 1);
+        assert_eq!(report.scope_contentions[0].scope_kind, ScopeKind::Role);
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn qa_repository_cap_defers_concurrent_dispatch_against_same_repo() {
+        let queue = Arc::new(QaDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(QaDispatchReason::Passed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Repository("acme/widgets".into()), 1);
+
+        let runner =
+            QaDispatchRunner::new(queue.clone(), dispatcher.clone(), 4).with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(1, "PROJ-1", "qa", None, Some("acme/widgets")));
+        queue.enqueue(req_full(2, "PROJ-2", "qa", None, Some("acme/widgets")));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_scope_contention, 1);
+        let obs = &report.scope_contentions[0];
+        assert_eq!(obs.scope_kind, ScopeKind::Repository);
+        assert_eq!(obs.scope_key, "acme/widgets");
+        assert_eq!(obs.identifier, "PROJ-2");
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn qa_scope_contention_does_not_consume_local_capacity() {
+        // Capacity 1 + role cap 0 means the gate rejects the first
+        // dispatch, but the local permit must NOT be consumed: the
+        // second (cap-free) dispatch on the same pass still spawns.
+        let queue = Arc::new(QaDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(QaDispatchReason::Passed));
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("frozen".into()), 0);
+
+        let runner =
+            QaDispatchRunner::new(queue.clone(), dispatcher.clone(), 1).with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(1, "PROJ-1", "frozen", None, None));
+        queue.enqueue(req_full(2, "PROJ-2", "qa", None, None));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 1);
+        assert_eq!(report.scope_contentions[0].identifier, "PROJ-1");
+        assert_eq!(report.scope_contentions[0].scope_kind, ScopeKind::Role);
+        assert_eq!(report.scope_contentions[0].scope_key, "frozen");
+        assert_eq!(report.scope_contentions[0].cap, 0);
+
+        let _ = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(dispatcher.calls(), vec!["PROJ-2"]);
+    }
+
+    #[tokio::test]
+    async fn qa_no_concurrency_gate_means_no_scope_observations() {
+        let queue = Arc::new(QaDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(QaDispatchReason::Passed));
+        let runner = QaDispatchRunner::new(queue.clone(), dispatcher.clone(), 4);
+        queue.enqueue(req_full(
+            1,
+            "PROJ-1",
+            "qa",
+            Some("claude"),
+            Some("acme/widgets"),
+        ));
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert!(report.scope_contentions.is_empty());
+        assert_eq!(report.deferred_scope_contention, 0);
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn qa_dispatch_without_role_bypasses_concurrency_gate() {
+        // Requests without a `role` must bypass gate acquisition even
+        // when a gate is wired — the QA tick emits role-less requests
+        // today, and they should not block on a Global cap.
+        let queue = Arc::new(QaDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(QaDispatchReason::Passed));
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Global, 0);
+
+        let runner =
+            QaDispatchRunner::new(queue.clone(), dispatcher.clone(), 4).with_concurrency_gate(gate);
+
+        queue.enqueue(req(1, "PROJ-1"));
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert!(report.scope_contentions.is_empty());
+        let _ = wait_for_outcomes(&runner, 1).await;
     }
 }

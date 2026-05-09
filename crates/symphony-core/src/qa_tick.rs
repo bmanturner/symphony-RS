@@ -135,6 +135,23 @@ pub struct QaDispatchRequest {
     /// acquisition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<crate::blocker::RunRef>,
+    /// QA-gate role bound to the dispatch at emission time, if known.
+    /// Plumbed onto the request so concurrency-gated runners can derive
+    /// a [`crate::concurrency_gate::DispatchTriple`] without re-resolving
+    /// workflow config per dispatch. `None` skips
+    /// [`crate::concurrency_gate::ConcurrencyGate`] acquisition entirely
+    /// (no role implies no gate request shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<crate::role::RoleName>,
+    /// Agent profile bound to the QA role at emission time, if any.
+    /// `None` skips the `AgentProfile` scope acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<String>,
+    /// Repository slug the dispatch targets, if known. Used by
+    /// concurrency-gated runners to acquire the `Repository` scope.
+    /// `None` skips the `Repository` scope acquisition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 /// Shared FIFO of pending [`QaDispatchRequest`]s.
@@ -300,6 +317,9 @@ impl QueueTick for QaQueueTick {
                 title: c.title,
                 cause: c.cause,
                 run_id: None,
+                role: None,
+                agent_profile: None,
+                repository: None,
             });
             self.claimed
                 .lock()
@@ -620,6 +640,9 @@ mod tests {
             title: "first".into(),
             cause: QaRequestCause::DirectQaRequest,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         });
         q.enqueue(QaDispatchRequest {
             work_item_id: WorkItemId::new(2),
@@ -627,6 +650,9 @@ mod tests {
             title: "second".into(),
             cause: QaRequestCause::IntegrationConsolidated,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -672,6 +698,9 @@ mod tests {
             title: "verify".into(),
             cause: QaRequestCause::DirectQaRequest,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: QaDispatchRequest = serde_json::from_str(&json).unwrap();
@@ -686,6 +715,9 @@ mod tests {
             title: "verify".into(),
             cause: QaRequestCause::IntegrationConsolidated,
             run_id: Some(crate::blocker::RunRef::new(123)),
+            role: None,
+            agent_profile: None,
+            repository: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"run_id\":123"), "json={json}");

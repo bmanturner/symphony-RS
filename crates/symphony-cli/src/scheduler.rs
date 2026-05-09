@@ -2667,6 +2667,9 @@ mod tests {
             title: "title".into(),
             cause: QaRequestCause::DirectQaRequest,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         };
         assert_eq!(
             NoopQaDispatcher.dispatch(qa_req, cancel.clone()).await,
