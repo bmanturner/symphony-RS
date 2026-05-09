@@ -56,7 +56,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Implement mutation no-op/advisory wrapper for read-only trackers.
 - [x] Extend GitHub adapter with issue create/comment/label-based blocker or relation mapping where feasible.
 - [x] Extend Linear adapter with issue create/comment/dependency mapping where feasible.
-- [ ] Keep product adapter scope limited to git, GitHub, Linear, Codex, Claude, and Hermes.
+- [x] Keep product adapter scope limited to git, GitHub, Linear, Codex, Claude, and Hermes.
 - [ ] Add conformance tests for read adapter behavior and separate mutation conformance tests for capable adapters.
 
 ## Phase 5 — Routing and Decomposition

@@ -14,9 +14,15 @@
 //! This crate intentionally has no async surface; the orchestrator owns
 //! the runtime and feeds parsed config in.
 
+pub mod adapter_scope;
 pub mod config;
 pub mod layered;
 pub mod loader;
+
+pub use adapter_scope::{
+    SUPPORTED_PRODUCT_AGENT_BACKENDS, SUPPORTED_PRODUCT_TRACKERS, SUPPORTED_SOURCE_CONTROL_ADAPTER,
+    is_product_agent_backend, is_product_tracker,
+};
 
 pub use config::{
     AgentBackend, AgentBackendProfile, AgentCompositeProfile, AgentConfig, AgentKind,
