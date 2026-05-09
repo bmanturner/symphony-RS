@@ -54,7 +54,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add `TrackerCapabilities` so workflows can detect read-only vs mutation-capable adapters.
 - [x] Add mutation request/response types: create issue, update issue, add comment, add blocker, link parent/child, attach artifact.
 - [x] Implement mutation no-op/advisory wrapper for read-only trackers.
-- [ ] Extend GitHub adapter with issue create/comment/label-based blocker or relation mapping where feasible.
+- [x] Extend GitHub adapter with issue create/comment/label-based blocker or relation mapping where feasible.
 - [ ] Extend Linear adapter with issue create/comment/dependency mapping where feasible.
 - [ ] Keep product adapter scope limited to git, GitHub, Linear, Codex, Claude, and Hermes.
 - [ ] Add conformance tests for read adapter behavior and separate mutation conformance tests for capable adapters.

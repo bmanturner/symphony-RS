@@ -24,10 +24,13 @@ use http::Uri;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use symphony_core::tracker::{Issue, IssueId, IssueState};
-use symphony_core::tracker_trait::TrackerError;
+use symphony_core::tracker_trait::{
+    AddBlockerRequest, AddCommentRequest, ArtifactKind, AttachArtifactRequest, CreateIssueRequest,
+    LinkParentChildRequest, TrackerError, TrackerMutations, UpdateIssueRequest,
+};
 use symphony_tracker::conformance::{Scenario, github_canonical_scenario, run_full_suite};
 use symphony_tracker::{GitHubConfig, GitHubTracker, TrackerRead};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build the JSON payload for a single GitHub issue with every
@@ -891,4 +894,401 @@ async fn fetch_active_recovers_blocked_by_from_issue_body_text() {
         b.state.is_none(),
         "state stays None — body text has no state hint"
     );
+}
+
+// ---------------------------------------------------------------------------
+// TrackerMutations — write-side surface (SPEC v2 §7.2).
+//
+// GitHub Issues exposes structural support for create/update/comment but
+// has no native blocker or parent/child edge — the adapter advertises
+// those flags as `false` and rejects the calls rather than degrade.
+// These tests pin both halves of the contract.
+// ---------------------------------------------------------------------------
+
+/// Build a comment payload that octocrab can decode back into
+/// `models::issues::Comment`. Matches the wire shape GitHub returns from
+/// `POST /issues/{n}/comments`.
+fn gh_comment_json(id: u64, issue_number: u64, body: &str) -> Value {
+    let user = json!({
+        "login": "octobot",
+        "id": 9001u64,
+        "node_id": "U_octobot",
+        "avatar_url": "https://api.test/avatars/octobot",
+        "gravatar_id": "",
+        "url": "https://api.test/users/octobot",
+        "html_url": "https://github.test/octobot",
+        "followers_url": "https://api.test/users/octobot/followers",
+        "following_url": "https://api.test/users/octobot/following{/other_user}",
+        "gists_url": "https://api.test/users/octobot/gists{/gist_id}",
+        "starred_url": "https://api.test/users/octobot/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.test/users/octobot/subscriptions",
+        "organizations_url": "https://api.test/users/octobot/orgs",
+        "repos_url": "https://api.test/users/octobot/repos",
+        "events_url": "https://api.test/users/octobot/events{/privacy}",
+        "received_events_url": "https://api.test/users/octobot/received_events",
+        "type": "Bot",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null,
+    });
+    json!({
+        "id": id,
+        "node_id": format!("C_{id}"),
+        "url": format!("https://api.test/repos/acme/robot/issues/comments/{id}"),
+        "html_url": format!("https://github.test/acme/robot/issues/{issue_number}#issuecomment-{id}"),
+        "issue_url": format!("https://api.test/repos/acme/robot/issues/{issue_number}"),
+        "body": body,
+        "user": user,
+        "created_at": "2026-05-08T00:00:00Z",
+        "updated_at": "2026-05-08T00:00:00Z",
+    })
+}
+
+/// Build a tracker that points at `server` with the canonical config.
+/// Returns the tracker only (the server is owned by the caller so it can
+/// stay alive for the duration of the test).
+fn tracker_for(server: &MockServer) -> GitHubTracker {
+    let cfg = GitHubConfig {
+        token: SecretString::from("ghp_test".to_string()),
+        owner: "acme".into(),
+        repo: "robot".into(),
+        active_states: vec!["todo".into()],
+        status_label_prefix: "status:".into(),
+        base_uri: server.uri().parse().unwrap(),
+        page_size: 50,
+    };
+    GitHubTracker::new(cfg).unwrap()
+}
+
+#[tokio::test]
+async fn capabilities_advertise_create_update_comment_attach_but_not_blocker_or_parent_child() {
+    // The capability bag is the public contract workflows interrogate
+    // before dispatching — pin every flag so an accidental relaxation
+    // (e.g. starting to claim `add_blocker` while still proxying through
+    // labels) is caught.
+    let server = MockServer::start().await;
+    let tracker = tracker_for(&server);
+    let caps = tracker.capabilities();
+    assert!(caps.create_issue);
+    assert!(caps.update_issue);
+    assert!(caps.add_comment);
+    assert!(caps.attach_artifact);
+    assert!(!caps.add_blocker, "GitHub has no native dependency edge");
+    assert!(
+        !caps.link_parent_child,
+        "sub-issues API not advertised until it stabilises"
+    );
+    assert!(caps.supports_any_mutation());
+}
+
+#[tokio::test]
+async fn create_issue_posts_title_body_labels_assignees_and_returns_normalized_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues"))
+        .and(body_partial_json(json!({
+            "title": "Decompose payments refactor",
+            "body": "Top-level scope.\n\n> Parent: #100",
+            "labels": ["needs-triage", "status:Todo"],
+            "assignees": ["alice"],
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(gh_issue_json(
+            42,
+            "Decompose payments refactor",
+            Some("Top-level scope.\n\n> Parent: #100"),
+            "open",
+            &["needs-triage", "status:Todo"],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    let resp = tracker
+        .create_issue(CreateIssueRequest {
+            title: "Decompose payments refactor".into(),
+            body: Some("Top-level scope.".into()),
+            labels: vec!["needs-triage".into()],
+            assignees: vec!["alice".into()],
+            parent: Some(IssueId::new("100")),
+            initial_state: Some(IssueState::new("Todo")),
+        })
+        .await
+        .expect("create_issue");
+
+    assert_eq!(resp.id.as_str(), "42");
+    assert_eq!(resp.identifier, "#42");
+    assert!(resp.url.is_some());
+}
+
+#[tokio::test]
+async fn create_issue_with_closed_initial_state_follows_up_with_native_close_patch() {
+    // The adapter cannot close an issue at creation time (GitHub creates
+    // open) so it must follow up with a PATCH. This test pins that the
+    // PATCH actually fires — wiremock's default-404 will fail the test
+    // if the route is missing.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(gh_issue_json(
+            7,
+            "Already done",
+            None,
+            "open",
+            &[],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/acme/robot/issues/7"))
+        .and(body_partial_json(json!({ "state": "closed" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            7,
+            "Already done",
+            None,
+            "closed",
+            &[],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    let resp = tracker
+        .create_issue(CreateIssueRequest {
+            title: "Already done".into(),
+            body: None,
+            labels: vec![],
+            assignees: vec![],
+            parent: None,
+            initial_state: Some(IssueState::new("Closed")),
+        })
+        .await
+        .expect("create_issue");
+    assert_eq!(resp.identifier, "#7");
+}
+
+#[tokio::test]
+async fn update_issue_with_native_state_drives_patch_and_assignee_routes_separately() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/acme/robot/issues/3"))
+        .and(body_partial_json(json!({
+            "title": "Renamed",
+            "state": "closed",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            3,
+            "Renamed",
+            None,
+            "closed",
+            &[],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues/3/assignees"))
+        .and(body_partial_json(json!({ "assignees": ["bob"] })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(gh_issue_json(
+            3,
+            "Renamed",
+            None,
+            "closed",
+            &[],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    let resp = tracker
+        .update_issue(UpdateIssueRequest {
+            id: IssueId::new("3"),
+            state: Some(IssueState::new("Closed")),
+            title: Some("Renamed".into()),
+            body: None,
+            add_labels: vec![],
+            remove_labels: vec![],
+            add_assignees: vec!["bob".into()],
+            remove_assignees: vec![],
+        })
+        .await
+        .expect("update_issue");
+    assert_eq!(resp.id.as_str(), "3");
+    assert_eq!(resp.state.as_ref().unwrap().as_str(), "Closed");
+}
+
+#[tokio::test]
+async fn update_issue_with_non_native_state_emits_status_label_via_add_labels() {
+    // "In Review" is not native — the adapter must surface it as a
+    // `status:In Review` label rather than try to PATCH it onto the
+    // native open/closed enum.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues/9/labels"))
+        .and(body_partial_json(json!({
+            "labels": ["status:In Review"],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    tracker
+        .update_issue(UpdateIssueRequest {
+            id: IssueId::new("9"),
+            state: Some(IssueState::new("In Review")),
+            title: None,
+            body: None,
+            add_labels: vec![],
+            remove_labels: vec![],
+            add_assignees: vec![],
+            remove_assignees: vec![],
+        })
+        .await
+        .expect("update_issue");
+}
+
+#[tokio::test]
+async fn update_issue_remove_labels_swallows_404_when_label_was_not_attached() {
+    // Per SPEC v2 §7.2: removing a label that isn't attached is a no-op,
+    // not an error. GitHub returns 404 in that case; the adapter must
+    // not propagate it.
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/acme/robot/issues/4/labels/stale"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "message": "Label does not exist",
+        })))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    tracker
+        .update_issue(UpdateIssueRequest {
+            id: IssueId::new("4"),
+            state: None,
+            title: None,
+            body: None,
+            add_labels: vec![],
+            remove_labels: vec!["stale".into()],
+            add_assignees: vec![],
+            remove_assignees: vec![],
+        })
+        .await
+        .expect("update_issue must swallow 404 from remove_label");
+}
+
+#[tokio::test]
+async fn add_comment_renders_role_prefix_and_returns_comment_id_and_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues/12/comments"))
+        .and(body_partial_json(json!({
+            "body": "**[qa]** Acceptance failed on case 3",
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(gh_comment_json(
+            555,
+            12,
+            "**[qa]** Acceptance failed on case 3",
+        )))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    let resp = tracker
+        .add_comment(AddCommentRequest {
+            issue: IssueId::new("12"),
+            body: "Acceptance failed on case 3".into(),
+            author_role: Some("qa".into()),
+        })
+        .await
+        .expect("add_comment");
+    assert_eq!(resp.id.as_deref(), Some("555"));
+    assert!(resp.url.unwrap().contains("issuecomment-555"));
+}
+
+#[tokio::test]
+async fn attach_artifact_lowers_pull_request_to_a_markdown_comment_and_returns_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues/22/comments"))
+        .and(body_partial_json(json!({
+            "body": "**Pull request:** [draft PR](https://github.test/acme/robot/pull/22)\n\nReady for QA review.",
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(gh_comment_json(
+            777,
+            22,
+            "ignored",
+        )))
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    let resp = tracker
+        .attach_artifact(AttachArtifactRequest {
+            issue: IssueId::new("22"),
+            kind: ArtifactKind::PullRequest,
+            uri: "https://github.test/acme/robot/pull/22".into(),
+            label: Some("draft PR".into()),
+            note: Some("Ready for QA review.".into()),
+        })
+        .await
+        .expect("attach_artifact");
+    assert_eq!(resp.id.as_deref(), Some("777"));
+}
+
+#[tokio::test]
+async fn add_blocker_returns_misconfigured_to_match_capability_report() {
+    // The capability flag is `false`, so this method must reject. No
+    // wiremock route is mounted — any HTTP call would 404 the test.
+    let server = MockServer::start().await;
+    let tracker = tracker_for(&server);
+    let err = tracker
+        .add_blocker(AddBlockerRequest {
+            blocked: IssueId::new("1"),
+            blocker: IssueId::new("2"),
+            reason: None,
+        })
+        .await
+        .expect_err("add_blocker must reject on GitHub");
+    assert!(matches!(err, TrackerError::Misconfigured(_)));
+}
+
+#[tokio::test]
+async fn link_parent_child_returns_misconfigured_to_match_capability_report() {
+    let server = MockServer::start().await;
+    let tracker = tracker_for(&server);
+    let err = tracker
+        .link_parent_child(LinkParentChildRequest {
+            parent: IssueId::new("1"),
+            child: IssueId::new("2"),
+        })
+        .await
+        .expect_err("link_parent_child must reject on GitHub");
+    assert!(matches!(err, TrackerError::Misconfigured(_)));
+}
+
+#[tokio::test]
+async fn mutations_are_dispatchable_through_arc_dyn_tracker_mutations() {
+    // The orchestrator wires mutations as `Arc<dyn TrackerMutations>`.
+    // Pin that GitHubTracker can still be erased to that vtable.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/robot/issues/8/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(gh_comment_json(1, 8, "via dyn")))
+        .mount(&server)
+        .await;
+    let mutations: Arc<dyn TrackerMutations> = Arc::new(tracker_for(&server));
+    let resp = mutations
+        .add_comment(AddCommentRequest {
+            issue: IssueId::new("8"),
+            body: "via dyn".into(),
+            author_role: None,
+        })
+        .await
+        .expect("dyn dispatch");
+    assert!(resp.id.is_some());
 }

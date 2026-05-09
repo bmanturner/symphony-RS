@@ -54,7 +54,12 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::TrackerRead;
 use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
-use symphony_core::tracker_trait::{TrackerError, TrackerResult};
+use symphony_core::tracker_trait::{
+    AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse, ArtifactKind,
+    AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+    LinkParentChildRequest, LinkParentChildResponse, TrackerCapabilities, TrackerError,
+    TrackerMutations, TrackerResult, UpdateIssueRequest, UpdateIssueResponse,
+};
 
 /// Operator-supplied configuration for [`GitHubTracker`].
 #[derive(Debug, Clone)]
@@ -372,6 +377,289 @@ impl TrackerRead for GitHubTracker {
         }
         Ok(out)
     }
+
+    /// Capability bag for the GitHub adapter (SPEC v2 §7.2).
+    ///
+    /// We advertise only the capabilities GitHub Issues genuinely supports
+    /// without faking it. In particular `add_blocker` and `link_parent_child`
+    /// stay `false` because the trait contract forbids label-only proxies
+    /// from claiming structural edge support — workflows that require
+    /// first-class blocker/dependency edges must route to a tracker that
+    /// has them (Linear today). Workflows in advisory/proposal mode can
+    /// still capture those intents through `symphony_core::AdvisoryMutations`.
+    fn capabilities(&self) -> TrackerCapabilities {
+        TrackerCapabilities {
+            create_issue: true,
+            update_issue: true,
+            add_comment: true,
+            // GitHub has no native dependency edge; only labels or text.
+            // Reporting `false` is required by the trait contract.
+            add_blocker: false,
+            // Sub-issues exist as a beta API but are not yet stable across
+            // GHE/GitHub.com surfaces; defer to follow-up work and let
+            // workflows fall back to advisory mode.
+            link_parent_child: false,
+            // Lowered to a structured comment via [`Self::attach_artifact`].
+            attach_artifact: true,
+        }
+    }
+}
+
+#[async_trait]
+impl TrackerMutations for GitHubTracker {
+    /// Create a new issue. Uses `POST /repos/{owner}/{repo}/issues` via
+    /// `octocrab`'s issues handler `create` builder.
+    ///
+    /// `parent` is not natively supported by GitHub — rather than silently
+    /// dropping the link, we render a `> Parent: #N` markdown footer at
+    /// the bottom of the body so the relation stays visible to humans
+    /// even though the structural [`TrackerMutations::link_parent_child`]
+    /// path returns `Misconfigured` for this adapter.
+    ///
+    /// `initial_state` collapses two cases:
+    ///
+    /// * `open` / `closed` — left for the caller to drive through
+    ///   [`Self::update_issue`] post-create, since GitHub creates issues
+    ///   open by default and we'd need a follow-up PATCH for `closed`.
+    /// * any other value — emitted as a `{status_label_prefix}{state}`
+    ///   label at create time so derived state matches.
+    async fn create_issue(
+        &self,
+        request: CreateIssueRequest,
+    ) -> TrackerResult<CreateIssueResponse> {
+        let mut body = request.body.unwrap_or_default();
+        if let Some(parent) = request.parent.as_ref()
+            && let Some(n) = parent.as_str().parse::<u64>().ok()
+        {
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(&format!("> Parent: #{n}"));
+        }
+
+        let mut labels = request.labels.clone();
+        if let Some(state) = request.initial_state.as_ref() {
+            let lc = state.normalized();
+            if lc != "open" && lc != "closed" {
+                labels.push(format!(
+                    "{}{}",
+                    self.config.status_label_prefix,
+                    state.as_str()
+                ));
+            }
+        }
+
+        let issues = self.client.issues(&self.config.owner, &self.config.repo);
+        let mut builder = issues.create(request.title);
+        if !body.is_empty() {
+            builder = builder.body(body);
+        }
+        if !labels.is_empty() {
+            builder = builder.labels(labels);
+        }
+        if !request.assignees.is_empty() {
+            builder = builder.assignees(request.assignees);
+        }
+        let gh = builder.send().await.map_err(map_octocrab_error)?;
+
+        // If the operator asked for `closed` initial state, follow up with
+        // a PATCH — keeps the create call atomic and predictable.
+        if let Some(state) = request.initial_state.as_ref()
+            && state.normalized() == "closed"
+        {
+            self.client
+                .issues(&self.config.owner, &self.config.repo)
+                .update(gh.number)
+                .state(octocrab::models::IssueState::Closed)
+                .send()
+                .await
+                .map_err(map_octocrab_error)?;
+        }
+
+        Ok(CreateIssueResponse {
+            id: IssueId::new(gh.number.to_string()),
+            identifier: format!("#{}", gh.number),
+            url: Some(gh.html_url.to_string()),
+        })
+    }
+
+    /// Update an issue. Coarse: each requested mutation maps to a
+    /// dedicated GitHub endpoint, so a single call may translate to
+    /// several round trips. The contract on `add_labels` / `remove_labels`
+    /// from SPEC v2 §7.2 (additive semantics, never replace) is honored
+    /// by using the per-label endpoints rather than `replace_all_labels`.
+    ///
+    /// State handling has two paths:
+    ///
+    /// * `open` / `closed` — drives the native `PATCH /issues/{n}` state
+    ///   field.
+    /// * any other value — emitted as a `{status_label_prefix}{state}`
+    ///   label. We do *not* auto-strip prior `status:*` labels: doing so
+    ///   would require an extra list round trip on every state change and
+    ///   the SPEC §7.2 add/remove channels already let the caller include
+    ///   the old status label in `remove_labels` when they want it gone.
+    async fn update_issue(
+        &self,
+        request: UpdateIssueRequest,
+    ) -> TrackerResult<UpdateIssueResponse> {
+        let number = parse_issue_number(&request.id)?;
+        let issues = self.client.issues(&self.config.owner, &self.config.repo);
+
+        // Title / body / native state ride a single PATCH when any of
+        // them are populated.
+        let needs_patch = request.title.is_some()
+            || request.body.is_some()
+            || matches!(
+                request.state.as_ref().map(|s| s.normalized()),
+                Some(ref v) if v == "open" || v == "closed"
+            );
+        if needs_patch {
+            let mut builder = issues.update(number);
+            if let Some(title) = request.title.as_deref() {
+                builder = builder.title(title);
+            }
+            if let Some(body) = request.body.as_deref() {
+                builder = builder.body(body);
+            }
+            if let Some(state) = request.state.as_ref() {
+                match state.normalized().as_str() {
+                    "open" => builder = builder.state(octocrab::models::IssueState::Open),
+                    "closed" => builder = builder.state(octocrab::models::IssueState::Closed),
+                    _ => {}
+                }
+            }
+            builder.send().await.map_err(map_octocrab_error)?;
+        }
+
+        // Non-native state → emit the status label.
+        let mut adds = request.add_labels.clone();
+        if let Some(state) = request.state.as_ref() {
+            let lc = state.normalized();
+            if lc != "open" && lc != "closed" {
+                adds.push(format!(
+                    "{}{}",
+                    self.config.status_label_prefix,
+                    state.as_str()
+                ));
+            }
+        }
+        if !adds.is_empty() {
+            issues
+                .add_labels(number, &adds)
+                .await
+                .map_err(map_octocrab_error)?;
+        }
+        for label in &request.remove_labels {
+            // GitHub returns 404 when the label isn't attached. The
+            // SPEC contract treats that as a no-op, so swallow it.
+            match issues.remove_label(number, label).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let mapped = map_octocrab_error(e);
+                    if !is_not_found(&mapped) {
+                        return Err(mapped);
+                    }
+                }
+            }
+        }
+
+        if !request.add_assignees.is_empty() {
+            let refs: Vec<&str> = request.add_assignees.iter().map(String::as_str).collect();
+            issues
+                .add_assignees(number, &refs)
+                .await
+                .map_err(map_octocrab_error)?;
+        }
+        if !request.remove_assignees.is_empty() {
+            let refs: Vec<&str> = request
+                .remove_assignees
+                .iter()
+                .map(String::as_str)
+                .collect();
+            issues
+                .remove_assignees(number, &refs)
+                .await
+                .map_err(map_octocrab_error)?;
+        }
+
+        Ok(UpdateIssueResponse {
+            id: request.id,
+            state: request.state,
+        })
+    }
+
+    async fn add_comment(&self, request: AddCommentRequest) -> TrackerResult<AddCommentResponse> {
+        let number = parse_issue_number(&request.issue)?;
+        let body = match request.author_role.as_deref() {
+            // Render a small role prefix when the workflow supplied one —
+            // GitHub adapters cannot impersonate users, so the prefix is
+            // the cheapest legible signal that "this comment came from QA"
+            // vs the bot account that owns the token.
+            Some(role) if !role.is_empty() => format!("**[{role}]** {}", request.body),
+            _ => request.body,
+        };
+        let comment = self
+            .client
+            .issues(&self.config.owner, &self.config.repo)
+            .create_comment(number, body)
+            .await
+            .map_err(map_octocrab_error)?;
+        Ok(AddCommentResponse {
+            id: Some(comment.id.to_string()),
+            url: Some(comment.html_url.to_string()),
+        })
+    }
+
+    /// GitHub does not expose structural blocker/dependency edges. The
+    /// trait contract on [`TrackerMutations::add_blocker`] forbids
+    /// label-only proxies from succeeding here — workflows that need
+    /// blockers MUST detect this through [`Self::capabilities`] and route
+    /// to advisory/proposal mode.
+    async fn add_blocker(&self, _request: AddBlockerRequest) -> TrackerResult<AddBlockerResponse> {
+        Err(TrackerError::Misconfigured(
+            "GitHub adapter cannot create structural blocker edges; \
+             route through advisory/proposal mode or a tracker with \
+             native dependencies (capabilities.add_blocker is false)"
+                .to_string(),
+        ))
+    }
+
+    /// GitHub's sub-issues API is in beta and not consistently available
+    /// across GHE / GitHub.com surfaces. Until that stabilises the adapter
+    /// reports `link_parent_child: false`; workflows MUST consult
+    /// [`Self::capabilities`] before dispatching.
+    async fn link_parent_child(
+        &self,
+        _request: LinkParentChildRequest,
+    ) -> TrackerResult<LinkParentChildResponse> {
+        Err(TrackerError::Misconfigured(
+            "GitHub adapter cannot create structural parent/child edges; \
+             route through advisory/proposal mode \
+             (capabilities.link_parent_child is false)"
+                .to_string(),
+        ))
+    }
+
+    /// Lower an artifact attachment to a structured comment on the issue.
+    /// GitHub has no first-class artifact field on issues, but a comment
+    /// is durable, addressable, and visible in the same UI surfaces a
+    /// human reviewer would consult.
+    async fn attach_artifact(
+        &self,
+        request: AttachArtifactRequest,
+    ) -> TrackerResult<AttachArtifactResponse> {
+        let number = parse_issue_number(&request.issue)?;
+        let body = render_artifact_comment(&request);
+        let comment = self
+            .client
+            .issues(&self.config.owner, &self.config.repo)
+            .create_comment(number, body)
+            .await
+            .map_err(map_octocrab_error)?;
+        Ok(AttachArtifactResponse {
+            id: Some(comment.id.to_string()),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +811,49 @@ fn parse_blocked_by(body: Option<&str>) -> Vec<BlockerRef> {
         }
     }
     out
+}
+
+/// Parse a numeric GitHub issue id out of an [`IssueId`]. Centralised so
+/// every mutation method reports the same `Misconfigured` shape when a
+/// caller hands us a non-numeric id.
+fn parse_issue_number(id: &IssueId) -> TrackerResult<u64> {
+    id.as_str().parse::<u64>().map_err(|e| {
+        TrackerError::Misconfigured(format!(
+            "GitHub issue ids are positive integers; got {:?}: {e}",
+            id.as_str()
+        ))
+    })
+}
+
+/// True when the mapped error represents an HTTP 404 from GitHub. Used by
+/// [`TrackerMutations::update_issue`] to swallow "label was not attached"
+/// responses on `remove_label` per SPEC v2 §7.2.
+fn is_not_found(err: &TrackerError) -> bool {
+    matches!(err, TrackerError::Misconfigured(msg) if msg.contains("HTTP 404"))
+}
+
+/// Render an [`AttachArtifactRequest`] as a markdown comment body. Pulled
+/// out so unit tests can pin the exact prose without an HTTP fixture —
+/// the comment shape is the externally observable artifact for
+/// downstream reviewers (humans and agents alike).
+fn render_artifact_comment(request: &AttachArtifactRequest) -> String {
+    let kind_label = match &request.kind {
+        ArtifactKind::PullRequest => "Pull request".to_string(),
+        ArtifactKind::RunLog => "Run log".to_string(),
+        ArtifactKind::QaEvidence => "QA evidence".to_string(),
+        ArtifactKind::Other { name } => name.clone(),
+    };
+    let display = request
+        .label
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(request.uri.as_str());
+    let mut body = format!("**{kind_label}:** [{display}]({})", request.uri);
+    if let Some(note) = request.note.as_deref().filter(|s| !s.is_empty()) {
+        body.push_str("\n\n");
+        body.push_str(note);
+    }
+    body
 }
 
 /// Translate `octocrab`'s rich error type into our coarse
