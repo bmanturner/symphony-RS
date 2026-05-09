@@ -47,6 +47,7 @@ pub mod qa_rework;
 pub mod qa_runner;
 pub mod qa_tick;
 pub mod queue_tick;
+pub mod recovery_runner;
 pub mod recovery_tick;
 pub mod retry;
 pub mod role;
@@ -171,6 +172,10 @@ pub use qa_tick::{
     QaQueueTick,
 };
 pub use queue_tick::{QueueTick, QueueTickCadence, ScriptedQueueTick, run_queue_tick_n};
+pub use recovery_runner::{
+    RecoveryDispatchOutcome, RecoveryDispatchReason, RecoveryDispatchTarget, RecoveryDispatcher,
+    RecoveryRunReport, RecoveryRunner,
+};
 pub use recovery_tick::{
     ExpiredLeaseCandidate, OrphanedWorkspaceClaimCandidate, RecoveryDispatchQueue,
     RecoveryDispatchRequest, RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick,
