@@ -54,6 +54,7 @@
 //!    dispatcher returns, so capacity is automatically restored on
 //!    completion.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -63,11 +64,15 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::blocker::RunRef;
 use crate::lease::{LeaseClock, LeaseConfig, LeaseOwner};
 use crate::recovery_tick::{
     RecoveryDispatchQueue, RecoveryDispatchRequest, RecoveryRunId, RecoveryWorkspaceClaimId,
 };
-use crate::run_lease::{LeaseAcquireOutcome, RunLeaseGuard, RunLeaseStore};
+use crate::run_lease::{
+    HeartbeatPulseObservation, LeaseAcquireOutcome, LeaseHeartbeat, RunLeaseGuard, RunLeaseStore,
+    pulse_observed,
+};
 use crate::work_item::WorkItemId;
 
 /// Final outcome of one recovery dispatch.
@@ -203,6 +208,33 @@ impl RecoveryRunReport {
     }
 }
 
+/// Per-pulse heartbeat observation surfaced by
+/// [`RecoveryRunner::pulse_heartbeats`].
+///
+/// Pairs the typed [`HeartbeatPulseObservation`] from
+/// [`crate::run_lease::pulse_observed`] with the run/dispatch target the
+/// heartbeat targets so the scheduler can route the observation
+/// (durable run-status update on contention, recovery dispatch on
+/// not-found, transient-error log on backend error) without re-keying
+/// against the in-flight set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerHeartbeatObservation {
+    /// Durable run row the heartbeat was renewed against.
+    pub run_id: RunRef,
+    /// Recovery dispatch target the dispatch covers.
+    pub target: RecoveryDispatchTarget,
+    /// Typed outcome of the renewal pulse.
+    pub observation: HeartbeatPulseObservation,
+}
+
+/// Per-run heartbeat registration: the dispatch target (so observations
+/// carry it back to the caller) plus the live heartbeat guarded by an
+/// async mutex (`pulse` is `&mut self`).
+struct HeartbeatRegistration {
+    target: RecoveryDispatchTarget,
+    heartbeat: Arc<Mutex<LeaseHeartbeat>>,
+}
+
 /// Bounded-concurrency consumer for [`RecoveryDispatchQueue`].
 pub struct RecoveryRunner {
     queue: Arc<RecoveryDispatchQueue>,
@@ -216,6 +248,12 @@ pub struct RecoveryRunner {
     /// dispatcher and releases it on terminal completion. Requests whose
     /// `dispatch_run_id` is `None` bypass lease acquisition.
     leasing: Option<LeaseWiring>,
+    /// In-flight heartbeats, keyed by `run_id`. Populated when a lease
+    /// is acquired alongside a spawned dispatch and removed by the
+    /// spawned task at terminal release. [`Self::pulse_heartbeats`]
+    /// snapshots the map and renews each due lease through the
+    /// configured wiring's clock.
+    heartbeats: Arc<Mutex<HashMap<RunRef, HeartbeatRegistration>>>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -244,6 +282,7 @@ impl RecoveryRunner {
             inflight: Mutex::new(JoinSet::new()),
             max_concurrent,
             leasing: None,
+            heartbeats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -321,8 +360,8 @@ impl RecoveryRunner {
             // dispatch and released on terminal completion. Permit is
             // only consumed once the lease is acquired so contention or
             // backend errors do not eat capacity.
-            let guard = match self.try_acquire_lease(&req).await {
-                LeaseAttempt::Acquired(guard) => guard,
+            let leased = match self.try_acquire_lease(&req).await {
+                LeaseAttempt::Acquired(leased) => leased,
                 LeaseAttempt::Skipped => None,
                 LeaseAttempt::Contended => {
                     drop(permit);
@@ -348,11 +387,27 @@ impl RecoveryRunner {
             let target = RecoveryDispatchTarget::from_request(&req);
             let work_item_id = work_item_of(&req);
             let req_for_dispatch = req.clone();
+            let heartbeat_run_id = req.dispatch_run_id();
+            let heartbeats = self.heartbeats.clone();
+
+            // Register the heartbeat so a parallel `pulse_heartbeats`
+            // tick can renew the lease while dispatch is in flight.
+            // Registration happens before spawn so a tight scheduler
+            // tick sequence (spawn + immediate pulse) cannot miss it.
+            if let (Some(run_id), Some(d)) = (heartbeat_run_id, leased.as_ref()) {
+                heartbeats.lock().await.insert(
+                    run_id,
+                    HeartbeatRegistration {
+                        target,
+                        heartbeat: d.heartbeat.clone(),
+                    },
+                );
+            }
 
             let mut inflight = self.inflight.lock().await;
             inflight.spawn(async move {
                 let reason = dispatcher.dispatch(req_for_dispatch, child_cancel).await;
-                if let Some(guard) = guard
+                if let Some(LeasedDispatch { guard, .. }) = leased
                     && let Err(err) = guard.release().await
                 {
                     warn!(
@@ -360,6 +415,12 @@ impl RecoveryRunner {
                         error = %err,
                         "recovery runner: lease release failed; relying on TTL reaper",
                     );
+                }
+                // Deregister after release so a concurrent
+                // `pulse_heartbeats` cannot re-acquire a lease the
+                // terminal release just cleared.
+                if let Some(run_id) = heartbeat_run_id {
+                    heartbeats.lock().await.remove(&run_id);
                 }
                 drop(permit);
                 RecoveryDispatchOutcome {
@@ -405,7 +466,19 @@ impl RecoveryRunner {
         )
         .await
         {
-            Ok(Ok(guard)) => LeaseAttempt::Acquired(Some(guard)),
+            Ok(Ok(guard)) => {
+                let heartbeat = LeaseHeartbeat::new(
+                    wiring.store.clone(),
+                    run_id,
+                    wiring.owner.clone(),
+                    ts.expires_at.clone(),
+                    wiring.config.renewal_margin_ms,
+                );
+                LeaseAttempt::Acquired(Some(LeasedDispatch {
+                    guard,
+                    heartbeat: Arc::new(Mutex::new(heartbeat)),
+                }))
+            }
             Ok(Err(LeaseAcquireOutcome::Contended { holder, expires_at })) => {
                 debug!(
                     target = ?RecoveryDispatchTarget::from_request(req),
@@ -437,6 +510,55 @@ impl RecoveryRunner {
         }
     }
 
+    /// Number of heartbeats currently registered against in-flight
+    /// dispatches. Diagnostic accessor for tests/scheduler logs.
+    pub async fn heartbeat_count(&self) -> usize {
+        self.heartbeats.lock().await.len()
+    }
+
+    /// Drive one renewal pass over every in-flight heartbeat.
+    ///
+    /// For each registered `(run_id, target, heartbeat)` the runner
+    /// checks [`LeaseHeartbeat::due`] against the configured wiring's
+    /// clock and, when due, invokes [`pulse_observed`] to renew through
+    /// the underlying [`RunLeaseStore::acquire`]. Heartbeats that are
+    /// not yet due are skipped silently — the pass is idle for them.
+    ///
+    /// Each pulsed heartbeat produces a [`RunnerHeartbeatObservation`]
+    /// in call order so the scheduler can route renewals, contention,
+    /// missing-row, and backend-error outcomes without silently
+    /// dropping the in-flight dispatch.
+    ///
+    /// Returns an empty vector when lease wiring is disabled.
+    pub async fn pulse_heartbeats(&self) -> Vec<RunnerHeartbeatObservation> {
+        let Some(wiring) = self.leasing.as_ref() else {
+            return Vec::new();
+        };
+        let snapshot: Vec<(RunRef, RecoveryDispatchTarget, Arc<Mutex<LeaseHeartbeat>>)> = {
+            let map = self.heartbeats.lock().await;
+            map.iter()
+                .map(|(run_id, reg)| (*run_id, reg.target, reg.heartbeat.clone()))
+                .collect()
+        };
+
+        let clock = wiring.clock.as_ref();
+        let ttl_ms = wiring.config.default_ttl_ms;
+        let mut out = Vec::new();
+        for (run_id, target, hb_arc) in snapshot {
+            let mut hb = hb_arc.lock().await;
+            if !hb.due(clock) {
+                continue;
+            }
+            let observation = pulse_observed(&mut hb, clock, ttl_ms).await;
+            out.push(RunnerHeartbeatObservation {
+                run_id,
+                target,
+                observation,
+            });
+        }
+        out
+    }
+
     /// Drain every dispatcher task that has finished since the last
     /// call.
     pub async fn reap_completed(&self) -> Vec<RecoveryDispatchOutcome> {
@@ -462,10 +584,9 @@ impl RecoveryRunner {
 
 /// Outcome of [`RecoveryRunner::try_acquire_lease`].
 enum LeaseAttempt {
-    /// Either lease acquired (`Some(guard)`) or no `dispatch_run_id` on
-    /// the request and lease wiring not exercised (`None`). Both cases
-    /// proceed to dispatch.
-    Acquired(Option<RunLeaseGuard>),
+    /// Either lease acquired (`Some(LeasedDispatch)`) or lease wiring
+    /// not configured (`None`). Both cases proceed to dispatch.
+    Acquired(Option<LeasedDispatch>),
     /// Lease wiring is configured but the request had no
     /// `dispatch_run_id` reservation. Dispatch proceeds without a lease
     /// guard.
@@ -476,6 +597,14 @@ enum LeaseAttempt {
     NotFound,
     /// The lease store reported a backend error (I/O, lock, encoding).
     BackendError,
+}
+
+/// Bundle of artifacts produced by a successful lease acquisition: the
+/// RAII guard the spawned task consumes at terminal release, and the
+/// shared heartbeat the runner-driven pulse cadence renews.
+struct LeasedDispatch {
+    guard: RunLeaseGuard,
+    heartbeat: Arc<Mutex<LeaseHeartbeat>>,
 }
 
 #[cfg(test)]
@@ -1212,5 +1341,278 @@ mod tests {
         assert_eq!(report.spawned, 0);
         assert_eq!(report.lease_backend_error, 1);
         assert_eq!(runner.deferred_count().await, 1);
+    }
+
+    // ---- Heartbeat wiring (CHECKLIST_v2 Phase 11) ------------------
+
+    /// Test-only [`LeaseClock`] whose `now` can be advanced between
+    /// pulses. Mirrors the way a real wall-clock-backed clock evolves
+    /// across scheduler ticks; deterministic for tests because the
+    /// caller controls each advance.
+    #[derive(Debug)]
+    struct AdvanceableLeaseClock {
+        now: StdMutex<String>,
+    }
+
+    impl AdvanceableLeaseClock {
+        fn new(now: impl Into<String>) -> Self {
+            Self {
+                now: StdMutex::new(now.into()),
+            }
+        }
+        fn set(&self, now: impl Into<String>) {
+            *self.now.lock().unwrap() = now.into();
+        }
+    }
+
+    impl LeaseClock for AdvanceableLeaseClock {
+        fn timestamps(&self, ttl_ms: u64) -> crate::lease::LeaseTimestamps {
+            let now = self.now.lock().unwrap().clone();
+            let expires_at = format!("{}+{:012}ms", now, ttl_ms);
+            crate::lease::LeaseTimestamps { now, expires_at }
+        }
+    }
+
+    fn build_lease_runner_with_clock(
+        max_concurrent: usize,
+        dispatcher: Arc<RecordingDispatcher>,
+        store: Arc<InMemoryRunLeaseStore>,
+        clock: Arc<AdvanceableLeaseClock>,
+    ) -> (Arc<RecoveryDispatchQueue>, RecoveryRunner) {
+        let queue = Arc::new(RecoveryDispatchQueue::new());
+        let runner = RecoveryRunner::new(queue.clone(), dispatcher, max_concurrent).with_leasing(
+            store,
+            lease_owner(),
+            LeaseConfig::default(),
+            clock,
+        );
+        (queue, runner)
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_advances_lease_expiry_during_reaped_dispatch() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) =
+            build_lease_runner_with_clock(4, dispatcher.clone(), store.clone(), clock.clone());
+        queue.enqueue(lease_req_with_run(1, 100, 42));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(runner.heartbeat_count().await, 1);
+
+        let initial = store.snapshot(RunRef::new(42)).await.unwrap().1;
+
+        let observations = runner.pulse_heartbeats().await;
+        assert!(
+            observations.is_empty(),
+            "heartbeat should be idle while full TTL remains; got {observations:?}",
+        );
+        let after_idle = store.snapshot(RunRef::new(42)).await.unwrap().1;
+        assert_eq!(after_idle, initial);
+
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        let obs = &observations[0];
+        assert_eq!(obs.run_id, RunRef::new(42));
+        assert_eq!(
+            obs.target,
+            RecoveryDispatchTarget::ExpiredLease {
+                run_id: RecoveryRunId::new(1),
+            }
+        );
+        assert_eq!(obs.observation, HeartbeatPulseObservation::Renewed);
+
+        let after_renewal = store.snapshot(RunRef::new(42)).await.unwrap().1;
+        assert!(
+            after_renewal > initial,
+            "lease_expires_at must advance after a successful pulse: {after_renewal} > {initial}",
+        );
+
+        dispatcher.release_gate();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, RecoveryDispatchReason::Reconciled);
+        assert!(store.snapshot(RunRef::new(42)).await.is_none());
+        assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_advances_expiry_for_orphaned_dispatch() {
+        // Verifies the orphaned-claim leg: dispatcher reports
+        // Reconciled while heartbeat ticks mid-flight.
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(7)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) =
+            build_lease_runner_with_clock(4, dispatcher.clone(), store.clone(), clock.clone());
+        queue.enqueue(orphan_req_with_run(2, 100, 7));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(runner.heartbeat_count().await, 1);
+
+        let initial = store.snapshot(RunRef::new(7)).await.unwrap().1;
+        clock.set("T9");
+        let obs = runner.pulse_heartbeats().await;
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].observation, HeartbeatPulseObservation::Renewed);
+        assert_eq!(
+            obs[0].target,
+            RecoveryDispatchTarget::OrphanedWorkspaceClaim {
+                claim_id: RecoveryWorkspaceClaimId::new(2),
+            }
+        );
+        let after = store.snapshot(RunRef::new(7)).await.unwrap().1;
+        assert!(after > initial);
+
+        dispatcher.release_gate();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, RecoveryDispatchReason::Reconciled);
+        assert!(store.snapshot(RunRef::new(7)).await.is_none());
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_surfaces_contended_observation() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) =
+            build_lease_runner_with_clock(4, dispatcher.clone(), store.clone(), clock.clone());
+        queue.enqueue(lease_req_with_run(1, 100, 42));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(runner.heartbeat_count().await, 1);
+
+        let intruder = LeaseOwner::new("other-host", "scheduler-test", 9).unwrap();
+        store.release(RunRef::new(42)).await.unwrap();
+        let outcome = store
+            .acquire(RunRef::new(42), &intruder, "Z9999+999999999999ms", "Z9999")
+            .await
+            .unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::Acquired);
+
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        match &observations[0].observation {
+            HeartbeatPulseObservation::Contended { holder, .. } => {
+                assert_eq!(holder, &intruder.to_string());
+            }
+            other => panic!("expected Contended, got {other:?}"),
+        }
+        assert_eq!(observations[0].run_id, RunRef::new(42));
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_surfaces_not_found_observation() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) =
+            build_lease_runner_with_clock(4, dispatcher.clone(), store.clone(), clock.clone());
+        queue.enqueue(lease_req_with_run(1, 100, 42));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        store.forget_run(RunRef::new(42)).await;
+
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].observation,
+            HeartbeatPulseObservation::NotFound,
+        );
+        assert_eq!(observations[0].run_id, RunRef::new(42));
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_surfaces_backend_error_observation() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) =
+            build_lease_runner_with_clock(4, dispatcher.clone(), store.clone(), clock.clone());
+        queue.enqueue(lease_req_with_run(1, 100, 42));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        store.fail_next("disk full").await;
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].observation,
+            HeartbeatPulseObservation::BackendError {
+                message: "disk full".to_string(),
+            },
+        );
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_is_noop_without_lease_wiring() {
+        let queue = Arc::new(RecoveryDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        let runner = RecoveryRunner::new(queue, dispatcher, 4);
+        let observations = runner.pulse_heartbeats().await;
+        assert!(observations.is_empty());
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_release_clears_lease_exactly_once_after_pulses() {
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) =
+            build_lease_runner_with_clock(4, dispatcher.clone(), store.clone(), clock.clone());
+        queue.enqueue(lease_req_with_run(1, 100, 42));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        clock.set("T1");
+        let r1 = runner.pulse_heartbeats().await;
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].observation, HeartbeatPulseObservation::Renewed);
+        clock.set("T2");
+        let r2 = runner.pulse_heartbeats().await;
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].observation, HeartbeatPulseObservation::Renewed);
+
+        dispatcher.release_gate();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].reason, RecoveryDispatchReason::Reconciled);
+
+        assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
+        assert!(store.snapshot(RunRef::new(42)).await.is_none());
+        assert_eq!(runner.heartbeat_count().await, 0);
     }
 }
