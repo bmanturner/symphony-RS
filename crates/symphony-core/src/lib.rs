@@ -19,6 +19,7 @@ pub mod retry;
 pub mod state_machine;
 pub mod tracker;
 pub mod tracker_trait;
+pub mod work_item;
 
 pub use agent::{
     AgentControl, AgentError, AgentEvent, AgentEventStream, AgentResult, AgentRunner, AgentSession,
@@ -32,3 +33,7 @@ pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleReques
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
 pub use tracker_trait::{IssueTracker, TrackerError, TrackerResult};
+pub use work_item::{
+    ClassifyError, StatusClassifier, TrackerStatus, UnknownStatePolicy, WorkItem, WorkItemId,
+    WorkItemStatusClass,
+};
