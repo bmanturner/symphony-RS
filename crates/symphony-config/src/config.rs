@@ -351,6 +351,15 @@ pub struct PollingConfig {
     /// state changes. SPEC v2 §5.2 / §3 startup recovery. Default: `true`.
     #[serde(default = "default_startup_reconcile_recent_terminal")]
     pub startup_reconcile_recent_terminal: bool,
+
+    /// Durable-lease tuning for the scheduler runners
+    /// (ARCHITECTURE_v2 §7.2). Carries the default lease TTL and the
+    /// renewal margin every runner uses when acquiring or refreshing a
+    /// lease. Lives under `polling` so all per-tick cadence knobs sit
+    /// together; a future top-level `scheduler:` block, if introduced,
+    /// would absorb both.
+    #[serde(default)]
+    pub lease: LeaseConfig,
 }
 
 impl Default for PollingConfig {
@@ -359,8 +368,48 @@ impl Default for PollingConfig {
             interval_ms: default_poll_interval_ms(),
             jitter_ms: default_poll_jitter_ms(),
             startup_reconcile_recent_terminal: default_startup_reconcile_recent_terminal(),
+            lease: LeaseConfig::default(),
         }
     }
+}
+
+/// Durable-lease tuning shared by every scheduler runner.
+///
+/// `default_ttl_ms` is the wall-clock TTL written to
+/// `runs.lease_expires_at` when a runner first acquires a lease.
+/// `renewal_margin_ms` is the slack a heartbeating runner uses to
+/// refresh its lease *before* expiry; it MUST be strictly less than
+/// `default_ttl_ms` so renewals win the race against reaping. The
+/// validation step at config-load time enforces that invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseConfig {
+    /// Default lease TTL (ms) written to `runs.lease_expires_at` on
+    /// acquisition. Default: `60_000` (one minute).
+    #[serde(default = "default_lease_ttl_ms")]
+    pub default_ttl_ms: u64,
+
+    /// How far before TTL expiry (ms) a runner should attempt to renew
+    /// its lease. Default: `15_000` (renew at ~75% of the default TTL).
+    #[serde(default = "default_lease_renewal_margin_ms")]
+    pub renewal_margin_ms: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_ms: default_lease_ttl_ms(),
+            renewal_margin_ms: default_lease_renewal_margin_ms(),
+        }
+    }
+}
+
+fn default_lease_ttl_ms() -> u64 {
+    60_000
+}
+
+fn default_lease_renewal_margin_ms() -> u64 {
+    15_000
 }
 
 fn default_poll_interval_ms() -> u64 {
@@ -3316,6 +3365,50 @@ polling:
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
         assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn polling_lease_defaults_when_omitted() {
+        let yaml = "tracker:\n  project_slug: ENG\npolling:\n  interval_ms: 1000\n";
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.polling.lease.default_ttl_ms, 60_000);
+        assert_eq!(parsed.polling.lease.renewal_margin_ms, 15_000);
+    }
+
+    #[test]
+    fn polling_lease_roundtrip() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+polling:
+  interval_ms: 1000
+  lease:
+    default_ttl_ms: 30000
+    renewal_margin_ms: 5000
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.polling.lease.default_ttl_ms, 30_000);
+        assert_eq!(parsed.polling.lease.renewal_margin_ms, 5_000);
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn polling_lease_unknown_nested_key_is_rejected() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+polling:
+  lease:
+    ttl_ms: 30000
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("ttl_ms") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
     }
 
     #[test]

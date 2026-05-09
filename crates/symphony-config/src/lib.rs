@@ -29,7 +29,7 @@ pub use config::{
     AgentProfileConfig, AgentStrategy, BlockerPolicy, BranchPolicyConfig, ChildIssuePolicy,
     CodexConfig, ConfigValidationError, ConflictPolicy, DashboardConfig, DecompositionConfig,
     DecompositionTriggers, FollowupConfig, HermesAgentConfig, HooksConfig, IntegrationConfig,
-    IntegrationRequirement, LogFormat, LogsConfig, MergeStrategy, ObservabilityConfig,
+    IntegrationRequirement, LeaseConfig, LogFormat, LogsConfig, MergeStrategy, ObservabilityConfig,
     PollingConfig, PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider, PullRequestConfig,
     QaConfig, QaEvidenceRequired, RoleConfig, RoleKind, RoutingConfig, RoutingMatch,
     RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION, SseConfig, TandemMode, TrackerConfig,

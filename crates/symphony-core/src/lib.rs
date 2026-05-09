@@ -34,6 +34,7 @@ pub mod integration;
 pub mod integration_request;
 pub mod integration_runner;
 pub mod integration_tick;
+pub mod lease;
 pub mod logical_queue;
 pub mod parent_close;
 pub mod poll_loop;
@@ -137,6 +138,7 @@ pub use integration_tick::{
     IntegrationCandidate, IntegrationDispatchQueue, IntegrationDispatchRequest,
     IntegrationQueueError, IntegrationQueueSource, IntegrationQueueTick,
 };
+pub use lease::{LeaseOwner, LeaseOwnerParseError};
 pub use logical_queue::{LogicalQueue, QueueTickOutcome};
 pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
