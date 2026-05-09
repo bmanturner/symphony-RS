@@ -43,7 +43,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add deterministic rendering for the platform-lead catalog prompt section.
 - [ ] Add tests proving terse-description fallback emits warnings.
 
-## Phase 4 — Prompt Assembly Core
+## Phase 4 — Production Prompt Assembly
 
 - [ ] Replace production legacy issue-only `run.rs::render_prompt` path with the richer `symphony-core::prompt::PromptContext` renderer or an equivalent strict v2/v4 renderer.
 - [ ] Add explicit prompt section types: global workflow instructions, role prompt, role SOUL, agent system prompt, issue context, parent/child graph, blockers, workspace/branch, acceptance criteria, output schema.
@@ -53,7 +53,19 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add tests proving agent profile `system_prompt` is included but does not replace role instructions or SOUL.
 - [ ] Add tests proving prompt section provenance is included in run metadata.
 
-## Phase 5 — Platform Lead Decomposition Prompts
+## Phase 5 — Role-Scoped Runtime Profile Resolution
+
+- [ ] Replace the single global `build_agent_runner(cfg.agent.kind)` production path with role-aware runner resolution: run/work item role → `roles.<role>.agent` → `agents.<profile>` → concrete backend/composite runner.
+- [ ] Extend `AgentBackendProfile` with structured `args: Vec<String>` and `extra_args: Vec<String>` fields; keep `command` as executable/shell entrypoint, not a raw concatenated command line.
+- [ ] Preserve compatibility for existing `command: codex app-server` fixtures via migration/defaulting or fixture updates, but make the canonical v4 examples use `command: codex` + `args: [app-server]`.
+- [ ] Honor `AgentBackendProfile.model` in every concrete backend adapter: Claude via model flag, Codex via app-server conversation/session config, Hermes via supported Hermes non-interactive model/provider interface.
+- [ ] Wire per-profile runtime overrides into composite/tandem profiles so lead and follower can use different models, args, tools, and budgets.
+- [ ] Add validation for missing role agent, dangling agent profile, unsupported model override for backend, unsupported args ordering, and non-runnable composite profiles.
+- [ ] Add tests proving two roles using the same backend can launch with different models and extra args.
+- [ ] Add tests proving effective argv/debug metadata is emitted with secrets redacted.
+- [ ] Add operator docs showing model/args/extra_args examples for Claude, Codex, and Hermes.
+
+## Phase 6 — Platform Lead Decomposition Prompts
 
 - [ ] Add a decomposition-specific prompt builder for integration-owner/platform-lead runs.
 - [ ] Include global workflow prompt, platform-lead `role_prompt`, platform-lead `soul`, parent issue/repo context, decomposition policy, role catalog, dependency/blocker rules, and decomposition output schema.
@@ -64,7 +76,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add tests proving QA is not listed as a normal implementation child role unless workflow explicitly allows manual QA task issues.
 - [ ] Add tests proving platform lead has enough prompt context to emit `assigned_role` for each child without guessing from terse descriptions.
 
-## Phase 6 — Specialist Prompts
+## Phase 7 — Specialist Prompts
 
 - [ ] Add specialist prompt assembly that includes only the current specialist role's full `role_prompt` and `soul`.
 - [ ] Include parent issue context, current child issue context, dependency/blocker context, workspace/branch claim, acceptance criteria, and handoff output schema.
@@ -72,14 +84,14 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add tests proving backend specialist receives backend doctrine and not frontend doctrine.
 - [ ] Add tests proving blocked specialist runs include visible blocker/dependency reason when dispatched for repair/rework.
 
-## Phase 7 — QA Prompts
+## Phase 8 — QA Prompts
 
 - [ ] Add QA prompt assembly that includes global workflow prompt, QA `role_prompt`, QA `soul`, integrated branch/draft PR context, acceptance trace, child handoffs, known blockers, CI/check status, and QA verdict schema.
 - [ ] Ensure QA prompt construction treats QA as a gate over integrated output, not a normal implementation child by default.
 - [ ] Add tests proving QA verdict schema and evidence requirements are present.
 - [ ] Add tests proving QA can see child handoffs and integration summary.
 
-## Phase 8 — Fixtures and Examples
+## Phase 9 — Fixtures and Examples
 
 - [ ] Update `tests/fixtures/sample-workflow/WORKFLOW.md` with rich role assignment metadata for platform lead, QA, backend specialist, frontend/TUI specialist, reviewer, and operator examples.
 - [ ] Add `.symphony/roles/platform_lead/AGENTS.md` and `SOUL.md` fixture files.
@@ -88,7 +100,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add fixture tests proving `WorkflowLoader` validates and resolves those files.
 - [ ] Add fixture tests proving generated platform-lead catalog text changes when `WORKFLOW.md` role metadata changes.
 
-## Phase 9 — Operator Surface and Debugging
+## Phase 10 — Operator Surface and Debugging
 
 - [ ] Add a command or debug mode to render the effective prompt for a role/run without launching an agent.
 - [ ] Add a command or debug mode to render only the platform-lead role catalog.
@@ -96,14 +108,14 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add JSON output for role catalog inspection.
 - [ ] Add tests for prompt preview redaction and provenance output.
 
-## Phase 10 — End-to-End Scenarios
+## Phase 11 — End-to-End Scenarios
 
 - [ ] Add deterministic fake E2E: platform lead receives generated role catalog and decomposes a parent into correctly assigned backend/frontend children.
 - [ ] Add deterministic fake E2E: role catalog excludes QA as a child implementer and QA runs only after integration.
 - [ ] Add deterministic fake E2E: specialist receives its own instruction pack and emits a structured handoff satisfying role-specific expectations.
 - [ ] Add deterministic fake E2E: missing role instruction file fails before agent launch.
 
-## Phase 11 — Documentation
+## Phase 12 — Documentation
 
 - [ ] Document role instruction packs in `docs/roles.md`.
 - [ ] Document generated platform-lead assignment catalog in `docs/workflow.md`.
