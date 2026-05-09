@@ -43,7 +43,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add `RoleKind`, `RoleContext`, and role authority flags.
 - [x] Add `Blocker`, `BlockerStatus`, and blocker edge invariants.
 - [x] Add `Handoff` and `ReadyFor` structured output type.
-- [ ] Add `QaVerdict`, `QaEvidence`, and acceptance-criteria trace types.
+- [x] Add `QaVerdict`, `QaEvidence`, and acceptance-criteria trace types.
 - [ ] Add `FollowupIssueRequest` and `FollowupPolicy` types.
 - [ ] Add `IntegrationRecord` for canonical branch/worktree consolidation.
 - [ ] Add serialization tests for all public domain types.
@@ -103,7 +103,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Add QA queue fed by draft PRs/integration handoffs or direct specialist handoffs for simple issues.
 - [ ] Implement QA run request with draft PR ref, final branch/workspace, acceptance trace, changed files, CI/check status, and prior handoffs.
-- [ ] Add QA verdict persistence.
+- [ ] Add QA verdict persistence (widen `qa_verdicts.verdict` CHECK to the five SPEC §4.9 verdicts and persist `role`, `waiver_role`, `reason` alongside the existing evidence/trace columns).
 - [ ] Add blocker creation from QA verdict when failures are found.
 - [ ] Add policy: QA blockers block parent completion by default; QA waivers require a configured waiver role and reason.
 - [ ] Add rework routing after QA failure.

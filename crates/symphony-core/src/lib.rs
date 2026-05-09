@@ -17,6 +17,7 @@ pub mod event_bus;
 pub mod events;
 pub mod handoff;
 pub mod poll_loop;
+pub mod qa;
 pub mod retry;
 pub mod role;
 pub mod state_machine;
@@ -39,6 +40,10 @@ pub use handoff::{
     ReadyFor,
 };
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
+pub use qa::{
+    AcceptanceCriterionStatus, AcceptanceCriterionTrace, QaError, QaEvidence, QaOutcome, QaVerdict,
+    QaVerdictId,
+};
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
