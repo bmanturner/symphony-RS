@@ -30,6 +30,7 @@ pub mod prompt;
 pub mod pull_request;
 pub mod qa;
 pub mod qa_blocker;
+pub mod qa_blocker_policy;
 pub mod qa_request;
 pub mod retry;
 pub mod role;
@@ -97,6 +98,10 @@ pub use qa::{
     QaVerdictId,
 };
 pub use qa_blocker::{QaBlockerError, QaBlockerSpec, derive_qa_blockers};
+pub use qa_blocker_policy::{
+    QaBlockerPolicy, QaBlockerSnapshot, QaParentCloseError, QaWaiverError,
+    check_qa_blockers_at_parent_close, validate_qa_waiver,
+};
 pub use qa_request::{
     QaDraftPullRequest, QaRequestCause, QaRequestError, QaRunRequest, QaWorkspace,
 };
