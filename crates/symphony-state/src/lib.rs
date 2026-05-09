@@ -15,6 +15,7 @@
 pub mod events;
 pub mod migrations;
 pub mod repository;
+pub mod transaction;
 
 use std::path::Path;
 

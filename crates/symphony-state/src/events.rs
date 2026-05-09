@@ -23,7 +23,7 @@
 //! checklist item; this module deliberately keeps the API narrow so that
 //! composition is the only public way the kernel writes events.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::repository::{RunId, WorkItemId};
 use crate::{StateDb, StateResult};
@@ -117,42 +117,96 @@ fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
     })
 }
 
+// Free helpers parameterized on `&Connection` — same delegation pattern
+// as `repository.rs` so the transaction wrapper can append events inside
+// an open SQLite transaction.
+
+pub(crate) fn append_event_in(conn: &Connection, new: NewEvent<'_>) -> StateResult<EventRecord> {
+    // The `SELECT COALESCE(MAX(sequence), 0) + 1 FROM events` subquery
+    // executes inside the same statement as the INSERT, so the
+    // sequence read and write are atomic on a single connection. The
+    // UNIQUE index on `events.sequence` is the safety net for any
+    // future multi-connection writer.
+    conn.execute(
+        "INSERT INTO events \
+            (sequence, event_type, work_item_id, run_id, payload, created_at) \
+         VALUES \
+            ((SELECT COALESCE(MAX(sequence), 0) + 1 FROM events), \
+             ?1, ?2, ?3, ?4, ?5)",
+        params![
+            new.event_type,
+            new.work_item_id.map(|id| id.0),
+            new.run_id.map(|id| id.0),
+            new.payload,
+            new.now,
+        ],
+    )?;
+    let id = EventId(conn.last_insert_rowid());
+    let sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let record = stmt.query_row(params![id.0], map_event)?;
+    Ok(record)
+}
+
+pub(crate) fn last_event_sequence_in(conn: &Connection) -> StateResult<Option<EventSequence>> {
+    let mut stmt = conn.prepare("SELECT MAX(sequence) FROM events")?;
+    let value: Option<i64> = stmt
+        .query_row([], |row| row.get::<_, Option<i64>>(0))
+        .optional()?
+        .flatten();
+    Ok(value.map(EventSequence))
+}
+
+pub(crate) fn list_events_after_in(
+    conn: &Connection,
+    after: Option<EventSequence>,
+    limit: usize,
+) -> StateResult<Vec<EventRecord>> {
+    let cutoff = after.map(|s| s.0).unwrap_or(0);
+    // `i64::try_from(usize)` is the right cast for SQLite's LIMIT. A
+    // pathological `usize::MAX` on a 64-bit host saturates to i64::MAX,
+    // which is well past any realistic page size.
+    let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM events \
+         WHERE sequence > ?1 \
+         ORDER BY sequence ASC \
+         LIMIT ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![cutoff, limit_sql], map_event)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub(crate) fn list_events_for_work_item_in(
+    conn: &Connection,
+    work_item_id: WorkItemId,
+) -> StateResult<Vec<EventRecord>> {
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM events \
+         WHERE work_item_id = ?1 \
+         ORDER BY sequence ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![work_item_id.0], map_event)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 impl EventRepository for StateDb {
     fn append_event(&mut self, new: NewEvent<'_>) -> StateResult<EventRecord> {
-        let conn = self.conn();
-        // The `SELECT COALESCE(MAX(sequence), 0) + 1 FROM events` subquery
-        // executes inside the same statement as the INSERT, so the
-        // sequence read and write are atomic on a single connection. The
-        // UNIQUE index on `events.sequence` is the safety net for any
-        // future multi-connection writer.
-        conn.execute(
-            "INSERT INTO events \
-                (sequence, event_type, work_item_id, run_id, payload, created_at) \
-             VALUES \
-                ((SELECT COALESCE(MAX(sequence), 0) + 1 FROM events), \
-                 ?1, ?2, ?3, ?4, ?5)",
-            params![
-                new.event_type,
-                new.work_item_id.map(|id| id.0),
-                new.run_id.map(|id| id.0),
-                new.payload,
-                new.now,
-            ],
-        )?;
-        let id = EventId(conn.last_insert_rowid());
-        let sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?1");
-        let mut stmt = conn.prepare(&sql)?;
-        let record = stmt.query_row(params![id.0], map_event)?;
-        Ok(record)
+        append_event_in(self.conn(), new)
     }
 
     fn last_event_sequence(&self) -> StateResult<Option<EventSequence>> {
-        let mut stmt = self.conn().prepare("SELECT MAX(sequence) FROM events")?;
-        let value: Option<i64> = stmt
-            .query_row([], |row| row.get::<_, Option<i64>>(0))
-            .optional()?
-            .flatten();
-        Ok(value.map(EventSequence))
+        last_event_sequence_in(self.conn())
     }
 
     fn list_events_after(
@@ -160,39 +214,11 @@ impl EventRepository for StateDb {
         after: Option<EventSequence>,
         limit: usize,
     ) -> StateResult<Vec<EventRecord>> {
-        let cutoff = after.map(|s| s.0).unwrap_or(0);
-        // `i64::try_from(usize)` is the right cast for SQLite's LIMIT. A
-        // pathological `usize::MAX` on a 64-bit host saturates to i64::MAX,
-        // which is well past any realistic page size.
-        let limit_sql = i64::try_from(limit).unwrap_or(i64::MAX);
-        let sql = format!(
-            "SELECT {EVENT_COLUMNS} FROM events \
-             WHERE sequence > ?1 \
-             ORDER BY sequence ASC \
-             LIMIT ?2"
-        );
-        let mut stmt = self.conn().prepare(&sql)?;
-        let rows = stmt.query_map(params![cutoff, limit_sql], map_event)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        list_events_after_in(self.conn(), after, limit)
     }
 
     fn list_events_for_work_item(&self, work_item_id: WorkItemId) -> StateResult<Vec<EventRecord>> {
-        let sql = format!(
-            "SELECT {EVENT_COLUMNS} FROM events \
-             WHERE work_item_id = ?1 \
-             ORDER BY sequence ASC"
-        );
-        let mut stmt = self.conn().prepare(&sql)?;
-        let rows = stmt.query_map(params![work_item_id.0], map_event)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        list_events_for_work_item_in(self.conn(), work_item_id)
     }
 }
 

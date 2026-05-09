@@ -19,7 +19,7 @@
 //!   `CHECK`, deliberately — Phase 3 introduces `WorkItemStatusClass`
 //!   and the kernel will validate before insert.
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{StateDb, StateResult};
 
@@ -253,43 +253,161 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     })
 }
 
+// Free helpers parameterized on `&Connection` so both the public
+// `StateDb` repository impls and the transactional wrapper in
+// `crate::transaction` execute the same SQL without duplication.
+// `rusqlite::Transaction` derefs to `Connection`, which makes these
+// callable from inside an open transaction transparently.
+
+pub(crate) fn create_work_item_in(
+    conn: &Connection,
+    new: NewWorkItem<'_>,
+) -> StateResult<WorkItemRecord> {
+    conn.execute(
+        "INSERT INTO work_items \
+            (tracker_id, identifier, parent_id, title, status_class, \
+             tracker_status, assigned_role, assigned_agent, priority, \
+             workspace_policy, branch_policy, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        params![
+            new.tracker_id,
+            new.identifier,
+            new.parent_id.map(|id| id.0),
+            new.title,
+            new.status_class,
+            new.tracker_status,
+            new.assigned_role,
+            new.assigned_agent,
+            new.priority,
+            new.workspace_policy,
+            new.branch_policy,
+            new.now,
+        ],
+    )?;
+    let id = WorkItemId(conn.last_insert_rowid());
+    Ok(get_work_item_in(conn, id)?.expect("freshly inserted work item must be readable"))
+}
+
+pub(crate) fn get_work_item_in(
+    conn: &Connection,
+    id: WorkItemId,
+) -> StateResult<Option<WorkItemRecord>> {
+    let sql = format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt.query_row(params![id.0], map_work_item).optional()?;
+    Ok(row)
+}
+
+pub(crate) fn find_work_item_by_identifier_in(
+    conn: &Connection,
+    tracker_id: &str,
+    identifier: &str,
+) -> StateResult<Option<WorkItemRecord>> {
+    let sql = format!(
+        "SELECT {WORK_ITEM_COLUMNS} FROM work_items \
+         WHERE tracker_id = ?1 AND identifier = ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt
+        .query_row(params![tracker_id, identifier], map_work_item)
+        .optional()?;
+    Ok(row)
+}
+
+pub(crate) fn update_work_item_status_in(
+    conn: &Connection,
+    id: WorkItemId,
+    status_class: &str,
+    tracker_status: &str,
+    now: &str,
+) -> StateResult<bool> {
+    let updated = conn.execute(
+        "UPDATE work_items \
+         SET status_class = ?2, tracker_status = ?3, updated_at = ?4 \
+         WHERE id = ?1",
+        params![id.0, status_class, tracker_status, now],
+    )?;
+    Ok(updated == 1)
+}
+
+pub(crate) fn list_children_in(
+    conn: &Connection,
+    parent: WorkItemId,
+) -> StateResult<Vec<WorkItemRecord>> {
+    let sql = format!(
+        "SELECT {WORK_ITEM_COLUMNS} FROM work_items \
+         WHERE parent_id = ?1 ORDER BY id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![parent.0], map_work_item)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub(crate) fn create_run_in(conn: &Connection, new: NewRun<'_>) -> StateResult<RunRecord> {
+    conn.execute(
+        "INSERT INTO runs \
+            (work_item_id, role, agent, status, workspace_claim_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            new.work_item_id.0,
+            new.role,
+            new.agent,
+            new.status,
+            new.workspace_claim_id,
+            new.now,
+        ],
+    )?;
+    let id = RunId(conn.last_insert_rowid());
+    Ok(get_run_in(conn, id)?.expect("freshly inserted run must be readable"))
+}
+
+pub(crate) fn get_run_in(conn: &Connection, id: RunId) -> StateResult<Option<RunRecord>> {
+    let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
+    let row = stmt.query_row(params![id.0], map_run).optional()?;
+    Ok(row)
+}
+
+pub(crate) fn update_run_status_in(
+    conn: &Connection,
+    id: RunId,
+    status: &str,
+) -> StateResult<bool> {
+    let updated = conn.execute(
+        "UPDATE runs SET status = ?2 WHERE id = ?1",
+        params![id.0, status],
+    )?;
+    Ok(updated == 1)
+}
+
+pub(crate) fn list_runs_for_work_item_in(
+    conn: &Connection,
+    work_item_id: WorkItemId,
+) -> StateResult<Vec<RunRecord>> {
+    let sql = format!(
+        "SELECT {RUN_COLUMNS} FROM runs \
+         WHERE work_item_id = ?1 ORDER BY id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![work_item_id.0], map_run)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 impl WorkItemRepository for StateDb {
     fn create_work_item(&mut self, new: NewWorkItem<'_>) -> StateResult<WorkItemRecord> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO work_items \
-                (tracker_id, identifier, parent_id, title, status_class, \
-                 tracker_status, assigned_role, assigned_agent, priority, \
-                 workspace_policy, branch_policy, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
-            params![
-                new.tracker_id,
-                new.identifier,
-                new.parent_id.map(|id| id.0),
-                new.title,
-                new.status_class,
-                new.tracker_status,
-                new.assigned_role,
-                new.assigned_agent,
-                new.priority,
-                new.workspace_policy,
-                new.branch_policy,
-                new.now,
-            ],
-        )?;
-        let id = WorkItemId(conn.last_insert_rowid());
-        // SAFETY: we just inserted, so the row exists. `expect` here is a
-        // bug-not-error condition.
-        Ok(self
-            .get_work_item(id)?
-            .expect("freshly inserted work item must be readable"))
+        create_work_item_in(self.conn(), new)
     }
 
     fn get_work_item(&self, id: WorkItemId) -> StateResult<Option<WorkItemRecord>> {
-        let sql = format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE id = ?1");
-        let mut stmt = self.conn().prepare(&sql)?;
-        let row = stmt.query_row(params![id.0], map_work_item).optional()?;
-        Ok(row)
+        get_work_item_in(self.conn(), id)
     }
 
     fn find_work_item_by_identifier(
@@ -297,15 +415,7 @@ impl WorkItemRepository for StateDb {
         tracker_id: &str,
         identifier: &str,
     ) -> StateResult<Option<WorkItemRecord>> {
-        let sql = format!(
-            "SELECT {WORK_ITEM_COLUMNS} FROM work_items \
-             WHERE tracker_id = ?1 AND identifier = ?2"
-        );
-        let mut stmt = self.conn().prepare(&sql)?;
-        let row = stmt
-            .query_row(params![tracker_id, identifier], map_work_item)
-            .optional()?;
-        Ok(row)
+        find_work_item_by_identifier_in(self.conn(), tracker_id, identifier)
     }
 
     fn update_work_item_status(
@@ -315,79 +425,29 @@ impl WorkItemRepository for StateDb {
         tracker_status: &str,
         now: &str,
     ) -> StateResult<bool> {
-        let updated = self.conn().execute(
-            "UPDATE work_items \
-             SET status_class = ?2, tracker_status = ?3, updated_at = ?4 \
-             WHERE id = ?1",
-            params![id.0, status_class, tracker_status, now],
-        )?;
-        Ok(updated == 1)
+        update_work_item_status_in(self.conn(), id, status_class, tracker_status, now)
     }
 
     fn list_children(&self, parent: WorkItemId) -> StateResult<Vec<WorkItemRecord>> {
-        let sql = format!(
-            "SELECT {WORK_ITEM_COLUMNS} FROM work_items \
-             WHERE parent_id = ?1 ORDER BY id ASC"
-        );
-        let mut stmt = self.conn().prepare(&sql)?;
-        let rows = stmt.query_map(params![parent.0], map_work_item)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        list_children_in(self.conn(), parent)
     }
 }
 
 impl RunRepository for StateDb {
     fn create_run(&mut self, new: NewRun<'_>) -> StateResult<RunRecord> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO runs \
-                (work_item_id, role, agent, status, workspace_claim_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                new.work_item_id.0,
-                new.role,
-                new.agent,
-                new.status,
-                new.workspace_claim_id,
-                new.now,
-            ],
-        )?;
-        let id = RunId(conn.last_insert_rowid());
-        Ok(self
-            .get_run(id)?
-            .expect("freshly inserted run must be readable"))
+        create_run_in(self.conn(), new)
     }
 
     fn get_run(&self, id: RunId) -> StateResult<Option<RunRecord>> {
-        let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1");
-        let mut stmt = self.conn().prepare(&sql)?;
-        let row = stmt.query_row(params![id.0], map_run).optional()?;
-        Ok(row)
+        get_run_in(self.conn(), id)
     }
 
     fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool> {
-        let updated = self.conn().execute(
-            "UPDATE runs SET status = ?2 WHERE id = ?1",
-            params![id.0, status],
-        )?;
-        Ok(updated == 1)
+        update_run_status_in(self.conn(), id, status)
     }
 
     fn list_runs_for_work_item(&self, work_item_id: WorkItemId) -> StateResult<Vec<RunRecord>> {
-        let sql = format!(
-            "SELECT {RUN_COLUMNS} FROM runs \
-             WHERE work_item_id = ?1 ORDER BY id ASC"
-        );
-        let mut stmt = self.conn().prepare(&sql)?;
-        let rows = stmt.query_map(params![work_item_id.0], map_run)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+        list_runs_for_work_item_in(self.conn(), work_item_id)
     }
 }
 
