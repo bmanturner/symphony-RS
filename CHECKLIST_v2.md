@@ -164,7 +164,7 @@ One unchecked item per implementation iteration. Each item should land with test
     - [x] Wire `QaDispatchRunner` lease acquisition under the same contract, with tests for write/expiry/cleared-on-terminal across pass/fail/inconclusive/waiver verdicts.
     - [x] Wire `FollowupApprovalRunner` lease acquisition under the same contract, with tests for write/expiry/cleared-on-terminal across approve/reject paths.
     - [x] Wire `BudgetPauseRunner` lease acquisition under the same contract, with tests for write/expiry/cleared-on-terminal across resume/hold paths.
-    - [ ] Wire `RecoveryRunner` lease acquisition under the same contract (recovery dispatches are themselves runs), with tests for write/expiry/cleared-on-terminal across reaped/orphaned outcomes.
+    - [x] Wire `RecoveryRunner` lease acquisition under the same contract (recovery dispatches are themselves runs), with tests for write/expiry/cleared-on-terminal across reaped/orphaned outcomes.
   - [ ] Surface lease acquisition failures (contention, missing run row) as a typed dispatch outcome in each runner so the scheduler can park or reroute without losing the dispatch request, with tests for contention parking and missing-run dropping.
 - [ ] Add lease heartbeat and expiration handling.
 - [ ] Add global/role/agent/repository concurrency limits.

@@ -136,13 +136,22 @@ pub struct OrphanedWorkspaceClaimCandidate {
 ///
 /// Plain serializable data so a future scheduler can persist and replay
 /// it on restart. The variants mirror the two upstream signals.
+///
+/// The optional `dispatch_run_id` on each variant carries the durable
+/// `runs` row that animates *the recovery dispatch itself* (CHECKLIST_v2
+/// Phase 11: "recovery dispatches are themselves runs"). When `Some`,
+/// the [`crate::recovery_runner::RecoveryRunner`] acquires a lease on
+/// that row before invoking the dispatcher and releases it on terminal
+/// completion. `None` for legacy producers that do not reserve a
+/// dispatch run row before queueing — those dispatches bypass lease
+/// acquisition and rely on the upstream claim set for idempotency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecoveryDispatchRequest {
     /// Lease expired — recovery handler should clear the lease columns
     /// and re-route the work item.
     ExpiredLease {
-        /// Durable run id.
+        /// Durable run id of the *expired* run being reconciled.
         run_id: RecoveryRunId,
         /// Work item the leased run was operating on.
         work_item_id: WorkItemId,
@@ -152,6 +161,10 @@ pub enum RecoveryDispatchRequest {
         lease_expires_at: String,
         /// Claimed workspace, if any.
         workspace_claim_id: Option<RecoveryWorkspaceClaimId>,
+        /// Durable `runs` row animating *this recovery dispatch*. See
+        /// the enum-level docs for lease-wiring semantics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_run_id: Option<crate::blocker::RunRef>,
     },
     /// Workspace claim no longer referenced by an active run.
     OrphanedWorkspaceClaim {
@@ -163,7 +176,27 @@ pub enum RecoveryDispatchRequest {
         path: String,
         /// Claim status verbatim.
         claim_status: String,
+        /// Durable `runs` row animating *this recovery dispatch*. See
+        /// the enum-level docs for lease-wiring semantics.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_run_id: Option<crate::blocker::RunRef>,
     },
+}
+
+impl RecoveryDispatchRequest {
+    /// Durable `runs` row animating this dispatch, when one was reserved
+    /// by the producer. Returned for both variants so the runner can
+    /// fold lease wiring into a single code path.
+    pub fn dispatch_run_id(&self) -> Option<crate::blocker::RunRef> {
+        match self {
+            Self::ExpiredLease {
+                dispatch_run_id, ..
+            } => *dispatch_run_id,
+            Self::OrphanedWorkspaceClaim {
+                dispatch_run_id, ..
+            } => *dispatch_run_id,
+        }
+    }
 }
 
 /// Errors a [`RecoveryQueueSource`] may surface to the tick.
@@ -368,6 +401,7 @@ impl QueueTick for RecoveryQueueTick {
                 lease_owner: l.lease_owner,
                 lease_expires_at: l.lease_expires_at,
                 workspace_claim_id: l.workspace_claim_id,
+                dispatch_run_id: None,
             });
             self.claimed
                 .lock()
@@ -395,6 +429,7 @@ impl QueueTick for RecoveryQueueTick {
                     work_item_id: o.work_item_id,
                     path: o.path,
                     claim_status: o.claim_status,
+                    dispatch_run_id: None,
                 });
             self.claimed
                 .lock()
@@ -724,12 +759,14 @@ mod tests {
             lease_owner: "worker-a".into(),
             lease_expires_at: "2026-05-08T00:00:00Z".into(),
             workspace_claim_id: None,
+            dispatch_run_id: None,
         });
         q.enqueue(RecoveryDispatchRequest::OrphanedWorkspaceClaim {
             claim_id: RecoveryWorkspaceClaimId::new(7),
             work_item_id: WorkItemId::new(101),
             path: "/tmp/symphony/wt-7".into(),
             claim_status: "active".into(),
+            dispatch_run_id: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -790,9 +827,14 @@ mod tests {
             lease_owner: "worker-a".into(),
             lease_expires_at: "2026-05-08T00:00:00Z".into(),
             workspace_claim_id: None,
+            dispatch_run_id: None,
         };
         let json = serde_json::to_string(&r1).unwrap();
         assert!(json.contains("\"kind\":\"expired_lease\""));
+        assert!(
+            !json.contains("dispatch_run_id"),
+            "absent dispatch_run_id must be skipped on serialize",
+        );
         let back: RecoveryDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r1);
 
@@ -801,10 +843,32 @@ mod tests {
             work_item_id: WorkItemId::new(100),
             path: "/tmp/symphony/wt-7".into(),
             claim_status: "active".into(),
+            dispatch_run_id: None,
         };
         let json = serde_json::to_string(&r2).unwrap();
         assert!(json.contains("\"kind\":\"orphaned_workspace_claim\""));
+        assert!(!json.contains("dispatch_run_id"));
         let back: RecoveryDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r2);
+    }
+
+    #[test]
+    fn dispatch_request_round_trips_when_dispatch_run_id_present() {
+        let r1 = RecoveryDispatchRequest::ExpiredLease {
+            run_id: RecoveryRunId::new(1),
+            work_item_id: WorkItemId::new(100),
+            lease_owner: "worker-a".into(),
+            lease_expires_at: "2026-05-08T00:00:00Z".into(),
+            workspace_claim_id: None,
+            dispatch_run_id: Some(crate::blocker::RunRef::new(42)),
+        };
+        let json = serde_json::to_string(&r1).unwrap();
+        assert!(json.contains("\"dispatch_run_id\":42"));
+        let back: RecoveryDispatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r1);
+        assert_eq!(
+            back.dispatch_run_id(),
+            Some(crate::blocker::RunRef::new(42))
+        );
     }
 }
