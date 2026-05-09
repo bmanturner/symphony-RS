@@ -42,6 +42,7 @@ pub mod qa_blocker;
 pub mod qa_blocker_policy;
 pub mod qa_request;
 pub mod qa_rework;
+pub mod qa_runner;
 pub mod qa_tick;
 pub mod queue_tick;
 pub mod recovery_tick;
@@ -151,6 +152,9 @@ pub use qa_request::{
 pub use qa_rework::{
     BlockerReworkInput, BlockerReworkRoute, PriorRunSummary, QaReworkDecision, QaReworkError,
     derive_qa_rework_routing,
+};
+pub use qa_runner::{
+    QaDispatchOutcome, QaDispatchReason, QaDispatchRunner, QaDispatcher, QaRunReport,
 };
 pub use qa_tick::{
     QaCandidate, QaDispatchQueue, QaDispatchRequest, QaGates, QaQueueError, QaQueueSource,
