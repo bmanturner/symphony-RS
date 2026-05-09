@@ -32,6 +32,7 @@ pub mod qa;
 pub mod qa_blocker;
 pub mod qa_blocker_policy;
 pub mod qa_request;
+pub mod qa_rework;
 pub mod retry;
 pub mod role;
 pub mod routing;
@@ -104,6 +105,10 @@ pub use qa_blocker_policy::{
 };
 pub use qa_request::{
     QaDraftPullRequest, QaRequestCause, QaRequestError, QaRunRequest, QaWorkspace,
+};
+pub use qa_rework::{
+    BlockerReworkInput, BlockerReworkRoute, PriorRunSummary, QaReworkDecision, QaReworkError,
+    derive_qa_rework_routing,
 };
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};

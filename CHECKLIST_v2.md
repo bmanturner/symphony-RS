@@ -110,7 +110,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add QA verdict persistence (widen `qa_verdicts.verdict` CHECK to the five SPEC §4.9 verdicts and persist `role`, `waiver_role`, `reason` alongside the existing evidence/trace columns).
 - [x] Add blocker creation from QA verdict when failures are found.
 - [x] Add policy: QA blockers block parent completion by default; QA waivers require a configured waiver role and reason.
-- [ ] Add rework routing after QA failure.
+- [x] Add rework routing after QA failure.
 - [ ] Add tests for QA pass, QA fail with blockers, inconclusive verdict, and waiver policy.
 
 ## Phase 10 — Follow-up Issue Flow
