@@ -33,6 +33,9 @@ use crate::edges::{
 };
 use crate::events::{EventRecord, NewEvent};
 use crate::handoffs::{HandoffRecord, NewHandoff, create_handoff_in};
+use crate::integration_records::{
+    IntegrationRecordRow, NewIntegrationRecord, create_integration_record_in,
+};
 use crate::repository::{
     NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord, create_run_in,
     create_work_item_in, get_run_in, get_work_item_in, update_run_status_in,
@@ -138,6 +141,20 @@ impl<'conn> StateTransaction<'conn> {
     /// the audit trail.
     pub fn create_handoff(&mut self, new: NewHandoff<'_>) -> StateResult<HandoffRecord> {
         create_handoff_in(&self.tx, new)
+    }
+
+    /// Persist an integration record inside this transaction.
+    ///
+    /// Integration records are typically composed with the
+    /// `integration.completed` (or `integration.failed`) event append so
+    /// the durable log and the record row land atomically — the parent
+    /// closeout gate (ARCH §6.2) reads the latest record and would
+    /// observe a half-built world otherwise.
+    pub fn create_integration_record(
+        &mut self,
+        new: NewIntegrationRecord<'_>,
+    ) -> StateResult<IntegrationRecordRow> {
+        create_integration_record_in(&self.tx, new)
     }
 }
 

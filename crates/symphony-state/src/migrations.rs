@@ -243,7 +243,54 @@ pub fn migrations() -> &'static [Migration] {
     &MIGRATIONS
 }
 
-const MIGRATIONS: [Migration; 1] = [V2_INITIAL_SCHEMA];
+/// Adds the `integration_records` table. The kernel writes one row per
+/// integration-owner consolidation attempt against a parent work item
+/// (SPEC v2 §5.10, §6.4); the row is the durable proof QA reads to know
+/// what artifact it is verifying and the parent closeout gate reads to
+/// confirm "integration record exists when required" (ARCH §6.2).
+///
+/// JSON columns (`children_consolidated`, `conflicts`, `blockers_filed`)
+/// match the convention used by `events.payload` and the handoff JSON
+/// columns: stored opaquely so the storage crate stays free of
+/// `serde_json` and the canonical encoder lives in `symphony-core`.
+const V2_INTEGRATION_RECORDS: Migration = Migration {
+    version: 2_026_050_802,
+    name: "v2_integration_records",
+    sql: r#"
+        CREATE TABLE integration_records (
+            id                     INTEGER PRIMARY KEY,
+            parent_work_item_id    INTEGER NOT NULL
+                REFERENCES work_items(id) ON DELETE CASCADE,
+            owner_role             TEXT    NOT NULL,
+            run_id                 INTEGER
+                REFERENCES runs(id) ON DELETE SET NULL,
+            status                 TEXT    NOT NULL
+                CHECK (status IN
+                    ('pending', 'in_progress', 'succeeded',
+                     'failed', 'blocked', 'cancelled')),
+            merge_strategy         TEXT    NOT NULL
+                CHECK (merge_strategy IN
+                    ('sequential_cherry_pick', 'merge_commits',
+                     'shared_branch')),
+            integration_branch     TEXT,
+            base_ref               TEXT,
+            head_sha               TEXT,
+            workspace_path         TEXT,
+            children_consolidated  TEXT,
+            summary                TEXT,
+            conflicts              TEXT,
+            blockers_filed         TEXT,
+            created_at             TEXT    NOT NULL
+        );
+
+        CREATE INDEX idx_integration_records_parent
+            ON integration_records(parent_work_item_id);
+        CREATE INDEX idx_integration_records_status
+            ON integration_records(status);
+    "#,
+};
+
+const MIGRATIONS: [Migration; 2] = [V2_INITIAL_SCHEMA, V2_INTEGRATION_RECORDS];
 
 #[cfg(test)]
 mod tests {
@@ -282,6 +329,7 @@ mod tests {
             "events",
             "pending_tracker_syncs",
             "budget_pauses",
+            "integration_records",
         ] {
             assert!(table_exists(&db, table), "missing table `{table}`");
         }
@@ -290,7 +338,10 @@ mod tests {
     #[test]
     fn v2_migration_is_recorded_under_its_version() {
         let db = open_migrated();
-        assert_eq!(db.applied_versions().unwrap(), vec![2_026_050_801]);
+        assert_eq!(
+            db.applied_versions().unwrap(),
+            vec![2_026_050_801, 2_026_050_802]
+        );
     }
 
     #[test]
@@ -298,10 +349,10 @@ mod tests {
         let mut db = StateDb::open_in_memory().expect("open");
         let first = db.migrate(migrations()).expect("first apply");
         let second = db.migrate(migrations()).expect("second apply");
-        assert_eq!(first.applied, vec![2_026_050_801]);
+        assert_eq!(first.applied, vec![2_026_050_801, 2_026_050_802]);
         assert!(first.skipped.is_empty());
         assert!(second.applied.is_empty());
-        assert_eq!(second.skipped, vec![2_026_050_801]);
+        assert_eq!(second.skipped, vec![2_026_050_801, 2_026_050_802]);
     }
 
     fn insert_work_item(db: &StateDb, identifier: &str) -> i64 {
@@ -426,6 +477,62 @@ mod tests {
             .expect("read back");
         assert_eq!(kind, "add_comment");
         assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn integration_record_status_check_rejects_unknown_status() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        let err = db.conn().execute(
+            "INSERT INTO integration_records
+                (parent_work_item_id, owner_role, status, merge_strategy,
+                 created_at)
+             VALUES (?1, 'platform_lead', 'maybe', 'merge_commits',
+                     '2026-05-08T00:00:00Z')",
+            params![wi],
+        );
+        assert!(err.is_err(), "CHECK should reject unknown status");
+    }
+
+    #[test]
+    fn integration_record_merge_strategy_check_rejects_unknown_strategy() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        let err = db.conn().execute(
+            "INSERT INTO integration_records
+                (parent_work_item_id, owner_role, status, merge_strategy,
+                 created_at)
+             VALUES (?1, 'platform_lead', 'pending', 'rebase_n_pray',
+                     '2026-05-08T00:00:00Z')",
+            params![wi],
+        );
+        assert!(err.is_err(), "CHECK should reject unknown merge_strategy");
+    }
+
+    #[test]
+    fn integration_records_cascade_when_parent_deleted() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO integration_records
+                    (parent_work_item_id, owner_role, status, merge_strategy,
+                     created_at)
+                 VALUES (?1, 'platform_lead', 'pending', 'merge_commits',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("insert integration_records row");
+        db.conn()
+            .execute("DELETE FROM work_items WHERE id = ?1", params![wi])
+            .expect("delete work_item");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM integration_records", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 0, "FK cascade should clear integration_records");
     }
 
     #[test]
