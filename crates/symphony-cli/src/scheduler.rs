@@ -2663,6 +2663,7 @@ mod tests {
             identifier: "ENG-1".into(),
             title: "title".into(),
             cause: QaRequestCause::DirectQaRequest,
+            run_id: None,
         };
         assert_eq!(
             NoopQaDispatcher.dispatch(qa_req, cancel.clone()).await,
