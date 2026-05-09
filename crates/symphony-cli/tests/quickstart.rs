@@ -9,7 +9,7 @@
 //! 1. **Dispatch happened.** The orchestrator's per-issue workspace dir
 //!    (named after the sanitized issue identifier) appears under the
 //!    workspace root we point it at via `SYMPHONY_WORKSPACE__ROOT`.
-//!    `WorkspaceManager::ensure` is the very first dispatcher step, so a
+//!    `WorkspaceManager::claim` is the very first dispatcher step, so a
 //!    sub-directory named `QUICK-1` or `QUICK-2` is the smallest
 //!    observable side-effect that proves an issue made it from
 //!    "tracker says active" all the way to "dispatcher started".
@@ -128,7 +128,7 @@ fn quickstart_dispatches_an_issue_and_exits_cleanly_on_sigint() {
     let pid = child.id();
 
     // Give the orchestrator long enough for at least one poll tick
-    // (200ms in the fixture) plus the dispatcher's ensure() call. The
+    // (200ms in the fixture) plus the dispatcher's claim() call. The
     // mock agent finishes its scripted sequence in <50ms, so 1.5s is
     // comfortably more than needed without making the test slow.
     let observed = poll_until(Duration::from_millis(2000), || {
@@ -162,7 +162,7 @@ fn quickstart_dispatches_an_issue_and_exits_cleanly_on_sigint() {
 }
 
 /// List the immediate sub-directory names of `root`. Used as the
-/// dispatch-evidence probe — `WorkspaceManager::ensure` creates exactly
+/// dispatch-evidence probe — `WorkspaceManager::claim` creates exactly
 /// one directory per dispatched issue.
 fn sub_dirs(root: &std::path::Path) -> Vec<String> {
     std::fs::read_dir(root)

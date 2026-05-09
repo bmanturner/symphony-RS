@@ -79,7 +79,7 @@ use symphony_core::tracker_trait::TrackerRead;
 use symphony_tracker::{
     GitHubConfig, GitHubTracker, LinearConfig, LinearTracker, fixtures as tracker_fixtures,
 };
-use symphony_workspace::{LocalFsWorkspace, Workspace, WorkspaceManager};
+use symphony_workspace::{LocalFsWorkspace, WorkspaceClaim, WorkspaceManager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -428,8 +428,9 @@ fn yaml_to_json(v: Option<&serde_yaml::Value>) -> Option<serde_json::Value> {
 ///
 /// Lifecycle for one dispatch:
 ///
-/// 1. `workspace.ensure(identifier)` — materialize the per-issue dir,
-///    fire `after_create` if newly built.
+/// 1. `workspace.claim(identifier)` — materialize the per-issue dir
+///    and return a [`WorkspaceClaim`] (path + strategy + verification);
+///    fires `after_create` if newly built.
 /// 2. `workspace.before_run(identifier)` — fire the `before_run` hook;
 ///    a failure aborts the dispatch with [`ReleaseReason::Completed`].
 /// 3. `agent.start_session(...)` — spawn the backend with the rendered
@@ -466,11 +467,11 @@ impl SymphonyDispatcher {
         cancel: CancellationToken,
     ) -> Result<ReleaseReason> {
         let identifier = issue.identifier.clone();
-        let Workspace { path, .. } = self
+        let WorkspaceClaim { path, .. } = self
             .workspace
-            .ensure(&identifier)
+            .claim(&identifier)
             .await
-            .with_context(|| format!("ensure workspace for {identifier}"))?;
+            .with_context(|| format!("claim workspace for {identifier}"))?;
         self.workspace
             .before_run(&identifier)
             .await

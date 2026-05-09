@@ -25,7 +25,7 @@
 //!    by a sandbox VM) without touching the orchestrator.
 //! 3. Each safety invariant from SPEC §9.5 has exactly one place where
 //!    it is enforced: inside the manager. The orchestrator only sees the
-//!    return value of [`WorkspaceManager::ensure`], which is by
+//!    return value of [`WorkspaceManager::claim`], which is by
 //!    construction a path inside the workspace root.
 
 use async_trait::async_trait;
@@ -182,23 +182,169 @@ pub enum WorkspaceError {
 /// Convenience alias matching the project-wide convention.
 pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 
-/// The handle [`WorkspaceManager::ensure`] returns to the orchestrator.
+/// The handle [`WorkspaceManager::claim`] returns to the orchestrator.
 ///
-/// Carries the absolute path the agent should run in plus a `created_now`
-/// flag. SPEC §9.2 requires `created_now` to drive the `after_create`
-/// hook firing decision: it must be true *only* when this call is the one
-/// that materialised the directory, never on subsequent reuse.
+/// SPEC v2 §5.8 (and the v1 §9.2 hook lifecycle it preserves) requires
+/// each per-issue dispatch to record more than just a directory: the
+/// workspace strategy in force, the base/branch refs the runner should
+/// later verify, the owning work item, the cleanup policy that controls
+/// terminal reclamation, and the verification report produced by the
+/// pre-launch safety checks. `created_now` is preserved because the
+/// `after_create` hook firing decision still depends on whether this
+/// call materialised the directory or found it already on disk.
+///
+/// This iteration introduces the *shape* — the fields. Subsequent
+/// checklist items (Phase 6) populate `strategy` from workflow config,
+/// derive `branch`/`base_ref` from `BranchPolicyConfig` templates, and
+/// run the cwd/branch/tree-clean checks that fill `verification`. Until
+/// then every claim returns the [`ClaimStrategy::Directory`] strategy
+/// with a [`VerificationStatus::Pending`] report — i.e. the v1 plain-
+/// directory behaviour, now wrapped in the v2 envelope so that callers
+/// (orchestrator, agents, tests) can be written against the target
+/// shape rather than rewritten when each strategy lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Workspace {
+pub struct WorkspaceClaim {
     /// Absolute path to the per-issue workspace directory.
     pub path: PathBuf,
-    /// True iff this call created the directory (vs. found it existing).
+    /// Workspace strategy this claim was provisioned under. Determines
+    /// later cleanup, branch verification, and integration semantics.
+    pub strategy: ClaimStrategy,
+    /// Base ref the strategy started from (e.g. `main`). `None` for
+    /// strategies that do not branch (`Directory`) or have not yet
+    /// been wired through to git.
+    pub base_ref: Option<String>,
+    /// Branch/ref the runner expects this workspace to be on at
+    /// agent-launch time. `None` for strategies without git semantics.
+    pub branch: Option<String>,
+    /// Work item that owns this claim. `None` when the claim was
+    /// minted before the orchestrator wired durable work items into
+    /// the dispatcher path.
+    pub owner: Option<ClaimOwner>,
+    /// Cleanup policy applied when the owning work item reaches a
+    /// terminal class. Mirrors `WorkspaceCleanupPolicy` in
+    /// `symphony-config`; duplicated here so this crate stays free of
+    /// a config dep.
+    pub cleanup: CleanupPolicy,
+    /// Outcome of pre-launch verification (cwd, branch, tree-clean).
+    /// Default is [`VerificationStatus::Pending`] until a verifier
+    /// from a later checklist item runs against the claim.
+    pub verification: VerificationReport,
+    /// True iff this call created the directory (vs. found it
+    /// existing). Drives the `after_create` hook firing decision.
     pub created_now: bool,
+}
+
+/// Workspace strategy in force for a [`WorkspaceClaim`].
+///
+/// Mirrors `WorkspaceStrategyKind` in `symphony-config` (SPEC v2 §5.8)
+/// without taking a config-crate dependency on this layer. The
+/// orchestrator translates from config to this enum at claim time;
+/// later checklist items add the `GitWorktree`/`ExistingWorktree`/
+/// `SharedBranch` claimers and remove the temporary
+/// [`Self::Directory`] fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimStrategy {
+    /// Plain directory under workspace root with no git semantics.
+    /// Default until per-strategy claimers land; equivalent to v1
+    /// behaviour.
+    #[default]
+    Directory,
+    /// Fresh per-issue git worktree on a branch derived from
+    /// `branch_template`.
+    GitWorktree,
+    /// Reuse a worktree already present on disk, optionally asserting
+    /// it is checked out on a required branch.
+    ExistingWorktree,
+    /// Multiple work items share one branch and worktree (typically
+    /// the integration owner's).
+    SharedBranch,
+}
+
+/// Cleanup policy stamped on a claim.
+///
+/// Mirrors `WorkspaceCleanupPolicy` in `symphony-config`; duplicated to
+/// keep `symphony-workspace` independent of the config crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupPolicy {
+    /// Retain on disk until the owning work item reaches a terminal
+    /// class, then reclaim. SPEC v2 §5.8 default.
+    #[default]
+    RetainUntilDone,
+    /// Remove as soon as the run completes.
+    RemoveAfterRun,
+    /// Never remove; operator owns cleanup. For shared/long-lived
+    /// integration worktrees.
+    RetainAlways,
+}
+
+/// Identifies which work item owns a claim.
+///
+/// Two-field shape keeps tracker identifiers (string keys like
+/// `ENG-42`) and durable row ids decoupled — the dispatcher knows the
+/// identifier before the work item is persisted, while later flow
+/// stages know both. Future checklist items (Phase 7) wire this onto
+/// the structured agent run request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClaimOwner {
+    /// Tracker-side identifier (sanitised input the manager hashes
+    /// into a directory name). Always present.
+    pub identifier: String,
+    /// Durable `WorkItemId` row id when the work item has been
+    /// persisted. `None` for early dispatch paths that have not yet
+    /// gone through `symphony-state`.
+    pub work_item_id: Option<i64>,
+}
+
+/// Outcome of pre-launch verification checks bundled onto a claim.
+///
+/// Default is [`VerificationStatus::Pending`] with an empty `checks`
+/// list — the data shape exists but no verifier runs against this
+/// crate yet. Subsequent Phase 6 items populate `checks` with cwd,
+/// branch, and clean-tree assertions and flip `status` to
+/// [`VerificationStatus::Passed`] / [`VerificationStatus::Failed`]
+/// before the orchestrator launches an agent against the claim.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerificationReport {
+    /// Aggregate status across `checks`. `Pending` until a verifier
+    /// runs.
+    pub status: VerificationStatus,
+    /// Individual checks the verifier performed, in declaration order.
+    pub checks: Vec<VerificationCheck>,
+}
+
+/// One verifier outcome inside a [`VerificationReport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerificationCheck {
+    /// Stable check name (e.g. `"cwd_in_workspace"`,
+    /// `"branch_matches_required"`). Used for log lines and tests.
+    pub name: String,
+    /// Per-check verdict.
+    pub status: VerificationStatus,
+    /// Optional human-readable detail, populated on `Failed` so an
+    /// operator tailing logs can diagnose without re-running.
+    pub detail: Option<String>,
+}
+
+/// Aggregate or per-check verdict on a [`VerificationReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum VerificationStatus {
+    /// No verification has run yet. Default for newly minted claims.
+    #[default]
+    Pending,
+    /// Verification did not apply (e.g. cwd-policy disabled, or no
+    /// branch policy declared for this strategy).
+    Skipped,
+    /// Every check declared on this report passed.
+    Passed,
+    /// At least one check declared on this report failed.
+    Failed,
 }
 
 /// Abstract per-issue workspace lifecycle.
 ///
-/// The orchestrator calls [`Self::ensure`] before launching an agent
+/// The orchestrator calls [`Self::claim`] before launching an agent
 /// session and [`Self::release`] when the issue reaches a terminal state.
 /// Implementations are responsible for SPEC §9.5's safety invariants —
 /// the orchestrator trusts whatever path comes back to be containment-
@@ -208,14 +354,21 @@ pub struct Workspace {
 /// `Arc<dyn WorkspaceManager>` and share it across poll-loop tasks.
 #[async_trait]
 pub trait WorkspaceManager: Send + Sync {
-    /// Ensure a workspace exists for `identifier` and return its handle.
+    /// Claim a workspace for `identifier` and return its handle.
     ///
     /// Idempotent: calling twice with the same identifier returns the
     /// same path; only the first call sets `created_now = true`. When
     /// `created_now` is true, implementations also fire the configured
     /// `after_create` hook before returning; a hook failure is fatal and
     /// the partially-created directory is rolled back.
-    async fn ensure(&self, identifier: &str) -> WorkspaceResult<Workspace>;
+    ///
+    /// Returns a [`WorkspaceClaim`] carrying path plus strategy/branch/
+    /// owner/cleanup/verification metadata. The
+    /// [`LocalFsWorkspace`] adapter populates `strategy =
+    /// ClaimStrategy::Directory`, `verification = Pending`, and leaves
+    /// branch/owner empty; subsequent checklist items add the
+    /// strategy-aware claimers and the verifier passes.
+    async fn claim(&self, identifier: &str) -> WorkspaceResult<WorkspaceClaim>;
 
     /// Fire the `before_run` hook against `identifier`'s workspace.
     ///
@@ -441,7 +594,7 @@ impl LocalFsWorkspace {
 
 #[async_trait]
 impl WorkspaceManager for LocalFsWorkspace {
-    async fn ensure(&self, identifier: &str) -> WorkspaceResult<Workspace> {
+    async fn claim(&self, identifier: &str) -> WorkspaceResult<WorkspaceClaim> {
         // Sanitise per SPEC §4.2, then reject the three "all-allowlisted
         // but still hostile" survivors (empty, `.`, `..`) before joining.
         let safe = Self::safe_component(identifier)?;
@@ -481,8 +634,14 @@ impl WorkspaceManager for LocalFsWorkspace {
             return Err(e);
         }
 
-        Ok(Workspace {
+        Ok(WorkspaceClaim {
             path,
+            strategy: ClaimStrategy::Directory,
+            base_ref: None,
+            branch: None,
+            owner: None,
+            cleanup: CleanupPolicy::default(),
+            verification: VerificationReport::default(),
             created_now: !existed,
         })
     }
@@ -589,7 +748,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let ws = mgr.ensure("ENG-42").await.unwrap();
+        let ws = mgr.claim("ENG-42").await.unwrap();
 
         assert!(ws.created_now, "first ensure should report created_now");
         assert!(ws.path.is_dir());
@@ -604,8 +763,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let first = mgr.ensure("ENG-42").await.unwrap();
-        let second = mgr.ensure("ENG-42").await.unwrap();
+        let first = mgr.claim("ENG-42").await.unwrap();
+        let second = mgr.claim("ENG-42").await.unwrap();
 
         assert_eq!(first.path, second.path);
         assert!(first.created_now);
@@ -619,7 +778,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let ws = mgr.ensure("ENG-42").await.unwrap();
+        let ws = mgr.claim("ENG-42").await.unwrap();
         assert!(ws.path.is_dir());
 
         mgr.release("ENG-42").await.unwrap();
@@ -697,7 +856,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let ws = mgr.ensure("../etc/passwd").await.unwrap();
+        let ws = mgr.claim("../etc/passwd").await.unwrap();
 
         // Sanitisation maps each disallowed char (`.`, `.`, `/`, …) — but
         // `.` is *allowed*, so only the `/` chars become `_`. The result
@@ -724,7 +883,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let ws = mgr.ensure("ORG/repo#7").await.unwrap();
+        let ws = mgr.claim("ORG/repo#7").await.unwrap();
         assert!(ws.path.is_dir());
         assert_eq!(ws.path.file_name().unwrap(), "ORG_repo_7");
 
@@ -741,7 +900,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let err = mgr.ensure("..").await.unwrap_err();
+        let err = mgr.claim("..").await.unwrap_err();
         assert!(
             matches!(err, WorkspaceError::InvalidRoot(_)),
             "expected InvalidRoot, got {err:?}"
@@ -756,7 +915,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let err = mgr.ensure(".").await.unwrap_err();
+        let err = mgr.claim(".").await.unwrap_err();
         assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
     }
 
@@ -768,7 +927,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
 
-        let err = mgr.ensure("").await.unwrap_err();
+        let err = mgr.claim("").await.unwrap_err();
         assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
     }
 
@@ -787,7 +946,7 @@ mod tests {
         // Fullwidth solidus, division slash, fraction slash, and an
         // RTL override embedded mid-identifier.
         for hostile in ["a／b", "a∕b", "a⁄b", "a\u{202E}b"] {
-            let ws = mgr.ensure(hostile).await.unwrap();
+            let ws = mgr.claim(hostile).await.unwrap();
             assert_eq!(
                 ws.path.parent().unwrap(),
                 mgr.root(),
@@ -818,7 +977,7 @@ mod tests {
         // through the symlink and detect the containment violation.
         symlink(outside.path(), mgr.root().join("escape")).unwrap();
 
-        let err = mgr.ensure("escape").await.unwrap_err();
+        let err = mgr.claim("escape").await.unwrap_err();
         assert!(
             matches!(err, WorkspaceError::InvalidRoot(_)),
             "expected InvalidRoot from symlink escape, got {err:?}"
@@ -855,7 +1014,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        let ws = mgr.ensure("ENG-1").await.unwrap();
+        let ws = mgr.claim("ENG-1").await.unwrap();
         assert!(ws.path.join("created.marker").exists());
     }
 
@@ -871,7 +1030,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        let err = mgr.ensure("ENG-1").await.unwrap_err();
+        let err = mgr.claim("ENG-1").await.unwrap_err();
         assert!(matches!(err, WorkspaceError::Hook(_)), "got {err:?}");
         assert!(
             !tmp.path().join("ENG-1").exists(),
@@ -895,8 +1054,8 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        mgr.ensure("ENG-1").await.unwrap();
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         let count = std::fs::read_to_string(tmp.path().join("ENG-1/count")).unwrap();
         assert_eq!(count.trim(), "1", "after_create must fire exactly once");
     }
@@ -915,7 +1074,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        let err = mgr.ensure("ENG-1").await.unwrap_err();
+        let err = mgr.claim("ENG-1").await.unwrap_err();
         match err {
             WorkspaceError::Hook(msg) => assert!(
                 msg.contains("timed out"),
@@ -937,7 +1096,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         let err = mgr.before_run("ENG-1").await.unwrap_err();
         assert!(matches!(err, WorkspaceError::Hook(_)), "got {err:?}");
     }
@@ -949,7 +1108,7 @@ mod tests {
     async fn before_run_with_no_hook_is_ok() {
         let tmp = TempDir::new().unwrap();
         let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         mgr.before_run("ENG-1").await.unwrap();
     }
 
@@ -981,7 +1140,7 @@ mod tests {
             ..Default::default()
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         mgr.after_run("ENG-1").await; // returns `()`, must not panic
     }
 
@@ -998,7 +1157,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        let ws = mgr.ensure("ENG-1").await.unwrap();
+        let ws = mgr.claim("ENG-1").await.unwrap();
         assert!(ws.path.is_dir());
         mgr.release("ENG-1").await.unwrap();
         assert!(!ws.path.exists(), "release must rmdir even when hook fails");
@@ -1029,7 +1188,7 @@ mod tests {
         assert!(!archive_dir.path().join("before-remove.marker").exists());
 
         // After ensure → release the hook fires exactly once.
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         mgr.release("ENG-1").await.unwrap();
         assert!(archive_dir.path().join("before-remove.marker").exists());
     }
@@ -1052,7 +1211,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        let err = mgr.ensure("ENG-1").await.unwrap_err();
+        let err = mgr.claim("ENG-1").await.unwrap_err();
         match &err {
             WorkspaceError::Hook(msg) => {
                 assert!(
@@ -1087,7 +1246,7 @@ mod tests {
         )
         .unwrap();
 
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         mgr.before_run("ENG-1").await.unwrap();
         mgr.after_run("ENG-1").await;
         mgr.release("ENG-1").await.unwrap();
@@ -1109,7 +1268,7 @@ mod tests {
         };
         let mgr = LocalFsWorkspace::with_hooks(tmp.path(), hooks).unwrap();
 
-        mgr.ensure("ENG-1").await.unwrap();
+        mgr.claim("ENG-1").await.unwrap();
         mgr.after_run("ENG-1").await;
         assert!(
             marker.exists(),
@@ -1202,7 +1361,92 @@ mod tests {
         let mgr: std::sync::Arc<dyn WorkspaceManager> =
             std::sync::Arc::new(LocalFsWorkspace::new(tmp.path()).unwrap());
 
-        let ws = mgr.ensure("ENG-1").await.unwrap();
+        let ws = mgr.claim("ENG-1").await.unwrap();
         assert!(ws.created_now);
+    }
+
+    // ----- WorkspaceClaim shape (Phase 6) --------------------------------
+
+    /// Phase 6 step 1: every claim must surface the v2 envelope —
+    /// strategy, base ref, branch, owner, cleanup policy, and
+    /// verification report — even when the per-strategy claimers have
+    /// not yet landed. The defaults pin the "v1 baseline wrapped in v2
+    /// shape" contract: `Directory` strategy, no branch info, default
+    /// cleanup, and a `Pending` verification report. Subsequent
+    /// checklist items override these as each strategy/verifier comes
+    /// online; this test fails loudly when one of them silently
+    /// regresses the default.
+    #[tokio::test]
+    async fn claim_returns_v2_envelope_with_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = LocalFsWorkspace::new(tmp.path()).unwrap();
+
+        let claim = mgr.claim("ENG-7").await.unwrap();
+
+        assert!(claim.path.is_dir());
+        assert!(claim.path.starts_with(mgr.root()));
+        assert_eq!(claim.strategy, ClaimStrategy::Directory);
+        assert_eq!(claim.base_ref, None);
+        assert_eq!(claim.branch, None);
+        assert_eq!(claim.owner, None);
+        assert_eq!(claim.cleanup, CleanupPolicy::RetainUntilDone);
+        assert_eq!(claim.verification.status, VerificationStatus::Pending);
+        assert!(
+            claim.verification.checks.is_empty(),
+            "verification.checks should start empty until a verifier runs",
+        );
+        assert!(claim.created_now);
+    }
+
+    /// `WorkspaceClaim` is a plain data struct: assigning a richer
+    /// strategy/branch/owner is what the strategy-aware claimers in
+    /// later checklist items will do, so the shape must round-trip
+    /// every populated field. This test pins the field set as a
+    /// regression guard for the v2 envelope.
+    #[test]
+    fn workspace_claim_carries_every_v2_field() {
+        let claim = WorkspaceClaim {
+            path: PathBuf::from("/tmp/symphony/ENG-7"),
+            strategy: ClaimStrategy::GitWorktree,
+            base_ref: Some("main".into()),
+            branch: Some("symphony/ENG-7".into()),
+            owner: Some(ClaimOwner {
+                identifier: "ENG-7".into(),
+                work_item_id: Some(42),
+            }),
+            cleanup: CleanupPolicy::RemoveAfterRun,
+            verification: VerificationReport {
+                status: VerificationStatus::Passed,
+                checks: vec![VerificationCheck {
+                    name: "cwd_in_workspace".into(),
+                    status: VerificationStatus::Passed,
+                    detail: None,
+                }],
+            },
+            created_now: true,
+        };
+
+        assert_eq!(claim.strategy, ClaimStrategy::GitWorktree);
+        assert_eq!(claim.base_ref.as_deref(), Some("main"));
+        assert_eq!(claim.branch.as_deref(), Some("symphony/ENG-7"));
+        let owner = claim.owner.as_ref().expect("owner");
+        assert_eq!(owner.identifier, "ENG-7");
+        assert_eq!(owner.work_item_id, Some(42));
+        assert_eq!(claim.cleanup, CleanupPolicy::RemoveAfterRun);
+        assert_eq!(claim.verification.status, VerificationStatus::Passed);
+        assert_eq!(claim.verification.checks.len(), 1);
+        assert_eq!(claim.verification.checks[0].name, "cwd_in_workspace");
+    }
+
+    /// Defaults document the "no work has been done yet" state of a
+    /// verification report. Pinning them here means a future
+    /// reorganisation that flipped `Pending` to e.g. `Skipped` would
+    /// fail this test loudly rather than quietly mark every claim as
+    /// already-verified.
+    #[test]
+    fn verification_report_defaults_to_pending() {
+        let report = VerificationReport::default();
+        assert_eq!(report.status, VerificationStatus::Pending);
+        assert!(report.checks.is_empty());
     }
 }
