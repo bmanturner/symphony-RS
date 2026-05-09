@@ -314,6 +314,63 @@ impl LeaseHeartbeat {
     }
 }
 
+/// Typed outcome of a single heartbeat pulse, for runners that prefer a
+/// flat enum over the `Result<LeaseAcquireOutcome, RunLeaseError>` shape
+/// returned by [`LeaseHeartbeat::pulse`].
+///
+/// This is the renewal-time analogue of [`LeaseAcquireOutcome`]: it folds
+/// the backend-error case into a fourth variant so the runner can match
+/// once and surface the result as a typed in-flight observation rather
+/// than threading `Result` through every dispatch path. See
+/// CHECKLIST_v2 Phase 11 (heartbeat-wiring scaffolding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatPulseObservation {
+    /// Lease was successfully renewed; `last_expires_at` advanced.
+    Renewed,
+    /// Another owner now holds the lease.
+    Contended {
+        /// Canonical [`LeaseOwner`] string of the current holder.
+        holder: String,
+        /// RFC3339 string of the contending lease's expiration.
+        expires_at: String,
+    },
+    /// The run row no longer exists in the durable store.
+    NotFound,
+    /// The lease-store backend errored during the pulse.
+    BackendError {
+        /// Human-readable error message from the backend.
+        message: String,
+    },
+}
+
+impl HeartbeatPulseObservation {
+    /// True when the heartbeat successfully renewed its lease.
+    pub fn is_renewed(&self) -> bool {
+        matches!(self, Self::Renewed)
+    }
+}
+
+/// Map a [`LeaseHeartbeat::pulse`] call onto a single [`HeartbeatPulseObservation`].
+///
+/// This is the adapter runners call from their pulse cadence: it folds
+/// the backend-error case into the typed outcome so callers can match
+/// once and emit a runner observation, rather than threading
+/// `Result<LeaseAcquireOutcome, RunLeaseError>` through dispatch code.
+pub async fn pulse_observed(
+    heartbeat: &mut LeaseHeartbeat,
+    clock: &dyn LeaseClock,
+    ttl_ms: u64,
+) -> HeartbeatPulseObservation {
+    match heartbeat.pulse(clock, ttl_ms).await {
+        Ok(LeaseAcquireOutcome::Acquired) => HeartbeatPulseObservation::Renewed,
+        Ok(LeaseAcquireOutcome::Contended { holder, expires_at }) => {
+            HeartbeatPulseObservation::Contended { holder, expires_at }
+        }
+        Ok(LeaseAcquireOutcome::NotFound) => HeartbeatPulseObservation::NotFound,
+        Err(RunLeaseError::Backend(message)) => HeartbeatPulseObservation::BackendError { message },
+    }
+}
+
 /// Deterministic in-memory [`RunLeaseStore`] for tests.
 ///
 /// Backed by a `tokio::sync::Mutex<HashMap>` so behaviour matches the
@@ -849,6 +906,92 @@ mod tests {
         store.fail_next("disk full").await;
         let err = hb.pulse(&clock, 60_000).await.unwrap_err();
         assert!(matches!(err, RunLeaseError::Backend(msg) if msg == "disk full"));
+        assert_eq!(hb.last_expires_at(), recorded);
+    }
+
+    // ---- pulse_observed adapter -----------------------------------------
+
+    #[tokio::test]
+    async fn pulse_observed_returns_renewed_on_acquired() {
+        let early = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (store, mut hb) = seed_heartbeat(&early, 60_000, 15_000).await;
+        let original_expiry = hb.last_expires_at().to_string();
+
+        let later = FixedLeaseClock::new("2026-01-01T00:00:50Z");
+        let observation = pulse_observed(&mut hb, &later, 60_000).await;
+        assert_eq!(observation, HeartbeatPulseObservation::Renewed);
+        assert!(observation.is_renewed());
+
+        // Recorded expiry advanced and the store reflects the renewal.
+        assert!(hb.last_expires_at() > original_expiry.as_str());
+        let snap = store.snapshot(RunRef::new(1)).await.unwrap();
+        assert_eq!(snap.1, hb.last_expires_at());
+    }
+
+    #[tokio::test]
+    async fn pulse_observed_returns_contended_when_other_owner_holds_lease() {
+        let acquire_clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (store, mut hb) = seed_heartbeat(&acquire_clock, 60_000, 15_000).await;
+        let recorded = hb.last_expires_at().to_string();
+
+        // Hand the lease to a different owner with a far-future expiry.
+        let intruder_ts = FixedLeaseClock::new("2030-01-01T00:00:00Z").timestamps(60_000);
+        store.release(RunRef::new(1)).await.unwrap();
+        let outcome = store
+            .acquire(
+                RunRef::new(1),
+                &owner(1),
+                &intruder_ts.expires_at,
+                &intruder_ts.now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::Acquired);
+
+        let pulse_clock = FixedLeaseClock::new("2026-01-01T00:00:30Z");
+        let observation = pulse_observed(&mut hb, &pulse_clock, 60_000).await;
+        match observation {
+            HeartbeatPulseObservation::Contended { holder, expires_at } => {
+                assert_eq!(holder, owner(1).to_string());
+                assert_eq!(expires_at, intruder_ts.expires_at);
+            }
+            other => panic!("expected Contended, got {other:?}"),
+        }
+        // Recorded expiry untouched on contention.
+        assert_eq!(hb.last_expires_at(), recorded);
+    }
+
+    #[tokio::test]
+    async fn pulse_observed_returns_not_found_when_run_row_missing() {
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        // No `register_run` — the run row is absent.
+        let mut hb = LeaseHeartbeat::new(
+            store.clone(),
+            RunRef::new(1),
+            owner(0),
+            "2026-01-01T00:01:00Z",
+            15_000,
+        );
+        let recorded = hb.last_expires_at().to_string();
+        let pulse_clock = FixedLeaseClock::new("2026-01-01T00:00:30Z");
+        let observation = pulse_observed(&mut hb, &pulse_clock, 60_000).await;
+        assert_eq!(observation, HeartbeatPulseObservation::NotFound);
+        assert_eq!(hb.last_expires_at(), recorded);
+    }
+
+    #[tokio::test]
+    async fn pulse_observed_folds_backend_error_into_typed_observation() {
+        let clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let (store, mut hb) = seed_heartbeat(&clock, 60_000, 15_000).await;
+        let recorded = hb.last_expires_at().to_string();
+        store.fail_next("disk full").await;
+        let observation = pulse_observed(&mut hb, &clock, 60_000).await;
+        assert_eq!(
+            observation,
+            HeartbeatPulseObservation::BackendError {
+                message: "disk full".to_string(),
+            }
+        );
         assert_eq!(hb.last_expires_at(), recorded);
     }
 
