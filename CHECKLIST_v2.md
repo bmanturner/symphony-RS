@@ -46,7 +46,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add `QaVerdict`, `QaEvidence`, and acceptance-criteria trace types.
 - [x] Add `FollowupIssueRequest` and `FollowupPolicy` types.
 - [x] Add `IntegrationRecord` for canonical branch/worktree consolidation.
-- [ ] Add serialization tests for all public domain types.
+- [x] Add serialization tests for all public domain types.
 
 ## Phase 4 — Tracker Capabilities
 
