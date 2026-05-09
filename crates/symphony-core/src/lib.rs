@@ -11,6 +11,7 @@
 //! normalized `Issue` model and the `AgentEvent` enum (defined in later
 //! phases).
 
+pub mod advisory;
 pub mod agent;
 pub mod blocker;
 pub mod event_bus;
@@ -27,6 +28,7 @@ pub mod tracker;
 pub mod tracker_trait;
 pub mod work_item;
 
+pub use advisory::{AdvisoryMutations, AdvisoryRecord};
 pub use agent::{
     AgentControl, AgentError, AgentEvent, AgentEventStream, AgentResult, AgentRunner, AgentSession,
     CompletionReason, RateLimitSnapshot, SessionId, StartSessionParams, ThreadId, TokenUsage,
