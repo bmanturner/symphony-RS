@@ -29,6 +29,23 @@
 //! The two readiness causes are surfaced separately as
 //! [`IntegrationQueueCause`] so the scheduler can record *why* an item
 //! entered the queue when emitting events.
+//!
+//! ## Gate waivers
+//!
+//! Both readiness gates correspond to the workflow-level switches
+//! `IntegrationConfig.require_all_children_terminal` and
+//! `IntegrationConfig.require_no_open_blockers` from SPEC v2 §5.10. The
+//! defaults match the SPEC: both gates *on*. A workflow may explicitly
+//! waive either gate by passing an [`IntegrationQueueGates`] value to
+//! [`IntegrationQueueRepository::list_ready_for_integration_with_gates`].
+//! When the children-terminal gate is waived, the queue surfaces parents
+//! that decompose into one or more children regardless of whether all
+//! children have reached a terminal status — the integration owner is
+//! then trusted to consolidate whatever has landed. When the blocker
+//! gate is waived, the queue stops excluding parents whose subtree has
+//! open `blocks` edges. The legacy
+//! [`IntegrationQueueRepository::list_ready_for_integration`] keeps the
+//! both-gates-on behavior so existing callers do not change.
 
 use rusqlite::Connection;
 
@@ -74,22 +91,101 @@ impl IntegrationQueueEntry {
     }
 }
 
+/// Workflow-level gate switches that decide which parents the queue
+/// surfaces (SPEC v2 §5.10).
+///
+/// Defaults match the SPEC: both gates *on* — children must be terminal
+/// and the subtree must have no open blockers. A workflow may waive
+/// either gate by setting the corresponding field to `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrationQueueGates {
+    /// When `true` (default), parents with non-terminal children are
+    /// hidden from the decomposed-cause source. When `false`, the gate
+    /// is waived and decomposed parents surface as soon as they have at
+    /// least one `parent_child` edge.
+    pub require_all_children_terminal: bool,
+    /// When `true` (default), any open `blocks` edge anywhere in the
+    /// parent's subtree excludes the parent from the queue. When
+    /// `false`, the gate is waived and the blocker-subtree check is
+    /// skipped.
+    pub require_no_open_blockers: bool,
+}
+
+impl Default for IntegrationQueueGates {
+    fn default() -> Self {
+        Self {
+            require_all_children_terminal: true,
+            require_no_open_blockers: true,
+        }
+    }
+}
+
 /// Read-only view over [`integration queue`](self) candidates.
 pub trait IntegrationQueueRepository {
-    /// Return every work item currently ready for the integration owner,
-    /// ordered FIFO by `created_at` then `id` for determinism.
-    fn list_ready_for_integration(&self) -> StateResult<Vec<IntegrationQueueEntry>>;
+    /// Return every work item currently ready for the integration owner
+    /// under the SPEC defaults (both gates on), ordered FIFO by
+    /// `created_at` then `id` for determinism.
+    fn list_ready_for_integration(&self) -> StateResult<Vec<IntegrationQueueEntry>> {
+        self.list_ready_for_integration_with_gates(IntegrationQueueGates::default())
+    }
+
+    /// Return every work item ready for the integration owner under the
+    /// supplied [`IntegrationQueueGates`]. Workflows pass a non-default
+    /// value to explicitly waive the children-terminal or open-blocker
+    /// gate.
+    fn list_ready_for_integration_with_gates(
+        &self,
+        gates: IntegrationQueueGates,
+    ) -> StateResult<Vec<IntegrationQueueEntry>>;
 }
 
 const TERMINAL_CLASSES: &str = "('done','cancelled')";
 
 pub(crate) fn list_ready_for_integration_in(
     conn: &Connection,
+    gates: IntegrationQueueGates,
 ) -> StateResult<Vec<IntegrationQueueEntry>> {
     // Two sources, unioned with their cause label, then filtered by the
     // open-blocker subtree exclusion. The recursive CTE walks
     // `parent_child` descendants of each candidate parent (inclusive)
-    // and counts open `blocks` edges; non-zero counts are dropped.
+    // and counts open `blocks` edges; non-zero counts are dropped. Each
+    // gate filter is conditionally elided when the workflow has waived
+    // the corresponding gate via `IntegrationQueueGates`.
+    let children_terminal_filter = if gates.require_all_children_terminal {
+        format!(
+            "AND NOT EXISTS ( \
+                 SELECT 1 \
+                   FROM work_item_edges e \
+                   JOIN work_items c ON c.id = e.child_id \
+                  WHERE e.parent_id = w.id \
+                    AND e.edge_type = 'parent_child' \
+                    AND c.status_class NOT IN {terminal} \
+             )",
+            terminal = TERMINAL_CLASSES,
+        )
+    } else {
+        String::new()
+    };
+    let blocker_filter = if gates.require_no_open_blockers {
+        "AND NOT EXISTS ( \
+             WITH RECURSIVE descendants(id) AS ( \
+                 SELECT w.id \
+                 UNION \
+                 SELECT e.child_id \
+                   FROM work_item_edges e \
+                   JOIN descendants d ON e.parent_id = d.id \
+                  WHERE e.edge_type = 'parent_child' \
+             ) \
+             SELECT 1 \
+               FROM work_item_edges b \
+              WHERE b.edge_type = 'blocks' \
+                AND b.status = 'open' \
+                AND b.child_id IN (SELECT id FROM descendants) \
+         )"
+        .to_string()
+    } else {
+        String::new()
+    };
     let sql = format!(
         "WITH \
          direct AS ( \
@@ -106,14 +202,7 @@ pub(crate) fn list_ready_for_integration_in(
                       FROM work_item_edges e \
                      WHERE e.edge_type = 'parent_child' \
                 ) \
-                AND NOT EXISTS ( \
-                    SELECT 1 \
-                      FROM work_item_edges e \
-                      JOIN work_items c ON c.id = e.child_id \
-                     WHERE e.parent_id = w.id \
-                       AND e.edge_type = 'parent_child' \
-                       AND c.status_class NOT IN {terminal} \
-                ) \
+                {children_terminal_filter} \
          ), \
          candidates AS ( \
              SELECT parent_id, cause FROM direct \
@@ -125,21 +214,7 @@ pub(crate) fn list_ready_for_integration_in(
            FROM candidates c \
            JOIN work_items w ON w.id = c.parent_id \
           WHERE w.status_class NOT IN {terminal} \
-            AND NOT EXISTS ( \
-                WITH RECURSIVE descendants(id) AS ( \
-                    SELECT w.id \
-                    UNION \
-                    SELECT e.child_id \
-                      FROM work_item_edges e \
-                      JOIN descendants d ON e.parent_id = d.id \
-                     WHERE e.edge_type = 'parent_child' \
-                ) \
-                SELECT 1 \
-                  FROM work_item_edges b \
-                 WHERE b.edge_type = 'blocks' \
-                   AND b.status = 'open' \
-                   AND b.child_id IN (SELECT id FROM descendants) \
-            ) \
+            {blocker_filter} \
           ORDER BY w.created_at ASC, w.id ASC",
         cols = prefixed_columns("w"),
         terminal = TERMINAL_CLASSES,
@@ -177,8 +252,11 @@ fn prefixed_columns(prefix: &str) -> String {
 }
 
 impl IntegrationQueueRepository for StateDb {
-    fn list_ready_for_integration(&self) -> StateResult<Vec<IntegrationQueueEntry>> {
-        list_ready_for_integration_in(self.conn())
+    fn list_ready_for_integration_with_gates(
+        &self,
+        gates: IntegrationQueueGates,
+    ) -> StateResult<Vec<IntegrationQueueEntry>> {
+        list_ready_for_integration_in(self.conn(), gates)
     }
 }
 
@@ -378,6 +456,93 @@ mod tests {
         let mut db = open();
         seed_item(&mut db, "ENG-1", "running", "2026-05-08T00:00:00Z");
         assert!(db.list_ready_for_integration().unwrap().is_empty());
+    }
+
+    #[test]
+    fn waived_children_terminal_gate_surfaces_parent_with_unfinished_child() {
+        let mut db = open();
+        let parent = seed_item(&mut db, "ENG-1", "running", "2026-05-08T00:00:00Z");
+        let c1 = seed_item(&mut db, "ENG-2", "done", "2026-05-08T00:00:01Z");
+        let c2 = seed_item(&mut db, "ENG-3", "running", "2026-05-08T00:00:02Z");
+        link_parent_child(&mut db, parent, c1);
+        link_parent_child(&mut db, parent, c2);
+
+        // Default gates: parent is hidden because ENG-3 is still running.
+        assert!(db.list_ready_for_integration().unwrap().is_empty());
+
+        // Waiver: workflow opts out of the children-terminal gate.
+        let waived = IntegrationQueueGates {
+            require_all_children_terminal: false,
+            require_no_open_blockers: true,
+        };
+        let queue = db.list_ready_for_integration_with_gates(waived).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id(), parent);
+        assert_eq!(queue[0].cause, IntegrationQueueCause::AllChildrenTerminal);
+    }
+
+    #[test]
+    fn waived_blocker_gate_surfaces_parent_with_open_blocker() {
+        let mut db = open();
+        let parent = seed_item(&mut db, "ENG-1", "integration", "2026-05-08T00:00:00Z");
+        let blocker = seed_item(&mut db, "ENG-9", "blocked", "2026-05-08T00:00:05Z");
+        open_blocker(&mut db, blocker, parent);
+
+        // Default gates: parent is hidden because the subtree has an open blocker.
+        assert!(db.list_ready_for_integration().unwrap().is_empty());
+
+        // Waiver: workflow opts out of the open-blocker gate.
+        let waived = IntegrationQueueGates {
+            require_all_children_terminal: true,
+            require_no_open_blockers: false,
+        };
+        let queue = db.list_ready_for_integration_with_gates(waived).unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id(), parent);
+        assert_eq!(
+            queue[0].cause,
+            IntegrationQueueCause::DirectIntegrationRequest
+        );
+    }
+
+    #[test]
+    fn waiving_only_one_gate_does_not_waive_the_other() {
+        let mut db = open();
+        // Parent has a non-terminal child AND an open blocker on the child.
+        let parent = seed_item(&mut db, "ENG-1", "running", "2026-05-08T00:00:00Z");
+        let child = seed_item(&mut db, "ENG-2", "running", "2026-05-08T00:00:01Z");
+        link_parent_child(&mut db, parent, child);
+        let blocker = seed_item(&mut db, "ENG-9", "blocked", "2026-05-08T00:00:02Z");
+        open_blocker(&mut db, blocker, child);
+
+        // Waive only the children-terminal gate; the blocker still excludes.
+        let waived = IntegrationQueueGates {
+            require_all_children_terminal: false,
+            require_no_open_blockers: true,
+        };
+        assert!(
+            db.list_ready_for_integration_with_gates(waived)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Waive both: now the parent surfaces.
+        let waived_both = IntegrationQueueGates {
+            require_all_children_terminal: false,
+            require_no_open_blockers: false,
+        };
+        let queue = db
+            .list_ready_for_integration_with_gates(waived_both)
+            .unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id(), parent);
+    }
+
+    #[test]
+    fn default_gates_match_spec() {
+        let gates = IntegrationQueueGates::default();
+        assert!(gates.require_all_children_terminal);
+        assert!(gates.require_no_open_blockers);
     }
 
     #[test]
