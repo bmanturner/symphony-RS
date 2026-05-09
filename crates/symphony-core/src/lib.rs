@@ -14,6 +14,7 @@
 pub mod advisory;
 pub mod agent;
 pub mod blocker;
+pub mod blocker_gate;
 pub mod decomposition;
 pub mod decomposition_applier;
 pub mod decomposition_runner;
@@ -44,6 +45,9 @@ pub use agent::{
 };
 pub use blocker::{
     Blocker, BlockerError, BlockerId, BlockerOrigin, BlockerSeverity, BlockerStatus, RunRef,
+};
+pub use blocker_gate::{
+    BlockerGateError, GateOperation, OpenBlockerSnapshot, check_no_open_blockers, collect_open,
 };
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
