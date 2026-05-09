@@ -12,6 +12,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod migrations;
+
 use std::path::Path;
 
 use rusqlite::Connection;
