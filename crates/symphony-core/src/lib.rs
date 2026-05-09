@@ -21,6 +21,7 @@ pub mod decomposition_runner;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
+pub mod followup_policy;
 pub mod followup_request;
 pub mod followup_routing;
 pub mod handoff;
@@ -72,6 +73,9 @@ pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use followup::{
     FollowupError, FollowupId, FollowupIssueRequest, FollowupLink, FollowupPolicy, FollowupStatus,
+};
+pub use followup_policy::{
+    BlockingFollowupGateError, BlockingFollowupSnapshot, check_blocking_followups_at_parent_close,
 };
 pub use followup_request::{
     FollowupRequestError, FollowupRequestInput, FollowupSpec, derive_followups,

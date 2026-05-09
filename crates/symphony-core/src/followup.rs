@@ -433,6 +433,26 @@ impl FollowupIssueRequest {
         self.blocking && !self.status.is_terminal()
     }
 
+    /// True when the follow-up still gates parent-close acceptance under
+    /// SPEC §4.10 / §8.1's "blocking follow-ups invalidate acceptance"
+    /// rule. A blocking follow-up gates close while it sits in the
+    /// approval pipeline (`Proposed` or `Approved`) and once it has been
+    /// `Created` (the spawned tracker work item must complete in its own
+    /// right — which the parent-close child gate enforces separately).
+    /// Sticky-terminal `Rejected` and `Cancelled` follow-ups never gate
+    /// because the operator/agent has dismissed the gate explicitly.
+    ///
+    /// Non-blocking follow-ups always return `false`: SPEC §4.10
+    /// distinguishes the two precisely so adjacent findings don't bottle
+    /// up parent acceptance.
+    pub fn is_acceptance_gating(&self) -> bool {
+        self.blocking
+            && !matches!(
+                self.status,
+                FollowupStatus::Rejected | FollowupStatus::Cancelled
+            )
+    }
+
     /// Approve a [`FollowupStatus::Proposed`] request, recording the
     /// approving role and note. Transitions to [`FollowupStatus::Approved`].
     pub fn approve(
@@ -881,6 +901,68 @@ mod tests {
         assert!(!g.is_blocking_gate());
         g.cancel(None).unwrap();
         assert!(!g.is_blocking_gate());
+    }
+
+    #[test]
+    fn is_acceptance_gating_distinguishes_blocking_from_non_blocking() {
+        // Non-blocking follow-up never gates parent close, regardless of
+        // status — this is the SPEC §4.10 distinction in action.
+        let mut non_blocking = proposed_followup();
+        assert!(!non_blocking.blocking);
+        for _ in 0..1 {
+            assert!(!non_blocking.is_acceptance_gating());
+        }
+        non_blocking
+            .approve(RoleName::new("platform_lead"), "ok")
+            .unwrap();
+        assert!(!non_blocking.is_acceptance_gating());
+        non_blocking.mark_created(WorkItemId::new(77)).unwrap();
+        assert!(!non_blocking.is_acceptance_gating());
+    }
+
+    #[test]
+    fn is_acceptance_gating_blocking_followup_gates_through_creation() {
+        // Blocking + Approved (direct policy initial status) gates.
+        let mut f = direct_followup();
+        assert!(f.blocking);
+        assert!(f.is_acceptance_gating());
+        // Blocking + Created still gates: the spawned tracker work item
+        // must complete in its own right; the parent-close child gate
+        // catches that separately.
+        f.mark_created(WorkItemId::new(99)).unwrap();
+        assert_eq!(f.status, FollowupStatus::Created);
+        assert!(f.is_acceptance_gating());
+    }
+
+    #[test]
+    fn is_acceptance_gating_blocking_proposed_gates_until_resolved() {
+        let mut f = FollowupIssueRequest::try_new(
+            FollowupId::new(10),
+            WorkItemId::new(42),
+            "blocking proposal",
+            "agent flagged invalidating finding",
+            "scope",
+            vec!["ac".into()],
+            true,
+            FollowupPolicy::ProposeForApproval,
+            run_origin(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(f.status, FollowupStatus::Proposed);
+        assert!(f.is_acceptance_gating());
+
+        // Reject is sticky-terminal and explicitly dismisses the gate.
+        let mut rejected = f.clone();
+        rejected
+            .reject(RoleName::new("platform_lead"), "duplicate")
+            .unwrap();
+        assert!(!rejected.is_acceptance_gating());
+
+        // Cancelled is sticky-terminal and also dismisses the gate.
+        f.cancel(Some("scope folded into source item".into()))
+            .unwrap();
+        assert!(!f.is_acceptance_gating());
     }
 
     #[test]
