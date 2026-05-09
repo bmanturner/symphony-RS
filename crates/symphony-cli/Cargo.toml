@@ -15,6 +15,7 @@ symphony-core = { path = "../symphony-core" }
 symphony-config = { path = "../symphony-config" }
 symphony-tracker = { path = "../symphony-tracker" }
 symphony-agent = { path = "../symphony-agent" }
+symphony-state = { path = "../symphony-state" }
 symphony-workspace = { path = "../symphony-workspace" }
 
 anyhow.workspace = true

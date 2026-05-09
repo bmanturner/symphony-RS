@@ -3698,6 +3698,7 @@ dependencies = [
  "symphony-agent",
  "symphony-config",
  "symphony-core",
+ "symphony-state",
  "symphony-tracker",
  "symphony-workspace",
  "tempfile",

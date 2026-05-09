@@ -106,6 +106,14 @@ pub struct StatusArgs {
     /// rule [`symphony_config::LayeredLoader`] uses at runtime.
     #[arg(value_name = "PATH", default_value = "WORKFLOW.md")]
     pub path: PathBuf,
+
+    /// Optional path to the durable state SQLite database. When
+    /// provided, `status` augments the active-issue table with the
+    /// latest persisted handoff envelope per work item (SPEC v2 §4.7).
+    /// Omitted by default so a stock `symphony status` keeps its
+    /// tracker-only snapshot semantics.
+    #[arg(long = "state-db", value_name = "PATH")]
+    pub state_db: Option<PathBuf>,
 }
 
 /// Arguments for `symphony run`.

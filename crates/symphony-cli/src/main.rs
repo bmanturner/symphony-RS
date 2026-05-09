@@ -100,7 +100,7 @@ fn main() -> anyhow::Result<ExitCode> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let outcome = runtime.block_on(status::run(&args.path));
+            let outcome = runtime.block_on(status::run(&args.path, args.state_db.as_deref()));
             let code = status::render(&outcome);
             Ok(ExitCode::from(code as u8))
         }
