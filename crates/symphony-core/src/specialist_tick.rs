@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::blocker::RunRef;
 use crate::intake_tick::ActiveSetStore;
 use crate::logical_queue::{LogicalQueue, QueueTickOutcome};
 use crate::queue_tick::{QueueTick, QueueTickCadence};
@@ -52,6 +53,14 @@ pub struct SpecialistDispatchRequest {
     /// Index of the matching rule in [`RoutingEngine`]'s table, when a
     /// rule actually matched. `None` for `default_role` fall-through.
     pub rule_index: Option<usize>,
+    /// Durable `runs.id` row this dispatch corresponds to, when the
+    /// scheduler created the run row before enqueueing. `None` when the
+    /// emitter has not yet reserved a run row (e.g. ticks running ahead
+    /// of state-backed wiring); runners with leasing configured will
+    /// skip lease acquisition for those requests rather than fabricate
+    /// an id. See `SpecialistRunner::with_leasing`.
+    #[serde(default)]
+    pub run_id: Option<RunRef>,
 }
 
 /// Shared FIFO of pending [`SpecialistDispatchRequest`]s.
@@ -254,6 +263,7 @@ impl QueueTick for SpecialistQueueTick {
                                 identifier: issue.identifier.clone(),
                                 role,
                                 rule_index,
+                                run_id: None,
                             });
                             self.claimed
                                 .lock()
@@ -647,12 +657,14 @@ mod tests {
             identifier: "ENG-1".into(),
             role: RoleName::from("frontend"),
             rule_index: Some(0),
+            run_id: None,
         });
         q.enqueue(SpecialistDispatchRequest {
             issue_id: "2".into(),
             identifier: "ENG-2".into(),
             role: RoleName::from("backend"),
             rule_index: Some(1),
+            run_id: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();

@@ -139,7 +139,9 @@ pub use integration_tick::{
     IntegrationCandidate, IntegrationDispatchQueue, IntegrationDispatchRequest,
     IntegrationQueueError, IntegrationQueueSource, IntegrationQueueTick,
 };
-pub use lease::{LeaseOwner, LeaseOwnerParseError};
+pub use lease::{
+    FixedLeaseClock, LeaseClock, LeaseConfig, LeaseOwner, LeaseOwnerParseError, LeaseTimestamps,
+};
 pub use logical_queue::{LogicalQueue, QueueTickOutcome};
 pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};

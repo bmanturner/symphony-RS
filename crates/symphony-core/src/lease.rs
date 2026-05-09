@@ -167,6 +167,93 @@ fn validate_component(field: &'static str, value: &str) -> Result<(), LeaseOwner
     Ok(())
 }
 
+/// Kernel-side mirror of `symphony_config::LeaseConfig`.
+///
+/// The runners in this crate cannot depend on `symphony-config` (the
+/// kernel must remain a leaf node of the workspace dependency graph), so
+/// the lease tuning the runners actually consume is captured here. The
+/// scheduler builder in `symphony-cli` translates the parsed config into
+/// this struct at construction time.
+///
+/// `default_ttl_ms` is the wall-clock TTL written to
+/// `runs.lease_expires_at` when a runner first acquires a lease.
+/// `renewal_margin_ms` is the slack a heartbeating runner uses to
+/// refresh its lease *before* expiry; it MUST be strictly less than
+/// `default_ttl_ms` so renewals win the race against reaping. The
+/// caller is responsible for enforcing that invariant — the kernel
+/// just records the values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseConfig {
+    /// Default lease TTL (ms) written to `runs.lease_expires_at` on
+    /// acquisition. Default: `60_000` (one minute).
+    pub default_ttl_ms: u64,
+    /// How far before TTL expiry (ms) a runner should attempt to renew
+    /// its lease. Default: `15_000` (renew at ~75% of the default TTL).
+    pub renewal_margin_ms: u64,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_ms: 60_000,
+            renewal_margin_ms: 15_000,
+        }
+    }
+}
+
+/// Pair of RFC3339 timestamps used by [`crate::run_lease::RunLeaseStore::acquire`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseTimestamps {
+    /// Caller's "now" — passed to the store for expired-takeover
+    /// comparisons.
+    pub now: String,
+    /// `now + ttl`, written to `runs.lease_expires_at`.
+    pub expires_at: String,
+}
+
+/// Clock used by runners to derive the `(now, expires_at)` pair fed
+/// into [`crate::run_lease::RunLeaseStore::acquire`].
+///
+/// The kernel intentionally avoids pulling in `chrono`/`time`, so the
+/// production clock is supplied by the composition root. Tests use the
+/// in-crate [`FixedLeaseClock`] for determinism.
+pub trait LeaseClock: Send + Sync {
+    /// Compute `(now, expires_at)` for a freshly attempted acquisition
+    /// where the caller wants the lease to expire `ttl_ms` from now.
+    fn timestamps(&self, ttl_ms: u64) -> LeaseTimestamps;
+}
+
+/// Deterministic [`LeaseClock`] returning a fixed `now` and computing
+/// `expires_at` by appending `+<ttl_ms>ms` to the canonical wire form.
+///
+/// The append-suffix form preserves lexicographic monotonicity — which
+/// is all the in-memory `RunLeaseStore` and the SQLite expiration scan
+/// rely on — without bringing real calendar arithmetic into the kernel.
+/// Production code should supply a real RFC3339 clock instead.
+#[derive(Debug, Clone)]
+pub struct FixedLeaseClock {
+    now: String,
+}
+
+impl FixedLeaseClock {
+    /// Build a clock that always returns `now` for the "now" timestamp.
+    pub fn new(now: impl Into<String>) -> Self {
+        Self { now: now.into() }
+    }
+}
+
+impl LeaseClock for FixedLeaseClock {
+    fn timestamps(&self, ttl_ms: u64) -> LeaseTimestamps {
+        // Padded to 12 digits so lex order matches numeric order across
+        // any reasonable TTL the kernel actually issues.
+        let expires_at = format!("{}+{:012}ms", self.now, ttl_ms);
+        LeaseTimestamps {
+            now: self.now.clone(),
+            expires_at,
+        }
+    }
+}
+
 /// Errors produced when constructing or parsing a [`LeaseOwner`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LeaseOwnerParseError {
@@ -291,6 +378,24 @@ mod tests {
                 field: "scheduler_instance"
             },
         );
+    }
+
+    #[test]
+    fn lease_config_defaults_match_polling_block() {
+        let c = LeaseConfig::default();
+        assert_eq!(c.default_ttl_ms, 60_000);
+        assert_eq!(c.renewal_margin_ms, 15_000);
+    }
+
+    #[test]
+    fn fixed_lease_clock_returns_now_and_padded_expiry() {
+        let clock = FixedLeaseClock::new("2026-01-01T00:00:00Z");
+        let ts = clock.timestamps(60_000);
+        assert_eq!(ts.now, "2026-01-01T00:00:00Z");
+        assert_eq!(ts.expires_at, "2026-01-01T00:00:00Z+000000060000ms");
+        // Lex monotonic with TTL.
+        let smaller = clock.timestamps(1_000);
+        assert!(smaller.expires_at < ts.expires_at);
     }
 
     #[test]
