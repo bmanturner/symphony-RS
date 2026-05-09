@@ -22,6 +22,7 @@ pub mod event_bus;
 pub mod events;
 pub mod followup;
 pub mod followup_request;
+pub mod followup_routing;
 pub mod handoff;
 pub mod integration;
 pub mod integration_request;
@@ -74,6 +75,9 @@ pub use followup::{
 };
 pub use followup_request::{
     FollowupRequestError, FollowupRequestInput, FollowupSpec, derive_followups,
+};
+pub use followup_routing::{
+    FollowupRouteDecision, FollowupRoutingError, route_followup, route_followups,
 };
 pub use handoff::{
     BranchOrWorkspace, Handoff, HandoffBlockerRequest, HandoffError, HandoffFollowupRequest,
