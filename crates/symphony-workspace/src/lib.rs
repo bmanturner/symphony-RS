@@ -489,6 +489,85 @@ pub fn verify_cwd_in_workspace(claim_path: &Path, cwd: &Path) -> VerificationChe
     }
 }
 
+/// Stable check name for the branch-matches-required verifier.
+///
+/// Pinned so log scrapers and tests do not depend on a literal that
+/// might drift. SPEC v2 §8.3 lists "current branch matches the
+/// branch the claim was minted on" as the second pre-launch
+/// invariant, immediately after `cwd_in_workspace`.
+pub const CHECK_BRANCH_MATCHES_REQUIRED: &str = "branch_matches_required";
+
+/// Verify that the worktree at `claim_path` is currently checked out
+/// on `required` branch.
+///
+/// This is the SPEC v2 §8.3 "git branch/ref equals expected branch"
+/// gate. It is the second pre-launch invariant, after cwd
+/// containment. The orchestrator runs it immediately before any
+/// mutation-capable agent run so a worktree that has drifted
+/// (operator checkout, detached HEAD after rebase, stray script)
+/// cannot produce wrong-tree commits.
+///
+/// Implementation: `git -C <claim_path> rev-parse --abbrev-ref HEAD`,
+/// trim, compare for exact equality. Detached HEAD reports `"HEAD"`,
+/// which fails the equality check. Any spawn or non-zero-exit error
+/// fails the gate rather than panicking — agents must not launch
+/// when we cannot prove their branch is safe.
+pub async fn verify_branch_matches_required(
+    claim_path: &Path,
+    required: &str,
+) -> VerificationCheck {
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(claim_path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+    {
+        Ok(out) => out,
+        Err(e) => {
+            return VerificationCheck {
+                name: CHECK_BRANCH_MATCHES_REQUIRED.into(),
+                status: VerificationStatus::Failed,
+                detail: Some(format!(
+                    "spawn git rev-parse in {}: {e}",
+                    claim_path.display()
+                )),
+            };
+        }
+    };
+    if !out.status.success() {
+        return VerificationCheck {
+            name: CHECK_BRANCH_MATCHES_REQUIRED.into(),
+            status: VerificationStatus::Failed,
+            detail: Some(format!(
+                "git rev-parse --abbrev-ref HEAD in {} exited {}: {}",
+                claim_path.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        };
+    }
+    let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if current == required {
+        VerificationCheck {
+            name: CHECK_BRANCH_MATCHES_REQUIRED.into(),
+            status: VerificationStatus::Passed,
+            detail: None,
+        }
+    } else {
+        VerificationCheck {
+            name: CHECK_BRANCH_MATCHES_REQUIRED.into(),
+            status: VerificationStatus::Failed,
+            detail: Some(format!(
+                "worktree {} is on branch {:?} but required {:?}",
+                claim_path.display(),
+                current,
+                required
+            )),
+        }
+    }
+}
+
 impl VerificationReport {
     /// Append `check` and recompute aggregate [`Self::status`].
     ///
@@ -522,6 +601,34 @@ impl WorkspaceClaim {
     /// without each one having to re-run prior checks.
     pub fn verify_cwd(&mut self, cwd: &Path) -> bool {
         let check = verify_cwd_in_workspace(&self.path, cwd);
+        let passed = matches!(check.status, VerificationStatus::Passed);
+        self.verification.record(check);
+        passed
+    }
+
+    /// Run [`verify_branch_matches_required`] for this claim and
+    /// record the result on [`Self::verification`]. Returns `true`
+    /// iff the branch check passed (or was skipped because no branch
+    /// is declared); callers (the orchestrator's pre-launch path)
+    /// MUST NOT spawn a mutation-capable agent when this returns
+    /// `false`.
+    ///
+    /// When `branch` is `None` — a `Directory` strategy claim, or a
+    /// strategy that does not pin a branch — the verifier records a
+    /// `Skipped` check and returns `true`, matching SPEC v2 §8.3's
+    /// "skip is neither a pass nor a fail" rule. Recording the skip
+    /// (rather than silently doing nothing) keeps the verification
+    /// report self-describing for log scrapers.
+    pub async fn verify_branch(&mut self) -> bool {
+        let Some(required) = self.branch.clone() else {
+            self.verification.record(VerificationCheck {
+                name: CHECK_BRANCH_MATCHES_REQUIRED.into(),
+                status: VerificationStatus::Skipped,
+                detail: Some("claim carries no required branch".into()),
+            });
+            return true;
+        };
+        let check = verify_branch_matches_required(&self.path, &required).await;
         let passed = matches!(check.status, VerificationStatus::Passed);
         self.verification.record(check);
         passed
@@ -2298,6 +2405,169 @@ mod tests {
         };
         assert!(!claim.verify_cwd(other.path()));
         assert_eq!(claim.verification.status, VerificationStatus::Failed);
+    }
+
+    // ----- pre-launch branch verifier (Phase 6) ---------------------------
+
+    /// Worktree on the required branch passes — nominal case before a
+    /// mutation-capable run.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_branch_passes_when_head_matches_required() {
+        let repo = init_repo_with_main_commit().await;
+        let check = verify_branch_matches_required(repo.path(), "main").await;
+        assert_eq!(check.name, CHECK_BRANCH_MATCHES_REQUIRED);
+        assert_eq!(check.status, VerificationStatus::Passed);
+        assert!(check.detail.is_none());
+    }
+
+    /// Worktree on a different branch fails with both branches in
+    /// the detail so an operator can diagnose without rerunning.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_branch_fails_on_mismatch() {
+        let repo = init_repo_with_branches("feature/x").await;
+        let check = verify_branch_matches_required(repo.path(), "feature/y").await;
+        assert_eq!(check.status, VerificationStatus::Failed);
+        let detail = check.detail.expect("failed check must carry detail");
+        assert!(
+            detail.contains("feature/x") && detail.contains("feature/y"),
+            "got: {detail}"
+        );
+    }
+
+    /// Detached HEAD reports `"HEAD"` from `rev-parse --abbrev-ref`,
+    /// which must fail the equality check — a detached worktree is
+    /// not safe to receive mutation-capable runs.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_branch_fails_on_detached_head() {
+        let repo = init_repo_with_main_commit().await;
+        let sha = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .expect("rev-parse");
+        assert!(sha.status.success());
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["checkout", "-q", "--detach", &sha])
+            .output()
+            .await
+            .expect("checkout --detach");
+        assert!(out.status.success(), "detach: {out:?}");
+
+        let check = verify_branch_matches_required(repo.path(), "main").await;
+        assert_eq!(check.status, VerificationStatus::Failed);
+    }
+
+    /// A non-git path fails the gate (rev-parse exits non-zero) rather
+    /// than panicking. Defensive guard for the orchestrator path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_branch_fails_when_path_is_not_git() {
+        let tmp = TempDir::new().unwrap();
+        let check = verify_branch_matches_required(tmp.path(), "main").await;
+        assert_eq!(check.status, VerificationStatus::Failed);
+        assert!(check.detail.is_some());
+    }
+
+    /// `WorkspaceClaim::verify_branch` records a `Passed` check when
+    /// HEAD matches and flips the aggregate report to `Passed`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_claim_verify_branch_records_pass() {
+        let repo = init_repo_with_main_commit().await;
+        let mut claim = WorkspaceClaim {
+            path: repo.path().to_path_buf(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some("main".into()),
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_branch().await);
+        assert_eq!(claim.verification.status, VerificationStatus::Passed);
+        assert_eq!(claim.verification.checks.len(), 1);
+        assert_eq!(
+            claim.verification.checks[0].name,
+            CHECK_BRANCH_MATCHES_REQUIRED
+        );
+    }
+
+    /// A failed branch verification flips the aggregate to `Failed`
+    /// and the method returns `false`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_claim_verify_branch_records_fail() {
+        let repo = init_repo_with_branches("feature/x").await;
+        let mut claim = WorkspaceClaim {
+            path: repo.path().to_path_buf(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some("feature/y".into()),
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(!claim.verify_branch().await);
+        assert_eq!(claim.verification.status, VerificationStatus::Failed);
+    }
+
+    /// A claim with no `branch` (Directory strategy, or a strategy
+    /// that does not pin a branch) records a `Skipped` check and
+    /// returns `true` — a skip is neither a pass nor a fail.
+    #[tokio::test]
+    async fn workspace_claim_verify_branch_skips_when_no_required_branch() {
+        let tmp = TempDir::new().unwrap();
+        let mut claim = WorkspaceClaim {
+            path: tmp.path().to_path_buf(),
+            strategy: ClaimStrategy::Directory,
+            base_ref: None,
+            branch: None,
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_branch().await);
+        assert_eq!(claim.verification.status, VerificationStatus::Pending);
+        assert_eq!(claim.verification.checks.len(), 1);
+        assert_eq!(
+            claim.verification.checks[0].status,
+            VerificationStatus::Skipped
+        );
+    }
+
+    /// Composing cwd then branch verifiers yields a `Passed`
+    /// aggregate when both gates pass — the canonical pre-launch
+    /// sequence the orchestrator runs against a worktree-backed
+    /// claim.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn workspace_claim_cwd_then_branch_compose_to_passed() {
+        let repo = init_repo_with_main_commit().await;
+        let mut claim = WorkspaceClaim {
+            path: repo.path().to_path_buf(),
+            strategy: ClaimStrategy::ExistingWorktree,
+            base_ref: None,
+            branch: Some("main".into()),
+            owner: None,
+            cleanup: CleanupPolicy::RetainUntilDone,
+            verification: VerificationReport::default(),
+            created_now: false,
+        };
+        assert!(claim.verify_cwd(repo.path()));
+        assert!(claim.verify_branch().await);
+        assert_eq!(claim.verification.status, VerificationStatus::Passed);
+        assert_eq!(claim.verification.checks.len(), 2);
     }
 
     /// A subsequent `Failed` check must downgrade an aggregate that
