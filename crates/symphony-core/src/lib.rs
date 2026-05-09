@@ -28,6 +28,7 @@ pub mod handoff;
 pub mod intake_tick;
 pub mod integration;
 pub mod integration_request;
+pub mod integration_tick;
 pub mod logical_queue;
 pub mod parent_close;
 pub mod poll_loop;
@@ -100,6 +101,10 @@ pub use integration::{
 pub use integration_request::{
     IntegrationChild, IntegrationGates, IntegrationRequestCause, IntegrationRequestError,
     IntegrationRunRequest, IntegrationWorkspace,
+};
+pub use integration_tick::{
+    IntegrationCandidate, IntegrationDispatchQueue, IntegrationDispatchRequest,
+    IntegrationQueueError, IntegrationQueueSource, IntegrationQueueTick,
 };
 pub use logical_queue::{LogicalQueue, QueueTickOutcome};
 pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
