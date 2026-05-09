@@ -173,17 +173,22 @@ impl RoleAuthority {
         required_for_done: false,
     };
 
-    /// Kind-derived default authority (SPEC v2 §4.4).
+    /// Kind-derived default authority (SPEC v2 §4.4, §6.6).
     ///
     /// * [`RoleKind::IntegrationOwner`] earns the parent-ownership
     ///   capabilities (decompose/assign/request QA/close parent).
     /// * [`RoleKind::QaGate`] earns the gating capabilities (file
-    ///   blockers, file follow-ups, required for done).
-    /// * Every other kind starts at [`Self::NONE`].
-    ///
-    /// The set of kind→authority defaults is deliberately conservative.
-    /// Operators wanting wider authority for `specialist`/`reviewer`/
-    /// `operator`/`custom` roles must opt in explicitly in the YAML.
+    ///   blockers, required for done).
+    /// * **Every** kind earns `can_file_followups: true`. SPEC §6.6 makes
+    ///   follow-up identification a universal agent literacy: any role
+    ///   may file or propose follow-up work, with the
+    ///   `followups.default_policy` knob deciding whether the request is
+    ///   created directly or routed through approval. Operators that want
+    ///   to silence follow-up filing for a specific role must opt out
+    ///   explicitly via [`RoleAuthorityOverrides::can_file_followups`].
+    /// * Beyond that, `specialist` / `reviewer` / `operator` / `custom`
+    ///   roles start with no other kernel authority and must earn it
+    ///   explicitly via operator overrides.
     pub const fn defaults_for(kind: RoleKind) -> Self {
         match kind {
             RoleKind::IntegrationOwner => Self {
@@ -191,6 +196,7 @@ impl RoleAuthority {
                 can_assign: true,
                 can_request_qa: true,
                 can_close_parent: true,
+                can_file_followups: true,
                 ..Self::NONE
             },
             RoleKind::QaGate => Self {
@@ -200,7 +206,10 @@ impl RoleAuthority {
                 ..Self::NONE
             },
             RoleKind::Specialist | RoleKind::Reviewer | RoleKind::Operator | RoleKind::Custom => {
-                Self::NONE
+                Self {
+                    can_file_followups: true,
+                    ..Self::NONE
+                }
             }
         }
     }
@@ -352,7 +361,11 @@ mod tests {
         assert!(a.can_assign);
         assert!(a.can_request_qa);
         assert!(a.can_close_parent);
-        // Gating authority belongs to QA, not the integration owner.
+        // Follow-up filing is universal authority per SPEC §6.6 — even
+        // the integration owner inherits it without an explicit override.
+        assert!(a.can_file_followups);
+        // Blocker filing and required-for-done belong to QA, not the
+        // integration owner.
         assert!(!a.can_file_blockers);
         assert!(!a.required_for_done);
     }
@@ -369,17 +382,39 @@ mod tests {
     }
 
     #[test]
-    fn other_role_kinds_default_to_no_authority() {
+    fn non_kernel_special_role_kinds_only_inherit_followup_authority_by_default() {
+        // Specialists/reviewers/operators/custom roles earn
+        // `can_file_followups` from SPEC §6.6 ("Any role may identify
+        // follow-up work"); every other authority flag stays off until
+        // an operator opts in explicitly.
         for kind in [
             RoleKind::Specialist,
             RoleKind::Reviewer,
             RoleKind::Operator,
             RoleKind::Custom,
         ] {
+            let a = RoleAuthority::defaults_for(kind);
+            assert!(
+                a.can_file_followups,
+                "{kind} should inherit can_file_followups"
+            );
             assert_eq!(
-                RoleAuthority::defaults_for(kind),
-                RoleAuthority::NONE,
-                "{kind} should start at NONE",
+                a,
+                RoleAuthority {
+                    can_file_followups: true,
+                    ..RoleAuthority::NONE
+                },
+                "{kind} should only differ from NONE on can_file_followups",
+            );
+        }
+    }
+
+    #[test]
+    fn every_role_kind_can_file_followups_by_default() {
+        for kind in RoleKind::ALL {
+            assert!(
+                RoleAuthority::defaults_for(kind).can_file_followups,
+                "{kind} must inherit can_file_followups per SPEC §6.6",
             );
         }
     }

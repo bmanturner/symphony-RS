@@ -37,7 +37,7 @@
 use crate::blocker::{BlockerOrigin, RunRef};
 use crate::followup::{FollowupError, FollowupId, FollowupIssueRequest, FollowupPolicy};
 use crate::handoff::HandoffFollowupRequest;
-use crate::role::RoleName;
+use crate::role::{RoleAuthority, RoleName};
 use crate::work_item::WorkItemId;
 
 /// Richer in-kernel input combining a [`HandoffFollowupRequest`] with the
@@ -182,6 +182,17 @@ pub enum FollowupRequestError {
         /// Position in the input slice.
         index: usize,
     },
+    /// The reporting role's [`RoleAuthority::can_file_followups`] flag is
+    /// `false`. SPEC §6.6 makes follow-up filing universal *by default*,
+    /// but operators may opt a role out via
+    /// [`crate::RoleAuthorityOverrides::can_file_followups`]; once they
+    /// do, the kernel refuses to derive follow-ups for that role rather
+    /// than silently dropping the request.
+    #[error("role {role} lacks can_file_followups authority; cannot derive follow-up requests")]
+    RoleLacksFollowupAuthority {
+        /// Operator-chosen role label that emitted the requests.
+        role: RoleName,
+    },
 }
 
 /// Resolve workflow default policy against a request's `propose_only`
@@ -213,14 +224,30 @@ fn resolve_policy(default_policy: FollowupPolicy, propose_only: bool) -> Followu
 /// so the kernel can surface the offending index to the agent for repair
 /// (SPEC §7 malformed handoff handling). Returns an empty `Vec` for an
 /// empty input slice — the common no-follow-ups happy path.
+///
+/// Per SPEC §6.6 every role may identify follow-up work, so the default
+/// authority granted by [`RoleAuthority::defaults_for`] is `true` for
+/// every kind. The check still runs because operators can opt a role out
+/// explicitly via [`crate::RoleAuthorityOverrides`]: when the resolved
+/// `can_file_followups` is `false`, derivation refuses the entire batch
+/// before any per-request validation so the diagnostic points at the
+/// authority gap rather than an incidental shape error. An empty
+/// `requests` slice is allowed regardless of authority — there is
+/// nothing to file.
 pub fn derive_followups(
     source_work_item: WorkItemId,
     run_id: RunRef,
     reporting_role: &RoleName,
+    role_authority: &RoleAuthority,
     default_policy: FollowupPolicy,
     require_acceptance_criteria: bool,
     requests: &[FollowupRequestInput],
 ) -> Result<Vec<FollowupSpec>, FollowupRequestError> {
+    if !requests.is_empty() && !role_authority.can_file_followups {
+        return Err(FollowupRequestError::RoleLacksFollowupAuthority {
+            role: reporting_role.clone(),
+        });
+    }
     let mut specs = Vec::with_capacity(requests.len());
     for (index, request) in requests.iter().enumerate() {
         if request.title.trim().is_empty() {
@@ -262,9 +289,14 @@ pub fn derive_followups(
 mod tests {
     use super::*;
     use crate::followup::FollowupStatus;
+    use crate::role::RoleKind;
 
     fn role() -> RoleName {
         RoleName::new("backend")
+    }
+
+    fn specialist_authority() -> RoleAuthority {
+        RoleAuthority::defaults_for(RoleKind::Specialist)
     }
 
     fn handoff(
@@ -348,6 +380,7 @@ mod tests {
             WorkItemId::new(50),
             RunRef::new(7),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -377,6 +410,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::ProposeForApproval,
             true,
             &inputs,
@@ -391,6 +425,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &[],
@@ -409,6 +444,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -424,6 +460,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -439,6 +476,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -461,6 +499,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -479,6 +518,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -497,6 +537,7 @@ mod tests {
             WorkItemId::new(1),
             RunRef::new(2),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             false,
             &inputs,
@@ -517,6 +558,7 @@ mod tests {
             WorkItemId::new(50),
             RunRef::new(7),
             &role(),
+            &specialist_authority(),
             FollowupPolicy::CreateDirectly,
             true,
             &inputs,
@@ -560,5 +602,77 @@ mod tests {
         };
         let err = spec.into_followup(FollowupId::new(1)).unwrap_err();
         assert_eq!(err, FollowupError::EmptyTitle);
+    }
+
+    #[test]
+    fn every_role_kind_can_derive_followups_with_default_authority() {
+        // SPEC §6.6: any role may identify follow-up work. Locks in that
+        // the default authority granted by RoleAuthority::defaults_for is
+        // sufficient for every role kind, not just qa_gate.
+        let inputs = vec![input("t", "r", "s", vec!["ac".into()], false, false)];
+        for kind in RoleKind::ALL {
+            let authority = RoleAuthority::defaults_for(kind);
+            let specs = derive_followups(
+                WorkItemId::new(1),
+                RunRef::new(2),
+                &role(),
+                &authority,
+                FollowupPolicy::CreateDirectly,
+                true,
+                &inputs,
+            )
+            .unwrap_or_else(|e| panic!("{kind} should derive follow-ups: {e}"));
+            assert_eq!(specs.len(), 1);
+            assert_eq!(specs[0].policy, FollowupPolicy::CreateDirectly);
+        }
+    }
+
+    #[test]
+    fn role_with_can_file_followups_disabled_is_rejected() {
+        // Operators may explicitly opt a role out of follow-up filing
+        // via RoleAuthorityOverrides; once they do, derivation refuses
+        // the batch with RoleLacksFollowupAuthority rather than silently
+        // dropping the request.
+        let authority = RoleAuthority {
+            can_file_followups: false,
+            ..RoleAuthority::defaults_for(RoleKind::Specialist)
+        };
+        let inputs = vec![input("t", "r", "s", vec!["ac".into()], false, false)];
+        let err = derive_followups(
+            WorkItemId::new(1),
+            RunRef::new(2),
+            &role(),
+            &authority,
+            FollowupPolicy::CreateDirectly,
+            true,
+            &inputs,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            FollowupRequestError::RoleLacksFollowupAuthority { role: role() },
+        );
+    }
+
+    #[test]
+    fn empty_request_slice_is_allowed_even_without_authority() {
+        // No requests means nothing to file, so the authority gate is
+        // a no-op. This keeps the kernel from spuriously erroring on
+        // runs that emit zero follow-ups regardless of authority.
+        let authority = RoleAuthority {
+            can_file_followups: false,
+            ..RoleAuthority::NONE
+        };
+        let specs = derive_followups(
+            WorkItemId::new(1),
+            RunRef::new(2),
+            &role(),
+            &authority,
+            FollowupPolicy::CreateDirectly,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(specs.is_empty());
     }
 }

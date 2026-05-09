@@ -493,7 +493,9 @@ mod tests {
         assert!(out.contains("role=platform_lead"));
         assert!(out.contains("kind=integration_owner"));
         assert!(
-            out.contains("grants=[can_decompose, can_assign, can_request_qa, can_close_parent]"),
+            out.contains(
+                "grants=[can_decompose, can_assign, can_request_qa, can_close_parent, can_file_followups]"
+            ),
             "got: {out}"
         );
     }
