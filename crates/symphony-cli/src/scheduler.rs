@@ -8,11 +8,13 @@
 //! subsequent decomposition step extends.
 //!
 //! [`build_scheduler_v2`] currently registers the **intake**,
-//! **recovery**, **specialist**, **integration**, and **QA** ticks
-//! plus a [`SpecialistRunner`], an [`IntegrationDispatchRunner`], and
-//! a [`QaDispatchRunner`] that drain the specialist, integration, and
-//! QA dispatch queues under `cfg.agent.max_concurrent_agents`
-//! capacity. The recovery tick is
+//! **recovery**, **specialist**, **integration**, **QA**,
+//! **follow-up approval**, and **budget-pause** ticks plus a
+//! [`SpecialistRunner`], an [`IntegrationDispatchRunner`], a
+//! [`QaDispatchRunner`], a [`FollowupApprovalRunner`], and a
+//! [`BudgetPauseRunner`] that drain the specialist, integration, QA,
+//! follow-up approval, and budget-pause dispatch queues under
+//! `cfg.agent.max_concurrent_agents` capacity. The recovery tick is
 //! driven by the shared [`ActiveSetStore`] plus an in-memory
 //! [`ClaimedRunRegistry`] that stands in for the durable `runs` table
 //! until a state DB is plumbed in: any claim whose `IssueId` is no
@@ -51,7 +53,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use symphony_config::{self as cfg, WorkflowConfig};
 use symphony_core::{
-    ActiveSetStore, Dispatcher, ExpiredLeaseCandidate, IntakeQueueTick, IntegrationDispatchQueue,
+    ActiveSetStore, BudgetPauseDispatchQueue, BudgetPauseDispatcher, BudgetPauseQueueSource,
+    BudgetPauseQueueTick, BudgetPauseRunner, Dispatcher, ExpiredLeaseCandidate,
+    FollowupApprovalDispatchQueue, FollowupApprovalDispatcher, FollowupApprovalQueueSource,
+    FollowupApprovalQueueTick, FollowupApprovalRunner, IntakeQueueTick, IntegrationDispatchQueue,
     IntegrationDispatchRunner, IntegrationDispatcher, IntegrationGates, IntegrationQueueSource,
     IntegrationQueueTick, IssueId, OrphanedWorkspaceClaimCandidate, QaDispatchQueue,
     QaDispatchRunner, QaDispatcher, QaGates, QaQueueSource, QaQueueTick, QueueTick,
@@ -141,6 +146,45 @@ pub struct SchedulerV2Bundle {
     /// / inconclusive) are signalled by the dispatcher's returned
     /// [`symphony_core::QaDispatchReason`].
     pub qa_runner: Arc<QaDispatchRunner>,
+    /// FIFO of pending [`symphony_core::FollowupApprovalDispatchRequest`]s
+    /// emitted by the follow-up approval queue tick. Drained by
+    /// [`Self::followup_approval_runner`] under bounded concurrency. Held
+    /// on the bundle so the eventual `run.rs` switch (and tests) can
+    /// observe queue state directly without reaching into the tick.
+    pub followup_approval_dispatch: Arc<FollowupApprovalDispatchQueue>,
+    /// Bounded-concurrency consumer for
+    /// [`Self::followup_approval_dispatch`], pre-wired with
+    /// `cfg.agent.max_concurrent_agents` capacity and the supplied
+    /// [`FollowupApprovalDispatcher`] (production: the workflow's
+    /// approval handler — operator UI / tracker comment / audit log).
+    /// The composition root drives
+    /// [`FollowupApprovalRunner::run_pending`] and
+    /// [`FollowupApprovalRunner::reap_completed`] on its own cadence;
+    /// the scheduler tick fan only enqueues requests. The runner does
+    /// not interpret verdicts — `Approved`/`Rejected`/`Deferred` are
+    /// recorded verbatim, and the next
+    /// [`FollowupApprovalQueueTick`] pass prunes the claim once the
+    /// durable proposal leaves [`symphony_core::FollowupStatus::Proposed`].
+    pub followup_approval_runner: Arc<FollowupApprovalRunner>,
+    /// FIFO of pending [`symphony_core::BudgetPauseDispatchRequest`]s
+    /// emitted by the budget-pause queue tick. Drained by
+    /// [`Self::budget_pause_runner`] under bounded concurrency. Held on
+    /// the bundle so the eventual `run.rs` switch (and tests) can
+    /// observe queue state directly without reaching into the tick.
+    pub budget_pause_dispatch: Arc<BudgetPauseDispatchQueue>,
+    /// Bounded-concurrency consumer for [`Self::budget_pause_dispatch`],
+    /// pre-wired with `cfg.agent.max_concurrent_agents` capacity and the
+    /// supplied [`BudgetPauseDispatcher`] (production: the workflow's
+    /// resume handler — operator UI / policy waiver evaluation /
+    /// durable status transition). The composition root drives
+    /// [`BudgetPauseRunner::run_pending`] and
+    /// [`BudgetPauseRunner::reap_completed`] on its own cadence; the
+    /// scheduler tick fan only enqueues requests. The runner does not
+    /// interpret verdicts — `Resumed`/`Waived`/`Deferred` are recorded
+    /// verbatim, and the next [`BudgetPauseQueueTick`] pass prunes the
+    /// claim once the durable pause leaves
+    /// [`symphony_core::BudgetPauseStatus::Active`].
+    pub budget_pause_runner: Arc<BudgetPauseRunner>,
 }
 
 /// One in-flight claim recorded in [`ClaimedRunRegistry`].
@@ -318,10 +362,31 @@ impl RecoveryQueueSource for ActiveSetRecoverySource {
 /// the QA-gate agent runner) under the configured
 /// `agent.max_concurrent_agents` ceiling.
 ///
-/// This function is intentionally additive: it does not register
-/// follow-up approval / budget-pause ticks yet. Those come in
-/// subsequent decomposition steps, which will extend this builder
-/// rather than introduce a parallel one.
+/// The follow-up approval tick consults `followup_approval_source`,
+/// which production wires to a state-crate adapter over
+/// `FollowupApprovalQueueRepository`. Tests pass a deterministic fake.
+/// Each emitted request is consumed by [`FollowupApprovalRunner`]
+/// invoking `followup_approval_dispatcher` (production: the workflow's
+/// approval handler — operator UI / tracker comment / audit log emission)
+/// under the configured `agent.max_concurrent_agents` ceiling. The
+/// runner does not interpret verdicts — `Approved`/`Rejected`/`Deferred`
+/// are recorded verbatim and the durable
+/// [`symphony_core::FollowupIssueRequest`] lifecycle is advanced
+/// downstream; the next tick prunes the claim once the proposal leaves
+/// [`symphony_core::FollowupStatus::Proposed`].
+///
+/// The budget-pause tick consults `budget_pause_source`, which
+/// production wires to a state-crate adapter over
+/// `BudgetPauseQueueRepository`. Tests pass a deterministic fake. Each
+/// emitted request is consumed by [`BudgetPauseRunner`] invoking
+/// `budget_pause_dispatcher` (production: the workflow's resume
+/// handler — operator UI / policy waiver evaluation / durable status
+/// transition) under the configured `agent.max_concurrent_agents`
+/// ceiling. The runner records `Resumed`/`Waived`/`Deferred` verbatim;
+/// the durable
+/// [`symphony_core::BudgetPauseStatus`] transition happens downstream
+/// and the next tick prunes the claim.
+#[allow(clippy::too_many_arguments)]
 pub fn build_scheduler_v2(
     cfg: &WorkflowConfig,
     tracker: Arc<dyn TrackerRead>,
@@ -330,6 +395,10 @@ pub fn build_scheduler_v2(
     integration_dispatcher: Arc<dyn IntegrationDispatcher>,
     qa_source: Arc<dyn QaQueueSource>,
     qa_dispatcher: Arc<dyn QaDispatcher>,
+    followup_approval_source: Arc<dyn FollowupApprovalQueueSource>,
+    followup_approval_dispatcher: Arc<dyn FollowupApprovalDispatcher>,
+    budget_pause_source: Arc<dyn BudgetPauseQueueSource>,
+    budget_pause_dispatcher: Arc<dyn BudgetPauseDispatcher>,
 ) -> SchedulerV2Bundle {
     let cadence = QueueTickCadence::from_millis(cfg.polling.interval_ms, cfg.polling.jitter_ms);
     let scheduler_cfg = SchedulerV2Config::from_cadence(cadence);
@@ -402,9 +471,41 @@ pub fn build_scheduler_v2(
         max_concurrent,
     ));
 
+    let followup_approval_dispatch = Arc::new(FollowupApprovalDispatchQueue::new());
+    let followup_approval: Box<dyn QueueTick> = Box::new(FollowupApprovalQueueTick::new(
+        followup_approval_source,
+        followup_approval_dispatch.clone(),
+        cadence,
+    ));
+    let followup_approval_runner = Arc::new(FollowupApprovalRunner::new(
+        followup_approval_dispatch.clone(),
+        followup_approval_dispatcher,
+        max_concurrent,
+    ));
+
+    let budget_pause_dispatch = Arc::new(BudgetPauseDispatchQueue::new());
+    let budget_pause: Box<dyn QueueTick> = Box::new(BudgetPauseQueueTick::new(
+        budget_pause_source,
+        budget_pause_dispatch.clone(),
+        cadence,
+    ));
+    let budget_pause_runner = Arc::new(BudgetPauseRunner::new(
+        budget_pause_dispatch.clone(),
+        budget_pause_dispatcher,
+        max_concurrent,
+    ));
+
     let scheduler = SchedulerV2::with_ticks(
         scheduler_cfg,
-        vec![intake, recovery, specialist, integration, qa],
+        vec![
+            intake,
+            recovery,
+            specialist,
+            integration,
+            qa,
+            followup_approval,
+            budget_pause,
+        ],
     );
     SchedulerV2Bundle {
         scheduler,
@@ -417,6 +518,10 @@ pub fn build_scheduler_v2(
         integration_runner,
         qa_dispatch,
         qa_runner,
+        followup_approval_dispatch,
+        followup_approval_runner,
+        budget_pause_dispatch,
+        budget_pause_runner,
     }
 }
 
@@ -658,6 +763,81 @@ mod tests {
 
     fn noop_qa_dispatcher() -> Arc<dyn QaDispatcher> {
         Arc::new(NoopQaDispatcher)
+    }
+
+    /// Empty follow-up approval source — never surfaces a candidate.
+    /// Used by tests that don't exercise the follow-up approval path.
+    struct EmptyFollowupApprovalSource;
+
+    impl FollowupApprovalQueueSource for EmptyFollowupApprovalSource {
+        fn list_pending(
+            &self,
+        ) -> Result<
+            Vec<symphony_core::FollowupApprovalCandidate>,
+            symphony_core::FollowupApprovalQueueError,
+        > {
+            Ok(Vec::new())
+        }
+    }
+
+    fn empty_followup_approval_source() -> Arc<dyn FollowupApprovalQueueSource> {
+        Arc::new(EmptyFollowupApprovalSource)
+    }
+
+    /// No-op follow-up approval dispatcher — would resolve every request
+    /// as `Approved`. Used by tests that don't drive the follow-up
+    /// approval runner.
+    struct NoopFollowupApprovalDispatcher;
+
+    #[async_trait]
+    impl FollowupApprovalDispatcher for NoopFollowupApprovalDispatcher {
+        async fn dispatch(
+            &self,
+            _request: symphony_core::FollowupApprovalDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> symphony_core::FollowupApprovalDispatchReason {
+            symphony_core::FollowupApprovalDispatchReason::Approved
+        }
+    }
+
+    fn noop_followup_approval_dispatcher() -> Arc<dyn FollowupApprovalDispatcher> {
+        Arc::new(NoopFollowupApprovalDispatcher)
+    }
+
+    /// Empty budget-pause source — never surfaces a candidate. Used by
+    /// tests that don't exercise the budget-pause path.
+    struct EmptyBudgetPauseSource;
+
+    impl BudgetPauseQueueSource for EmptyBudgetPauseSource {
+        fn list_active(
+            &self,
+        ) -> Result<Vec<symphony_core::BudgetPauseCandidate>, symphony_core::BudgetPauseQueueError>
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn empty_budget_pause_source() -> Arc<dyn BudgetPauseQueueSource> {
+        Arc::new(EmptyBudgetPauseSource)
+    }
+
+    /// No-op budget-pause dispatcher — would resolve every request as
+    /// `Resumed`. Used by tests that don't drive the budget-pause runner.
+    struct NoopBudgetPauseDispatcher;
+
+    #[async_trait]
+    impl BudgetPauseDispatcher for NoopBudgetPauseDispatcher {
+        async fn dispatch(
+            &self,
+            _request: symphony_core::BudgetPauseDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> symphony_core::BudgetPauseDispatchReason {
+            symphony_core::BudgetPauseDispatchReason::Resumed
+        }
+    }
+
+    fn noop_budget_pause_dispatcher() -> Arc<dyn BudgetPauseDispatcher> {
+        Arc::new(NoopBudgetPauseDispatcher)
     }
 
     /// Gate-aware QA source: stores per-gate candidate lists,
@@ -968,16 +1148,30 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
-        // Intake + recovery + specialist + integration + QA;
-        // follow-up approval / budget-pause ticks layer on in
-        // subsequent steps.
-        assert_eq!(bundle.scheduler.tick_count(), 5);
+        // Intake + recovery + specialist + integration + QA +
+        // follow-up approval + budget-pause: every logical queue is
+        // wired.
+        assert_eq!(bundle.scheduler.tick_count(), 7);
         assert!(bundle.claimed_runs.is_empty());
         assert!(bundle.recovery_dispatch.is_empty());
         assert!(bundle.specialist_dispatch.is_empty());
         assert!(bundle.integration_dispatch.is_empty());
         assert!(bundle.qa_dispatch.is_empty());
+        assert!(bundle.followup_approval_dispatch.is_empty());
+        assert!(bundle.budget_pause_dispatch.is_empty());
+        assert_eq!(
+            bundle.followup_approval_runner.max_concurrent(),
+            cfg.agent.max_concurrent_agents as usize,
+        );
+        assert_eq!(
+            bundle.budget_pause_runner.max_concurrent(),
+            cfg.agent.max_concurrent_agents as usize,
+        );
         assert_eq!(
             bundle.qa_runner.max_concurrent(),
             cfg.agent.max_concurrent_agents as usize,
@@ -1004,6 +1198,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let sc = bundle.scheduler.config();
         assert_eq!(sc.interval, Duration::from_millis(123));
@@ -1022,6 +1220,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1031,8 +1233,9 @@ mod tests {
 
         assert!(active_set.is_empty());
         let report = scheduler.tick_once().await;
-        // intake + recovery + specialist + integration + qa
-        assert_eq!(report.outcomes.len(), 5);
+        // intake + recovery + specialist + integration + qa +
+        // follow-up approval + budget-pause
+        assert_eq!(report.outcomes.len(), 7);
         assert_eq!(report.outcomes[0].processed, 3);
         assert_eq!(active_set.len(), 3);
         assert_eq!(
@@ -1057,6 +1260,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             scheduler,
@@ -1125,6 +1332,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1177,6 +1388,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1214,6 +1429,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1282,6 +1501,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1350,6 +1573,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1392,6 +1619,10 @@ mod tests {
             noop_integration_dispatcher(),
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1492,6 +1723,10 @@ mod tests {
             dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1554,6 +1789,10 @@ mod tests {
             dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1609,6 +1848,10 @@ mod tests {
             dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
             empty_qa_source(),
             noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1675,6 +1918,10 @@ mod tests {
             noop_integration_dispatcher(),
             source.clone() as Arc<dyn QaQueueSource>,
             dispatcher.clone() as Arc<dyn QaDispatcher>,
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1726,6 +1973,10 @@ mod tests {
             noop_integration_dispatcher(),
             source.clone() as Arc<dyn QaQueueSource>,
             dispatcher.clone() as Arc<dyn QaDispatcher>,
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1769,6 +2020,10 @@ mod tests {
             noop_integration_dispatcher(),
             source.clone() as Arc<dyn QaQueueSource>,
             dispatcher.clone() as Arc<dyn QaDispatcher>,
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -1788,5 +2043,518 @@ mod tests {
         assert_eq!(outcomes[0].work_item_id, WorkItemId::new(99));
         assert_eq!(outcomes[0].reason, QaDispatchReason::Waived);
         assert_eq!(dispatcher.calls(), vec!["PROJ-99"]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Follow-up approval + budget-pause tick + runner end-to-end coverage.
+    //
+    // Both queues are operator-decision queues: the dispatcher is the
+    // workflow's approval/resume handler. The runner records verdicts
+    // verbatim; the durable lifecycle transition happens downstream and
+    // the next tick prunes the claim once the source view stops
+    // surfacing the row.
+    // ---------------------------------------------------------------------
+
+    use symphony_core::{
+        BudgetPauseCandidate, BudgetPauseDispatchOutcome, BudgetPauseDispatchReason,
+        BudgetPauseDispatchRequest, BudgetPauseId, BudgetPauseQueueError,
+        FollowupApprovalCandidate, FollowupApprovalDispatchOutcome, FollowupApprovalDispatchReason,
+        FollowupApprovalDispatchRequest, FollowupApprovalQueueError, FollowupId,
+    };
+
+    /// In-memory follow-up approval source. Tests pre-load pending
+    /// proposals; advancing one to approved/rejected makes it disappear
+    /// on the next call, mirroring the durable view the future state
+    /// adapter will expose.
+    #[derive(Default)]
+    struct FakeFollowupApprovalSource {
+        pending: StdMutex<Vec<FollowupApprovalCandidate>>,
+    }
+
+    impl FakeFollowupApprovalSource {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn insert(&self, c: FollowupApprovalCandidate) {
+            self.pending.lock().unwrap().push(c);
+        }
+
+        fn remove(&self, id: FollowupId) {
+            self.pending.lock().unwrap().retain(|c| c.followup_id != id);
+        }
+    }
+
+    impl FollowupApprovalQueueSource for FakeFollowupApprovalSource {
+        fn list_pending(
+            &self,
+        ) -> Result<Vec<FollowupApprovalCandidate>, FollowupApprovalQueueError> {
+            Ok(self.pending.lock().unwrap().clone())
+        }
+    }
+
+    /// Records every approval dispatch invocation and resolves with a
+    /// configured reason.
+    struct RecordingFollowupApprovalDispatcher {
+        calls: StdMutex<Vec<FollowupId>>,
+        reason: FollowupApprovalDispatchReason,
+    }
+
+    impl RecordingFollowupApprovalDispatcher {
+        fn new(reason: FollowupApprovalDispatchReason) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                reason,
+            }
+        }
+        fn calls(&self) -> Vec<FollowupId> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl FollowupApprovalDispatcher for RecordingFollowupApprovalDispatcher {
+        async fn dispatch(
+            &self,
+            request: FollowupApprovalDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> FollowupApprovalDispatchReason {
+            self.calls.lock().unwrap().push(request.followup_id);
+            self.reason
+        }
+    }
+
+    fn followup_candidate(
+        followup_id: i64,
+        source_work_item: i64,
+        title: &str,
+        blocking: bool,
+    ) -> FollowupApprovalCandidate {
+        FollowupApprovalCandidate {
+            followup_id: FollowupId::new(followup_id),
+            source_work_item: WorkItemId::new(source_work_item),
+            title: title.into(),
+            blocking,
+            approval_role: RoleName::new("platform_lead"),
+        }
+    }
+
+    async fn wait_for_followup_outcomes(
+        runner: &FollowupApprovalRunner,
+        n: usize,
+    ) -> Vec<FollowupApprovalDispatchOutcome> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut acc = Vec::new();
+        while acc.len() < n {
+            acc.extend(runner.reap_completed().await);
+            if acc.len() >= n {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {n} followup outcomes; got {} so far",
+                    acc.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        acc
+    }
+
+    /// Approve path: source surfaces a pending proposal → tick enqueues
+    /// a dispatch request → runner invokes the dispatcher and records
+    /// `Approved`. The downstream lifecycle is simulated by removing
+    /// the row from the source; the next tick prunes the claim and no
+    /// re-emit happens.
+    #[tokio::test]
+    async fn builder_dispatches_followup_proposal_and_records_approve() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(FakeFollowupApprovalSource::new());
+        source.insert(followup_candidate(1, 100, "rate limit", false));
+        let dispatcher = Arc::new(RecordingFollowupApprovalDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
+            source.clone() as Arc<dyn FollowupApprovalQueueSource>,
+            dispatcher.clone() as Arc<dyn FollowupApprovalDispatcher>,
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            followup_approval_dispatch,
+            followup_approval_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(followup_approval_dispatch.len(), 1);
+
+        let report = followup_approval_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_capacity, 0);
+
+        let outcomes = wait_for_followup_outcomes(&followup_approval_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].followup_id, FollowupId::new(1));
+        assert_eq!(outcomes[0].reason, FollowupApprovalDispatchReason::Approved);
+        assert_eq!(dispatcher.calls(), vec![FollowupId::new(1)]);
+
+        // Simulate the downstream advance: row leaves Proposed.
+        source.remove(FollowupId::new(1));
+        scheduler.tick_once().await;
+        assert!(followup_approval_dispatch.is_empty());
+    }
+
+    /// Reject path: dispatcher returns `Rejected`. The runner records
+    /// the verdict verbatim — the kernel-side rejection of the durable
+    /// proposal is downstream's job.
+    #[tokio::test]
+    async fn builder_dispatches_followup_proposal_and_records_reject() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(FakeFollowupApprovalSource::new());
+        source.insert(followup_candidate(7, 100, "out of scope", true));
+        let dispatcher = Arc::new(RecordingFollowupApprovalDispatcher::new(
+            FollowupApprovalDispatchReason::Rejected,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
+            source.clone() as Arc<dyn FollowupApprovalQueueSource>,
+            dispatcher.clone() as Arc<dyn FollowupApprovalDispatcher>,
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            followup_approval_dispatch,
+            followup_approval_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(followup_approval_dispatch.len(), 1);
+
+        let report = followup_approval_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+
+        let outcomes = wait_for_followup_outcomes(&followup_approval_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].followup_id, FollowupId::new(7));
+        assert_eq!(outcomes[0].reason, FollowupApprovalDispatchReason::Rejected);
+        assert_eq!(dispatcher.calls(), vec![FollowupId::new(7)]);
+    }
+
+    /// Empty source: nothing surfaces, the runner has nothing to drain.
+    /// Demonstrates that follow-up approval wiring is a no-op when the
+    /// workflow has no pending proposals.
+    #[tokio::test]
+    async fn builder_emits_no_followup_request_when_source_empty() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(FakeFollowupApprovalSource::new());
+        let dispatcher = Arc::new(RecordingFollowupApprovalDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
+            source.clone() as Arc<dyn FollowupApprovalQueueSource>,
+            dispatcher.clone() as Arc<dyn FollowupApprovalDispatcher>,
+            empty_budget_pause_source(),
+            noop_budget_pause_dispatcher(),
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            followup_approval_dispatch,
+            followup_approval_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert!(followup_approval_dispatch.is_empty());
+
+        let report = followup_approval_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert!(report.is_idle());
+        assert!(dispatcher.calls().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Budget pause coverage.
+    // ---------------------------------------------------------------------
+
+    /// In-memory budget-pause source. Tests pre-load active pauses;
+    /// downstream resolution is simulated by removing the row.
+    #[derive(Default)]
+    struct FakeBudgetPauseSource {
+        active: StdMutex<Vec<BudgetPauseCandidate>>,
+    }
+
+    impl FakeBudgetPauseSource {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn insert(&self, c: BudgetPauseCandidate) {
+            self.active.lock().unwrap().push(c);
+        }
+
+        fn remove(&self, id: BudgetPauseId) {
+            self.active.lock().unwrap().retain(|c| c.pause_id != id);
+        }
+    }
+
+    impl BudgetPauseQueueSource for FakeBudgetPauseSource {
+        fn list_active(&self) -> Result<Vec<BudgetPauseCandidate>, BudgetPauseQueueError> {
+            Ok(self.active.lock().unwrap().clone())
+        }
+    }
+
+    /// Records every budget-pause dispatch invocation and resolves with
+    /// a configured reason.
+    struct RecordingBudgetPauseDispatcher {
+        calls: StdMutex<Vec<BudgetPauseId>>,
+        reason: BudgetPauseDispatchReason,
+    }
+
+    impl RecordingBudgetPauseDispatcher {
+        fn new(reason: BudgetPauseDispatchReason) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                reason,
+            }
+        }
+        fn calls(&self) -> Vec<BudgetPauseId> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl BudgetPauseDispatcher for RecordingBudgetPauseDispatcher {
+        async fn dispatch(
+            &self,
+            request: BudgetPauseDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> BudgetPauseDispatchReason {
+            self.calls.lock().unwrap().push(request.pause_id);
+            self.reason
+        }
+    }
+
+    fn budget_pause_candidate(
+        pause_id: i64,
+        work_item_id: i64,
+        kind: &str,
+        limit: f64,
+        observed: f64,
+    ) -> BudgetPauseCandidate {
+        BudgetPauseCandidate {
+            pause_id: BudgetPauseId::new(pause_id),
+            work_item_id: WorkItemId::new(work_item_id),
+            budget_kind: kind.into(),
+            limit_value: limit,
+            observed,
+        }
+    }
+
+    async fn wait_for_budget_pause_outcomes(
+        runner: &BudgetPauseRunner,
+        n: usize,
+    ) -> Vec<BudgetPauseDispatchOutcome> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut acc = Vec::new();
+        while acc.len() < n {
+            acc.extend(runner.reap_completed().await);
+            if acc.len() >= n {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {n} budget pause outcomes; got {} so far",
+                    acc.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        acc
+    }
+
+    /// Resume path: source surfaces an active pause → tick enqueues a
+    /// dispatch request → runner invokes the dispatcher and records
+    /// `Resumed`. Downstream advance is simulated by removing the row;
+    /// the next tick prunes the claim.
+    #[tokio::test]
+    async fn builder_dispatches_budget_pause_and_records_resume() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(FakeBudgetPauseSource::new());
+        source.insert(budget_pause_candidate(
+            42,
+            100,
+            "max_cost_per_issue_usd",
+            5.0,
+            6.5,
+        ));
+        let dispatcher = Arc::new(RecordingBudgetPauseDispatcher::new(
+            BudgetPauseDispatchReason::Resumed,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            source.clone() as Arc<dyn BudgetPauseQueueSource>,
+            dispatcher.clone() as Arc<dyn BudgetPauseDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            budget_pause_dispatch,
+            budget_pause_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(budget_pause_dispatch.len(), 1);
+
+        let report = budget_pause_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_capacity, 0);
+
+        let outcomes = wait_for_budget_pause_outcomes(&budget_pause_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].pause_id, BudgetPauseId::new(42));
+        assert_eq!(outcomes[0].work_item_id, WorkItemId::new(100));
+        assert_eq!(outcomes[0].reason, BudgetPauseDispatchReason::Resumed);
+        assert_eq!(dispatcher.calls(), vec![BudgetPauseId::new(42)]);
+
+        source.remove(BudgetPauseId::new(42));
+        scheduler.tick_once().await;
+        assert!(budget_pause_dispatch.is_empty());
+    }
+
+    /// Waive path: dispatcher returns `Waived`. The runner records the
+    /// verdict verbatim — the durable status transition is downstream's
+    /// job.
+    #[tokio::test]
+    async fn builder_dispatches_budget_pause_and_records_waive() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(FakeBudgetPauseSource::new());
+        source.insert(budget_pause_candidate(7, 100, "max_retries", 3.0, 4.0));
+        let dispatcher = Arc::new(RecordingBudgetPauseDispatcher::new(
+            BudgetPauseDispatchReason::Waived,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            source.clone() as Arc<dyn BudgetPauseQueueSource>,
+            dispatcher.clone() as Arc<dyn BudgetPauseDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            budget_pause_dispatch,
+            budget_pause_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(budget_pause_dispatch.len(), 1);
+
+        let report = budget_pause_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+
+        let outcomes = wait_for_budget_pause_outcomes(&budget_pause_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].pause_id, BudgetPauseId::new(7));
+        assert_eq!(outcomes[0].reason, BudgetPauseDispatchReason::Waived);
+        assert_eq!(dispatcher.calls(), vec![BudgetPauseId::new(7)]);
+    }
+
+    /// Empty source: no active pauses → nothing surfaces, runner is
+    /// idle. Demonstrates the budget-pause wiring is a no-op when the
+    /// workflow has no caps to resolve.
+    #[tokio::test]
+    async fn builder_emits_no_budget_pause_request_when_source_empty() {
+        let cfg = cfg_with(10, 0);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(FakeBudgetPauseSource::new());
+        let dispatcher = Arc::new(RecordingBudgetPauseDispatcher::new(
+            BudgetPauseDispatchReason::Resumed,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+            empty_qa_source(),
+            noop_qa_dispatcher(),
+            empty_followup_approval_source(),
+            noop_followup_approval_dispatcher(),
+            source.clone() as Arc<dyn BudgetPauseQueueSource>,
+            dispatcher.clone() as Arc<dyn BudgetPauseDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            budget_pause_dispatch,
+            budget_pause_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert!(budget_pause_dispatch.is_empty());
+
+        let report = budget_pause_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert!(report.is_idle());
+        assert!(dispatcher.calls().is_empty());
     }
 }
