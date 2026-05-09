@@ -67,7 +67,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Implement integration-owner decomposition runner path.
 - [x] Add child issue creation through `TrackerMutations`, gated by `decomposition.child_issue_policy`.
 - [x] Add parent/child edge persistence and blocker propagation.
-- [ ] Add guard preventing parent completion while required children are non-terminal.
+- [x] Add guard preventing parent completion while required children are non-terminal.
 
 ## Phase 6 — Workspace and Branch Claims
 

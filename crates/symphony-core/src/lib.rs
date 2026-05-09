@@ -22,6 +22,7 @@ pub mod events;
 pub mod followup;
 pub mod handoff;
 pub mod integration;
+pub mod parent_close;
 pub mod poll_loop;
 pub mod qa;
 pub mod retry;
@@ -67,6 +68,7 @@ pub use integration::{
     IntegrationConflict, IntegrationError, IntegrationId, IntegrationMergeStrategy,
     IntegrationRecord, IntegrationStatus,
 };
+pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use qa::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, QaError, QaEvidence, QaOutcome, QaVerdict,
