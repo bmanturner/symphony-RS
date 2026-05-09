@@ -131,7 +131,7 @@ One unchecked item per implementation iteration. Each item should land with test
   - [x] Add a specialist queue tick that claims routable specialist work items and emits dispatch requests, with tests for first-match and priority routing parity.
   - [x] Add an integration queue tick that drains `IntegrationQueueRepository` entries respecting gates, with tests for ready/blocked/waived cases.
   - [x] Add a QA queue tick that drains `QaQueueRepository` entries respecting gates, with tests for ready/blocked cases.
-  - [ ] Add a follow-up approval queue tick that drains pending approval-routed follow-ups, with tests for approve/reject paths.
+  - [x] Add a follow-up approval queue tick that drains pending approval-routed follow-ups, with tests for approve/reject paths.
   - [ ] Add a budget-pause queue tick that surfaces durable budget pauses for operator/policy resume, with tests for resume conditions.
   - [ ] Add a recovery queue tick that reconciles expired leases and orphaned workspace claims on each cadence (separate from the operator `recovery` command), with tests for lease expiry reaping.
   - [ ] Wire `Scheduler v2` that fans the queue ticks under shared `polling.interval_ms` cadence with `jitter_ms`, replacing the flat `PollLoop` entry point and migrating its existing reconciliation/cancellation semantics to the intake + recovery queues.
