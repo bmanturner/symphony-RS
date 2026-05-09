@@ -8,16 +8,28 @@
 //! subsequent decomposition step extends.
 //!
 //! [`build_scheduler_v2`] currently registers the **intake**,
-//! **recovery**, and **specialist** ticks plus a [`SpecialistRunner`]
-//! that drains the specialist dispatch queue under
+//! **recovery**, **specialist**, and **integration** ticks plus a
+//! [`SpecialistRunner`] and an [`IntegrationDispatchRunner`] that
+//! drain the specialist and integration dispatch queues under
 //! `cfg.agent.max_concurrent_agents` capacity. The recovery tick is
 //! driven by the shared [`ActiveSetStore`] plus an in-memory
 //! [`ClaimedRunRegistry`] that stands in for the durable `runs` table
 //! until a state DB is plumbed in: any claim whose `IssueId` is no
 //! longer in the active set surfaces as an [`ExpiredLeaseCandidate`],
 //! matching the flat poll loop's `Reconciled { dropped }`
-//! reconciliation contract. Integration / QA / follow-up-approval /
-//! budget-pause ticks layer on top of the same store and registry in
+//! reconciliation contract.
+//!
+//! The integration tick consults a caller-supplied
+//! [`IntegrationQueueSource`] under [`IntegrationGates`] derived from
+//! `cfg.integration.{require_all_children_terminal,
+//! require_no_open_blockers}` and emits one
+//! [`symphony_core::IntegrationDispatchRequest`] per ready parent.
+//! Production wires this to a state-crate adapter
+//! over `IntegrationQueueRepository`; tests wire a deterministic fake.
+//! Each request is consumed by the [`IntegrationDispatchRunner`] under
+//! the configured [`IntegrationDispatcher`] (production: the
+//! integration-owner agent runner). QA / follow-up-approval /
+//! budget-pause ticks layer on top of the same store and runners in
 //! subsequent decomposition steps. The returned scheduler is not yet
 //! wired into [`crate::run::run`]; that switch is the last
 //! decomposition step. Until then the production entry point remains
@@ -35,11 +47,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use symphony_config::{self as cfg, WorkflowConfig};
 use symphony_core::{
-    ActiveSetStore, Dispatcher, ExpiredLeaseCandidate, IntakeQueueTick, IssueId,
-    OrphanedWorkspaceClaimCandidate, QueueTick, QueueTickCadence, RecoveryDispatchQueue,
-    RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick, RecoveryRunId,
-    RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName, RoutingEngine, RoutingMatch,
-    RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2, SchedulerV2Config,
+    ActiveSetStore, Dispatcher, ExpiredLeaseCandidate, IntakeQueueTick, IntegrationDispatchQueue,
+    IntegrationDispatchRunner, IntegrationDispatcher, IntegrationGates, IntegrationQueueSource,
+    IntegrationQueueTick, IssueId, OrphanedWorkspaceClaimCandidate, QueueTick, QueueTickCadence,
+    RecoveryDispatchQueue, RecoveryQueueError, RecoveryQueueSource, RecoveryQueueTick,
+    RecoveryRunId, RecoveryWorkspaceClaimId, RoleKind, RoleKindLookup, RoleName, RoutingEngine,
+    RoutingMatch, RoutingMatchMode, RoutingRule, RoutingTable, SchedulerV2, SchedulerV2Config,
     SpecialistDispatchQueue, SpecialistQueueTick, SpecialistRunner, TrackerRead, WorkItemId,
 };
 
@@ -87,6 +100,23 @@ pub struct SchedulerV2Bundle {
     /// [`SpecialistRunner::reap_completed`] on its own cadence; the
     /// scheduler tick fan only enqueues requests.
     pub specialist_runner: Arc<SpecialistRunner>,
+    /// FIFO of pending [`symphony_core::IntegrationDispatchRequest`]s
+    /// emitted by the integration queue tick. Drained by
+    /// [`Self::integration_runner`] under bounded concurrency. Held on
+    /// the bundle so the eventual `run.rs` switch (and tests) can
+    /// observe queue state directly without reaching into the tick.
+    pub integration_dispatch: Arc<IntegrationDispatchQueue>,
+    /// Bounded-concurrency consumer for [`Self::integration_dispatch`],
+    /// pre-wired with `cfg.agent.max_concurrent_agents` capacity and
+    /// the supplied [`IntegrationDispatcher`] (production: the
+    /// integration-owner agent runner). The composition root drives
+    /// [`IntegrationDispatchRunner::run_pending`] and
+    /// [`IntegrationDispatchRunner::reap_completed`] on its own cadence;
+    /// the scheduler tick fan only enqueues requests. The upstream
+    /// [`IntegrationQueueTick`] applies workflow gates
+    /// (`require_all_children_terminal`, `require_no_open_blockers`) at
+    /// emission time, so every request the runner sees is authoritative.
+    pub integration_runner: Arc<IntegrationDispatchRunner>,
 }
 
 /// One in-flight claim recorded in [`ClaimedRunRegistry`].
@@ -224,8 +254,8 @@ impl RecoveryQueueSource for ActiveSetRecoverySource {
     }
 }
 
-/// Build a [`SchedulerV2`] with the intake, recovery, and specialist
-/// queue ticks wired up.
+/// Build a [`SchedulerV2`] with the intake, recovery, specialist, and
+/// integration queue ticks wired up.
 ///
 /// Cadence is mapped from [`WorkflowConfig::polling`]:
 /// `interval_ms` → `SchedulerV2Config::interval`,
@@ -243,14 +273,25 @@ impl RecoveryQueueSource for ActiveSetRecoverySource {
 /// `run_pending` / `reap_completed` on its own cadence — the scheduler
 /// only enqueues dispatch requests.
 ///
+/// The integration tick consults `integration_source` under
+/// [`IntegrationGates`] mirrored from `cfg.integration.*`. Production
+/// supplies a state-crate adapter over `IntegrationQueueRepository`;
+/// tests pass a deterministic in-memory fake. Every emitted request is
+/// pre-gated by the tick, so [`IntegrationDispatchRunner`] simply
+/// invokes `integration_dispatcher` (production: the integration-owner
+/// agent runner) under the configured `agent.max_concurrent_agents`
+/// ceiling. Per-role caps will layer in once role-aware dispatch lands.
+///
 /// This function is intentionally additive: it does not register
-/// integration / QA / follow-up approval / budget-pause ticks yet.
-/// Those come in subsequent decomposition steps, which will extend
-/// this builder rather than introduce a parallel one.
+/// QA / follow-up approval / budget-pause ticks yet. Those come in
+/// subsequent decomposition steps, which will extend this builder
+/// rather than introduce a parallel one.
 pub fn build_scheduler_v2(
     cfg: &WorkflowConfig,
     tracker: Arc<dyn TrackerRead>,
     dispatcher: Arc<dyn Dispatcher>,
+    integration_source: Arc<dyn IntegrationQueueSource>,
+    integration_dispatcher: Arc<dyn IntegrationDispatcher>,
 ) -> SchedulerV2Bundle {
     let cadence = QueueTickCadence::from_millis(cfg.polling.interval_ms, cfg.polling.jitter_ms);
     let scheduler_cfg = SchedulerV2Config::from_cadence(cadence);
@@ -292,7 +333,27 @@ pub fn build_scheduler_v2(
         max_concurrent,
     ));
 
-    let scheduler = SchedulerV2::with_ticks(scheduler_cfg, vec![intake, recovery, specialist]);
+    let integration_dispatch = Arc::new(IntegrationDispatchQueue::new());
+    let integration_gates = IntegrationGates {
+        require_all_children_terminal: cfg.integration.require_all_children_terminal,
+        require_no_open_blockers: cfg.integration.require_no_open_blockers,
+    };
+    let integration: Box<dyn QueueTick> = Box::new(IntegrationQueueTick::new(
+        integration_source,
+        integration_gates,
+        integration_dispatch.clone(),
+        cadence,
+    ));
+    let integration_runner = Arc::new(IntegrationDispatchRunner::new(
+        integration_dispatch.clone(),
+        integration_dispatcher,
+        max_concurrent,
+    ));
+
+    let scheduler = SchedulerV2::with_ticks(
+        scheduler_cfg,
+        vec![intake, recovery, specialist, integration],
+    );
     SchedulerV2Bundle {
         scheduler,
         active_set,
@@ -300,6 +361,8 @@ pub fn build_scheduler_v2(
         recovery_dispatch,
         specialist_dispatch,
         specialist_runner,
+        integration_dispatch,
+        integration_runner,
     }
 }
 
@@ -368,6 +431,10 @@ mod tests {
     use symphony_core::ReleaseReason;
     use symphony_core::tracker::{Issue, IssueId, IssueState};
     use symphony_core::tracker_trait::{TrackerError, TrackerResult};
+    use symphony_core::{
+        IntegrationCandidate, IntegrationDispatchReason, IntegrationDispatchRequest,
+        IntegrationQueueError, IntegrationRequestCause,
+    };
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
@@ -387,6 +454,157 @@ mod tests {
 
     fn noop_dispatcher() -> Arc<dyn Dispatcher> {
         Arc::new(NoopDispatcher)
+    }
+
+    /// Empty integration source — never surfaces a candidate. Used by
+    /// tests that only exercise intake/recovery/specialist behaviour.
+    struct EmptyIntegrationSource;
+
+    impl IntegrationQueueSource for EmptyIntegrationSource {
+        fn list_ready(
+            &self,
+            _gates: IntegrationGates,
+        ) -> Result<Vec<IntegrationCandidate>, IntegrationQueueError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn empty_integration_source() -> Arc<dyn IntegrationQueueSource> {
+        Arc::new(EmptyIntegrationSource)
+    }
+
+    /// No-op integration dispatcher — would resolve every request as
+    /// `Completed`. Used by tests that don't drive the integration runner.
+    struct NoopIntegrationDispatcher;
+
+    #[async_trait]
+    impl IntegrationDispatcher for NoopIntegrationDispatcher {
+        async fn dispatch(
+            &self,
+            _request: IntegrationDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> IntegrationDispatchReason {
+            IntegrationDispatchReason::Completed
+        }
+    }
+
+    fn noop_integration_dispatcher() -> Arc<dyn IntegrationDispatcher> {
+        Arc::new(NoopIntegrationDispatcher)
+    }
+
+    /// Gate-aware integration source: stores per-gate candidate lists,
+    /// mirroring `IntegrationQueueRepository::list_ready_for_integration_with_gates`.
+    /// The tick supplies the workflow's gates; this fake returns
+    /// whichever list was pre-loaded for that exact gate combination.
+    type GateKey = (bool, bool);
+
+    #[derive(Default)]
+    struct GateAwareIntegrationSource {
+        by_gates: StdMutex<Vec<(GateKey, Vec<IntegrationCandidate>)>>,
+    }
+
+    impl GateAwareIntegrationSource {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn set(&self, gates: IntegrationGates, candidates: Vec<IntegrationCandidate>) {
+            let key = (
+                gates.require_all_children_terminal,
+                gates.require_no_open_blockers,
+            );
+            let mut by = self.by_gates.lock().unwrap();
+            by.retain(|(k, _)| *k != key);
+            by.push((key, candidates));
+        }
+    }
+
+    impl IntegrationQueueSource for GateAwareIntegrationSource {
+        fn list_ready(
+            &self,
+            gates: IntegrationGates,
+        ) -> Result<Vec<IntegrationCandidate>, IntegrationQueueError> {
+            let key = (
+                gates.require_all_children_terminal,
+                gates.require_no_open_blockers,
+            );
+            let by = self.by_gates.lock().unwrap();
+            Ok(by
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default())
+        }
+    }
+
+    /// Records every integration dispatch invocation and resolves with
+    /// a configured reason. Mirrors the recording dispatchers in the
+    /// runner-side tests.
+    struct RecordingIntegrationDispatcher {
+        calls: StdMutex<Vec<String>>,
+        reason: IntegrationDispatchReason,
+    }
+
+    impl RecordingIntegrationDispatcher {
+        fn new(reason: IntegrationDispatchReason) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                reason,
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl IntegrationDispatcher for RecordingIntegrationDispatcher {
+        async fn dispatch(
+            &self,
+            request: IntegrationDispatchRequest,
+            _cancel: CancellationToken,
+        ) -> IntegrationDispatchReason {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(request.parent_identifier.clone());
+            self.reason
+        }
+    }
+
+    fn integration_candidate(
+        id: i64,
+        identifier: &str,
+        cause: IntegrationRequestCause,
+    ) -> IntegrationCandidate {
+        IntegrationCandidate {
+            parent_id: WorkItemId::new(id),
+            parent_identifier: identifier.into(),
+            parent_title: format!("title {identifier}"),
+            cause,
+        }
+    }
+
+    async fn wait_for_integration_outcomes(
+        runner: &IntegrationDispatchRunner,
+        n: usize,
+    ) -> Vec<symphony_core::IntegrationDispatchOutcome> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut acc = Vec::new();
+        while acc.len() < n {
+            acc.extend(runner.reap_completed().await);
+            if acc.len() >= n {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for {n} integration outcomes; got {} so far",
+                    acc.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        acc
     }
 
     /// Records every dispatch invocation and resolves with a configured
@@ -556,15 +774,27 @@ mod tests {
     async fn builder_registers_intake_recovery_and_specialist_ticks() {
         let cfg = cfg_with(50, 0);
         let tracker = Arc::new(StaticTracker::new(issues(2))) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
-        // Intake + recovery + specialist; integration / QA / follow-up
-        // approval / budget-pause ticks layer on in subsequent steps.
-        assert_eq!(bundle.scheduler.tick_count(), 3);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
+        // Intake + recovery + specialist + integration; QA /
+        // follow-up approval / budget-pause ticks layer on in
+        // subsequent steps.
+        assert_eq!(bundle.scheduler.tick_count(), 4);
         assert!(bundle.claimed_runs.is_empty());
         assert!(bundle.recovery_dispatch.is_empty());
         assert!(bundle.specialist_dispatch.is_empty());
+        assert!(bundle.integration_dispatch.is_empty());
         assert_eq!(
             bundle.specialist_runner.max_concurrent(),
+            cfg.agent.max_concurrent_agents as usize,
+        );
+        assert_eq!(
+            bundle.integration_runner.max_concurrent(),
             cfg.agent.max_concurrent_agents as usize,
         );
     }
@@ -573,7 +803,13 @@ mod tests {
     async fn builder_maps_polling_config_into_scheduler_cadence() {
         let cfg = cfg_with(123, 45);
         let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
         let sc = bundle.scheduler.config();
         assert_eq!(sc.interval, Duration::from_millis(123));
         assert_eq!(sc.jitter, Duration::from_millis(45));
@@ -583,7 +819,13 @@ mod tests {
     async fn tick_once_publishes_active_set_into_shared_store() {
         let cfg = cfg_with(10, 0);
         let tracker = Arc::new(StaticTracker::new(issues(3))) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             active_set,
@@ -592,8 +834,8 @@ mod tests {
 
         assert!(active_set.is_empty());
         let report = scheduler.tick_once().await;
-        // intake + recovery + specialist
-        assert_eq!(report.outcomes.len(), 3);
+        // intake + recovery + specialist + integration
+        assert_eq!(report.outcomes.len(), 4);
         assert_eq!(report.outcomes[0].processed, 3);
         assert_eq!(active_set.len(), 3);
         assert_eq!(
@@ -610,7 +852,13 @@ mod tests {
     async fn run_advances_under_configured_cadence_until_cancelled() {
         let cfg = cfg_with(2, 0);
         let tracker = Arc::new(StaticTracker::new(issues(1))) as Arc<dyn TrackerRead>;
-        let bundle = build_scheduler_v2(&cfg, tracker, noop_dispatcher());
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
         let SchedulerV2Bundle {
             scheduler,
             active_set,
@@ -674,6 +922,8 @@ mod tests {
             &cfg,
             tracker_inner.clone() as Arc<dyn TrackerRead>,
             noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -722,6 +972,8 @@ mod tests {
             &cfg,
             tracker_inner.clone() as Arc<dyn TrackerRead>,
             noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -755,6 +1007,8 @@ mod tests {
             &cfg,
             tracker_inner.clone() as Arc<dyn TrackerRead>,
             noop_dispatcher(),
+            empty_integration_source(),
+            noop_integration_dispatcher(),
         );
         let SchedulerV2Bundle {
             mut scheduler,
@@ -815,7 +1069,13 @@ mod tests {
         let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
         dispatcher.enable_gate(); // hold every dispatch open
 
-        let bundle = build_scheduler_v2(&cfg, tracker, dispatcher.clone() as Arc<dyn Dispatcher>);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            dispatcher.clone() as Arc<dyn Dispatcher>,
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             specialist_dispatch,
@@ -875,7 +1135,13 @@ mod tests {
         let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
         dispatcher.enable_gate(); // hold the dispatch open
 
-        let bundle = build_scheduler_v2(&cfg, tracker, dispatcher.clone() as Arc<dyn Dispatcher>);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            dispatcher.clone() as Arc<dyn Dispatcher>,
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             specialist_runner,
@@ -909,7 +1175,13 @@ mod tests {
         .await;
         let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
 
-        let bundle = build_scheduler_v2(&cfg, tracker, dispatcher.clone() as Arc<dyn Dispatcher>);
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            dispatcher.clone() as Arc<dyn Dispatcher>,
+            empty_integration_source(),
+            noop_integration_dispatcher(),
+        );
         let SchedulerV2Bundle {
             mut scheduler,
             specialist_dispatch,
@@ -958,5 +1230,187 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         acc
+    }
+
+    // ---------------------------------------------------------------------
+    // Integration tick + runner end-to-end coverage.
+    //
+    // Each scenario builds the scheduler with a `GateAwareIntegrationSource`
+    // pre-loaded for the workflow's [`IntegrationGates`], ticks the
+    // scheduler (which fans the integration tick → enqueues a dispatch
+    // request when the gates allow it), then drives the runner exposed
+    // on the bundle. The runner is the load-bearing piece this checklist
+    // step adds.
+    // ---------------------------------------------------------------------
+
+    fn cfg_with_integration_gates(
+        require_all_children_terminal: bool,
+        require_no_open_blockers: bool,
+    ) -> WorkflowConfig {
+        let mut c = cfg_with(10, 0);
+        c.integration.require_all_children_terminal = require_all_children_terminal;
+        c.integration.require_no_open_blockers = require_no_open_blockers;
+        c
+    }
+
+    /// Ready: source surfaces a candidate under the workflow's default
+    /// gates → the integration tick enqueues a dispatch request → the
+    /// runner invokes the dispatcher and reports `Completed`.
+    #[tokio::test]
+    async fn builder_dispatches_integration_candidates_when_ready() {
+        let cfg = cfg_with_integration_gates(true, true);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(GateAwareIntegrationSource::new());
+        source.set(
+            IntegrationGates::default(),
+            vec![integration_candidate(
+                42,
+                "PROJ-42",
+                IntegrationRequestCause::AllChildrenTerminal,
+            )],
+        );
+        let dispatcher = Arc::new(RecordingIntegrationDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            source.clone() as Arc<dyn IntegrationQueueSource>,
+            dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            integration_dispatch,
+            integration_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(integration_dispatch.len(), 1);
+
+        let report = integration_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.deferred_capacity, 0);
+
+        let outcomes = wait_for_integration_outcomes(&integration_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].parent_id, WorkItemId::new(42));
+        assert_eq!(outcomes[0].parent_identifier, "PROJ-42");
+        assert_eq!(outcomes[0].reason, IntegrationDispatchReason::Completed);
+        assert_eq!(dispatcher.calls(), vec!["PROJ-42"]);
+    }
+
+    /// Blocked: source returns nothing under default gates (e.g. a
+    /// subtree blocker keeps the parent suppressed upstream) → the
+    /// integration tick emits no request and the runner has nothing to
+    /// dispatch.
+    #[tokio::test]
+    async fn builder_emits_nothing_when_subtree_blocked() {
+        let cfg = cfg_with_integration_gates(true, true);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(GateAwareIntegrationSource::new());
+        // Default gates: empty list models "subtree blocked upstream".
+        source.set(IntegrationGates::default(), Vec::new());
+        // The waived view *would* surface a candidate, but the workflow
+        // is configured with the default (gates-on) view so the tick
+        // must never see it.
+        source.set(
+            IntegrationGates {
+                require_all_children_terminal: true,
+                require_no_open_blockers: false,
+            },
+            vec![integration_candidate(
+                7,
+                "PROJ-7",
+                IntegrationRequestCause::DirectIntegrationRequest,
+            )],
+        );
+        let dispatcher = Arc::new(RecordingIntegrationDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            source.clone() as Arc<dyn IntegrationQueueSource>,
+            dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            integration_dispatch,
+            integration_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert!(integration_dispatch.is_empty());
+
+        let report = integration_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert!(report.is_idle());
+        assert!(dispatcher.calls().is_empty());
+    }
+
+    /// Waived: workflow flips `require_no_open_blockers` to `false`. The
+    /// integration tick now reads the waived view and surfaces a parent
+    /// that the default-gates view would have suppressed → the runner
+    /// dispatches it. Demonstrates the workflow gate config flowing
+    /// end-to-end into the kernel-side [`IntegrationGates`].
+    #[tokio::test]
+    async fn builder_honors_waived_blocker_gate_from_workflow_config() {
+        let cfg = cfg_with_integration_gates(true, false);
+        let tracker = Arc::new(StaticTracker::new(Vec::new())) as Arc<dyn TrackerRead>;
+        let source = Arc::new(GateAwareIntegrationSource::new());
+        // Default gates: nothing (proves we're not falling back to the
+        // default view by accident).
+        source.set(IntegrationGates::default(), Vec::new());
+        // Waived blocker gate: one parent surfaces.
+        source.set(
+            IntegrationGates {
+                require_all_children_terminal: true,
+                require_no_open_blockers: false,
+            },
+            vec![integration_candidate(
+                7,
+                "PROJ-7",
+                IntegrationRequestCause::DirectIntegrationRequest,
+            )],
+        );
+        let dispatcher = Arc::new(RecordingIntegrationDispatcher::new(
+            IntegrationDispatchReason::Completed,
+        ));
+
+        let bundle = build_scheduler_v2(
+            &cfg,
+            tracker,
+            noop_dispatcher(),
+            source.clone() as Arc<dyn IntegrationQueueSource>,
+            dispatcher.clone() as Arc<dyn IntegrationDispatcher>,
+        );
+        let SchedulerV2Bundle {
+            mut scheduler,
+            integration_dispatch,
+            integration_runner,
+            ..
+        } = bundle;
+
+        scheduler.tick_once().await;
+        assert_eq!(integration_dispatch.len(), 1);
+
+        let report = integration_runner
+            .run_pending(CancellationToken::new())
+            .await;
+        assert_eq!(report.spawned, 1);
+
+        let outcomes = wait_for_integration_outcomes(&integration_runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].parent_id, WorkItemId::new(7));
+        assert_eq!(dispatcher.calls(), vec!["PROJ-7"]);
     }
 }
