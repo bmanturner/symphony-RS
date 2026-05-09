@@ -15,6 +15,7 @@ pub mod agent;
 pub mod blocker;
 pub mod event_bus;
 pub mod events;
+pub mod handoff;
 pub mod poll_loop;
 pub mod retry;
 pub mod role;
@@ -33,6 +34,10 @@ pub use blocker::{
 };
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
+pub use handoff::{
+    BranchOrWorkspace, Handoff, HandoffBlockerRequest, HandoffError, HandoffFollowupRequest,
+    ReadyFor,
+};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use retry::{RetryConfig, RetryEntry, RetryQueue, RetryReason, ScheduleRequest, backoff_for};
 pub use role::{RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName};
