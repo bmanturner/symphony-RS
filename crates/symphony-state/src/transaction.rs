@@ -27,6 +27,10 @@
 
 use rusqlite::Transaction;
 
+use crate::edges::{
+    EdgeId, NewWorkItemEdge, WorkItemEdgeRecord, create_edge_in, get_edge_in,
+    list_open_blockers_for_subtree_in, update_edge_status_in,
+};
 use crate::events::{EventRecord, NewEvent};
 use crate::repository::{
     NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord, create_run_in,
@@ -82,6 +86,38 @@ impl<'conn> StateTransaction<'conn> {
     /// the row does not exist.
     pub fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool> {
         update_run_status_in(&self.tx, id, status)
+    }
+
+    /// Insert a parent/child, blocker, relates-to, or follow-up edge.
+    ///
+    /// Composing edge inserts inside the same transaction as the
+    /// `work_items` rows they reference is what keeps the
+    /// parent-completion gate (Phase 5) consistent: the propagation
+    /// query in [`Self::list_open_blockers_for_subtree`] cannot observe
+    /// a half-built tree.
+    pub fn create_edge(&mut self, new: NewWorkItemEdge<'_>) -> StateResult<WorkItemEdgeRecord> {
+        create_edge_in(&self.tx, new)
+    }
+
+    /// Read an edge — useful when a transition needs to verify the
+    /// current row before updating its status.
+    pub fn get_edge(&self, id: EdgeId) -> StateResult<Option<WorkItemEdgeRecord>> {
+        get_edge_in(&self.tx, id)
+    }
+
+    /// Update only the edge's lifecycle status. Returns `Ok(false)` if
+    /// the row does not exist.
+    pub fn update_edge_status(&mut self, id: EdgeId, status: &str) -> StateResult<bool> {
+        update_edge_status_in(&self.tx, id, status)
+    }
+
+    /// Propagation query: every open `blocks` edge that gates `target`
+    /// either directly or via `parent_child` descendants.
+    pub fn list_open_blockers_for_subtree(
+        &self,
+        target: WorkItemId,
+    ) -> StateResult<Vec<WorkItemEdgeRecord>> {
+        list_open_blockers_for_subtree_in(&self.tx, target)
     }
 
     /// Append one event to the durable log inside this transaction.
@@ -269,6 +305,60 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "run.started");
         assert_eq!(events[0].run_id, Some(run.id));
+    }
+
+    #[test]
+    fn parent_child_edges_and_blocker_propagation_are_atomic() {
+        use crate::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+
+        let mut db = open();
+        let now = "2026-05-08T00:00:00Z";
+
+        let (parent_id, blocker_id) = db
+            .transaction(|tx| {
+                let parent = tx.create_work_item(sample_work_item("ENG-1", now))?;
+                let child = tx.create_work_item(sample_work_item("ENG-2", now))?;
+                let blocker = tx.create_work_item(sample_work_item("ENG-3", now))?;
+
+                tx.create_edge(NewWorkItemEdge {
+                    parent_id: parent.id,
+                    child_id: child.id,
+                    edge_type: EdgeType::ParentChild,
+                    reason: Some("decomposition"),
+                    status: "linked",
+                    now,
+                })?;
+                let blocker_edge = tx.create_edge(NewWorkItemEdge {
+                    parent_id: blocker.id,
+                    child_id: child.id,
+                    edge_type: EdgeType::Blocks,
+                    reason: Some("needs schema"),
+                    status: "open",
+                    now,
+                })?;
+
+                // Inside the same transaction the propagation query
+                // already sees the freshly inserted edges.
+                let blockers = tx.list_open_blockers_for_subtree(parent.id)?;
+                assert_eq!(blockers.len(), 1);
+                assert_eq!(blockers[0].id, blocker_edge.id);
+
+                tx.append_event(NewEvent {
+                    event_type: "blocker.created",
+                    work_item_id: Some(parent.id),
+                    run_id: None,
+                    payload: r#"{"source":"qa"}"#,
+                    now,
+                })?;
+                Ok((parent.id, blocker_edge.id))
+            })
+            .expect("commit");
+
+        // After commit, the public read API agrees with the transaction
+        // view: the parent has one open propagated blocker.
+        let after = db.list_open_blockers_for_subtree(parent_id).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, blocker_id);
     }
 
     #[test]

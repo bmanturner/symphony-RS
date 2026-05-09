@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod edges;
 pub mod events;
 pub mod migrations;
 pub mod repository;
