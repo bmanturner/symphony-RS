@@ -115,7 +115,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 10 — Follow-up Issue Flow
 
-- [ ] Add follow-up issue proposal/creation API in core.
+- [x] Add follow-up issue proposal/creation API in core.
 - [ ] Allow all roles to emit follow-up requests in structured handoff.
 - [ ] Apply shared workflow policy enum: `create_directly` vs `propose_for_approval`, routed to the follow-up approval queue when approval is required.
 - [ ] Link follow-ups to source work item.

@@ -21,6 +21,7 @@ pub mod decomposition_runner;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
+pub mod followup_request;
 pub mod handoff;
 pub mod integration;
 pub mod integration_request;
@@ -70,6 +71,9 @@ pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use followup::{
     FollowupError, FollowupId, FollowupIssueRequest, FollowupPolicy, FollowupStatus,
+};
+pub use followup_request::{
+    FollowupRequestError, FollowupRequestInput, FollowupSpec, derive_followups,
 };
 pub use handoff::{
     BranchOrWorkspace, Handoff, HandoffBlockerRequest, HandoffError, HandoffFollowupRequest,
