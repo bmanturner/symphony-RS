@@ -30,6 +30,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -150,6 +151,75 @@ pub fn sanitize_identifier(input: &str) -> String {
         .collect()
 }
 
+/// Sanitise `identifier` and reject the three "all-allowlisted but
+/// still hostile" survivors (empty, `.`, `..`).
+///
+/// The sanitiser already maps every disallowed codepoint to `_`, so
+/// only the allowlisted-but-reserved components survive: an empty
+/// string (no on-disk name), `"."` (the workspace root itself), and
+/// `".."` (the root's parent — SPEC §9.5 Invariant 2 explicitly
+/// forbids it). Each is rejected with [`WorkspaceError::InvalidRoot`]
+/// because they indicate a misconfigured tracker or a hostile input;
+/// either way the orchestrator cannot proceed.
+///
+/// Exposed at module scope (rather than on a single manager) so each
+/// strategy claimer ([`LocalFsWorkspace`], [`GitWorktreeClaimer`])
+/// shares the same rule and the property tests cover it exactly once.
+pub fn safe_component(identifier: &str) -> WorkspaceResult<String> {
+    let safe = sanitize_identifier(identifier);
+    match safe.as_str() {
+        "" => Err(WorkspaceError::InvalidRoot(
+            "identifier sanitised to empty string".into(),
+        )),
+        "." | ".." => Err(WorkspaceError::InvalidRoot(format!(
+            "identifier sanitised to reserved component {safe:?}"
+        ))),
+        _ => Ok(safe),
+    }
+}
+
+/// Render a branch-name template using flat `{{key}}` substitution.
+///
+/// Strict: an unclosed `{{` or a `{{key}}` whose name is not in `vars`
+/// returns [`WorkspaceError::InvalidRoot`]. Whitespace inside the
+/// braces is trimmed, so `{{ identifier }}` and `{{identifier}}`
+/// resolve identically. The renderer never emits a literal `{{...}}`
+/// segment in the output; if it cannot fill a variable, the operator
+/// hears about it.
+///
+/// This is the Phase 6 minimum needed for `branch_template` and
+/// `child_branch_template` rendering. Phase 7 will replace it with
+/// the full `{{path.to.value}}` renderer that walks nested context
+/// (role, work item, parent, claim); the flat shape here keeps the
+/// commit focused on git-worktree provisioning without pre-empting
+/// the richer renderer's design.
+pub fn render_branch_template(
+    template: &str,
+    vars: &BTreeMap<&str, &str>,
+) -> WorkspaceResult<String> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find("}}").ok_or_else(|| {
+            WorkspaceError::InvalidRoot(format!(
+                "branch template {template:?} has unclosed {{{{...}}}}",
+            ))
+        })?;
+        let key = after[..end].trim();
+        let value = vars.get(key).ok_or_else(|| {
+            WorkspaceError::InvalidRoot(format!(
+                "branch template {template:?} references unknown variable {key:?}",
+            ))
+        })?;
+        out.push_str(value);
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// Errors a [`WorkspaceManager`] can report.
 ///
 /// Mirrors the structure of `TrackerError` in `symphony-core`: a small,
@@ -177,6 +247,16 @@ pub enum WorkspaceError {
     /// orchestrator decides how to react based on which hook fired.
     #[error("workspace hook failed: {0}")]
     Hook(String),
+
+    /// A git CLI invocation made by a strategy claimer (e.g. the
+    /// [`GitWorktreeClaimer`]) failed. The string carries the failing
+    /// command's stderr tail and exit status so the operator can
+    /// diagnose without re-running. Distinct from [`Self::Io`] so
+    /// callers can branch on git-specific failure handling (retry,
+    /// repair, surface to a follow-up issue) once Phase 8 wires the
+    /// integration owner through this layer.
+    #[error("workspace git failure: {0}")]
+    Git(String),
 }
 
 /// Convenience alias matching the project-wide convention.
@@ -467,16 +547,9 @@ impl LocalFsWorkspace {
     /// indicate a misconfigured tracker or a truly malicious identifier;
     /// either way the orchestrator cannot proceed.
     fn safe_component(identifier: &str) -> WorkspaceResult<String> {
-        let safe = sanitize_identifier(identifier);
-        match safe.as_str() {
-            "" => Err(WorkspaceError::InvalidRoot(
-                "identifier sanitised to empty string".into(),
-            )),
-            "." | ".." => Err(WorkspaceError::InvalidRoot(format!(
-                "identifier sanitised to reserved component {safe:?}"
-            ))),
-            _ => Ok(safe),
-        }
+        // Delegates to the module-level [`safe_component`] so every
+        // strategy claimer shares one rule.
+        safe_component(identifier)
     }
 
     /// Belt-and-suspenders containment check (SPEC §9.5 Invariant 2).
@@ -723,6 +796,238 @@ impl WorkspaceManager for LocalFsWorkspace {
                 path.display()
             ))),
         }
+    }
+}
+
+/// Provisioner for the [`ClaimStrategy::GitWorktree`] strategy.
+///
+/// Materialises a fresh per-issue git worktree under `root` on a
+/// branch derived from `branch_template`. Implementation follows
+/// ARCHITECTURE_v2 §4.6: shell out to the `git` CLI rather than
+/// pulling in `git2`/`gix`, so the dependency footprint stays small
+/// until a concrete need motivates a typed library.
+///
+/// The claimer is intentionally narrow:
+///
+/// - it does *not* implement [`WorkspaceManager`] — that trait's
+///   single-arg `claim(&str)` signature is too thin for git-worktree
+///   provisioning, which needs a base ref and template; later phases
+///   add a strategy-dispatching manager that picks claimers per work
+///   item;
+/// - it does *not* run lifecycle hooks — Phase 6 keeps hook semantics
+///   on [`LocalFsWorkspace`] until the strategies converge under a
+///   shared dispatcher;
+/// - it does *not* yet verify cwd/branch/clean-tree — those are
+///   distinct checklist items in Phase 6 and each lands with its own
+///   commit and dedicated tests.
+///
+/// Idempotency rule: if the worktree directory already exists, the
+/// claimer returns the existing path without re-running
+/// `git worktree add`, mirroring [`LocalFsWorkspace::claim`]'s
+/// reuse semantics. `created_now` distinguishes the two cases for
+/// callers that want to fire one-shot setup hooks.
+#[derive(Debug, Clone)]
+pub struct GitWorktreeClaimer {
+    repo: PathBuf,
+    root: PathBuf,
+    base_ref: String,
+    branch_template: String,
+    cleanup: CleanupPolicy,
+}
+
+impl GitWorktreeClaimer {
+    /// Construct a claimer rooted at `root`, sourcing branches from
+    /// `repo` against `base_ref`.
+    ///
+    /// `repo` must be an existing directory (the source git
+    /// repository whose object database backs every produced
+    /// worktree). `root` must also exist; symphony does not create
+    /// either side because the operator's choice of layout is a
+    /// deployment concern (mount points, volumes) and silently
+    /// creating one would mask configuration mistakes — the same
+    /// rationale [`LocalFsWorkspace::new`] applies to its root.
+    ///
+    /// Both paths are canonicalised so downstream containment checks
+    /// compare absolute paths and a symlink planted under `root`
+    /// cannot smuggle a worktree outside it.
+    pub fn new(
+        repo: impl AsRef<Path>,
+        root: impl AsRef<Path>,
+        base_ref: impl Into<String>,
+        branch_template: impl Into<String>,
+        cleanup: CleanupPolicy,
+    ) -> WorkspaceResult<Self> {
+        let repo = repo.as_ref();
+        if !repo.is_dir() {
+            return Err(WorkspaceError::InvalidRoot(format!(
+                "git repo {} does not exist or is not a directory",
+                repo.display()
+            )));
+        }
+        let root = root.as_ref();
+        if !root.is_dir() {
+            return Err(WorkspaceError::InvalidRoot(format!(
+                "workspace root {} does not exist or is not a directory",
+                root.display()
+            )));
+        }
+        let repo = std::fs::canonicalize(repo)
+            .map_err(|e| WorkspaceError::InvalidRoot(format!("canonicalize repo: {e}")))?;
+        let root = std::fs::canonicalize(root)
+            .map_err(|e| WorkspaceError::InvalidRoot(format!("canonicalize root: {e}")))?;
+        Ok(Self {
+            repo,
+            root,
+            base_ref: base_ref.into(),
+            branch_template: branch_template.into(),
+            cleanup,
+        })
+    }
+
+    /// Canonical workspace root the claimer mints worktrees under.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Source repository whose object database backs each worktree.
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Claim a per-issue worktree for `identifier`.
+    ///
+    /// Behaviour:
+    ///
+    /// 1. Sanitise `identifier` (`{{identifier}}` resolves to the
+    ///    sanitised form so the branch name and the directory name
+    ///    stay in lockstep).
+    /// 2. Render `branch_template` with `identifier`. An unknown
+    ///    variable in the template is fatal.
+    /// 3. If the directory already exists, treat the claim as a reuse
+    ///    and skip the git invocation. Returned `created_now = false`.
+    /// 4. Otherwise run `git -C <repo> worktree add -b <branch>
+    ///    <path> <base>`. If git reports the branch already exists
+    ///    (a previous claim was rolled back without `git worktree
+    ///    remove`), retry as `git worktree add <path> <branch>` so
+    ///    the existing branch is checked out instead of being
+    ///    overwritten.
+    /// 5. Canonicalise the resulting path and assert it is contained
+    ///    under `root` (SPEC §9.5 Invariant 2).
+    ///
+    /// Verification (`cwd`, `branch matches`, `clean tree`) is left
+    /// at [`VerificationStatus::Pending`]; a later Phase 6 item adds
+    /// the verifier passes that flip it to `Passed`/`Failed` before
+    /// the orchestrator launches an agent.
+    pub async fn claim(
+        &self,
+        identifier: &str,
+        work_item_id: Option<i64>,
+    ) -> WorkspaceResult<WorkspaceClaim> {
+        let safe = safe_component(identifier)?;
+        let path = self.root.join(&safe);
+
+        let mut vars: BTreeMap<&str, &str> = BTreeMap::new();
+        vars.insert("identifier", safe.as_str());
+        let branch = render_branch_template(&self.branch_template, &vars)?;
+
+        let existed = fs::try_exists(&path)
+            .await
+            .map_err(|e| WorkspaceError::Io(format!("stat {}: {e}", path.display())))?;
+
+        if !existed {
+            self.git_worktree_add(&path, &branch).await?;
+        }
+
+        // Containment: even though the path was sanitised, a symlink
+        // planted under `root` could still redirect the worktree
+        // outside it. Canonicalise after creation and confirm we
+        // landed inside the canonical root.
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|e| WorkspaceError::Io(format!("canonicalize {}: {e}", path.display())))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(WorkspaceError::InvalidRoot(format!(
+                "worktree path {} escaped root {}",
+                canonical.display(),
+                self.root.display()
+            )));
+        }
+
+        Ok(WorkspaceClaim {
+            path,
+            strategy: ClaimStrategy::GitWorktree,
+            base_ref: Some(self.base_ref.clone()),
+            branch: Some(branch),
+            owner: Some(ClaimOwner {
+                identifier: safe,
+                work_item_id,
+            }),
+            cleanup: self.cleanup,
+            verification: VerificationReport::default(),
+            created_now: !existed,
+        })
+    }
+
+    async fn git_worktree_add(&self, path: &Path, branch: &str) -> WorkspaceResult<()> {
+        // First attempt: create a new branch at `base_ref` and check
+        // it out into `path`. This is the happy path — a fresh issue
+        // with no prior branch.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(branch)
+            .arg(path)
+            .arg(&self.base_ref)
+            .output()
+            .await
+            .map_err(|e| WorkspaceError::Git(format!("spawn git worktree add: {e}")))?;
+
+        if out.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+        // Recover from "branch already exists" by checking the
+        // existing branch out instead of re-creating it. A prior run
+        // that crashed between branch creation and worktree add (or
+        // a manual `git worktree remove` that didn't `branch -D`)
+        // leaves the branch behind; force-creating a new branch with
+        // `-B` would silently discard whatever was on it. Re-using is
+        // the safer default.
+        if stderr.contains("already exists") || stderr.contains("already used") {
+            let retry = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .arg("worktree")
+                .arg("add")
+                .arg(path)
+                .arg(branch)
+                .output()
+                .await
+                .map_err(|e| WorkspaceError::Git(format!("spawn git worktree add (retry): {e}")))?;
+            if retry.status.success() {
+                return Ok(());
+            }
+            return Err(WorkspaceError::Git(format!(
+                "git worktree add {} {} failed ({}): {}",
+                path.display(),
+                branch,
+                retry.status,
+                String::from_utf8_lossy(&retry.stderr).trim()
+            )));
+        }
+
+        Err(WorkspaceError::Git(format!(
+            "git worktree add -b {} {} {} failed ({}): {}",
+            branch,
+            path.display(),
+            self.base_ref,
+            out.status,
+            stderr.trim()
+        )))
     }
 }
 
@@ -1436,6 +1741,304 @@ mod tests {
         assert_eq!(claim.verification.status, VerificationStatus::Passed);
         assert_eq!(claim.verification.checks.len(), 1);
         assert_eq!(claim.verification.checks[0].name, "cwd_in_workspace");
+    }
+
+    // ----- branch template renderer (Phase 6) -----------------------------
+
+    /// `{{identifier}}` resolves from the supplied vars. The default
+    /// branch template (`"symphony/{{identifier}}"`) is the canonical
+    /// case driving Phase 6's worktree provisioning.
+    #[test]
+    fn render_branch_template_substitutes_known_variable() {
+        let mut vars: BTreeMap<&str, &str> = BTreeMap::new();
+        vars.insert("identifier", "ENG-42");
+        let out = render_branch_template("symphony/{{identifier}}", &vars).unwrap();
+        assert_eq!(out, "symphony/ENG-42");
+    }
+
+    /// Whitespace inside `{{ ... }}` is trimmed so an operator's
+    /// `{{ identifier }}` does not silently miss the lookup.
+    #[test]
+    fn render_branch_template_trims_whitespace_inside_braces() {
+        let mut vars: BTreeMap<&str, &str> = BTreeMap::new();
+        vars.insert("identifier", "ENG-42");
+        let out = render_branch_template("symphony/{{ identifier }}", &vars).unwrap();
+        assert_eq!(out, "symphony/ENG-42");
+    }
+
+    /// Templates with no placeholders pass through verbatim — the
+    /// renderer must not introduce spurious churn on plain literals.
+    #[test]
+    fn render_branch_template_passes_literals_through() {
+        let vars: BTreeMap<&str, &str> = BTreeMap::new();
+        assert_eq!(
+            render_branch_template("just/a/literal", &vars).unwrap(),
+            "just/a/literal",
+        );
+    }
+
+    /// An unknown variable is fatal: SPEC v2 §5.9 requires unknown
+    /// vars to fail render rather than silently emit literal
+    /// `{{...}}` segments. A branch named `symphony/{{role}}` would
+    /// otherwise be an obvious operator footgun.
+    #[test]
+    fn render_branch_template_rejects_unknown_variable() {
+        let vars: BTreeMap<&str, &str> = BTreeMap::new();
+        let err = render_branch_template("symphony/{{identifier}}", &vars).unwrap_err();
+        match err {
+            WorkspaceError::InvalidRoot(msg) => {
+                assert!(
+                    msg.contains("identifier"),
+                    "error should name the missing variable, got {msg:?}",
+                );
+            }
+            other => panic!("expected InvalidRoot, got {other:?}"),
+        }
+    }
+
+    /// An unclosed `{{` is a malformed template — surface it loudly
+    /// so the operator fixes the typo before any worktree is created.
+    #[test]
+    fn render_branch_template_rejects_unclosed_placeholder() {
+        let mut vars: BTreeMap<&str, &str> = BTreeMap::new();
+        vars.insert("identifier", "ENG-42");
+        let err = render_branch_template("symphony/{{identifier", &vars).unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// Multiple placeholders in one template are all resolved.
+    #[test]
+    fn render_branch_template_handles_multiple_variables() {
+        let mut vars: BTreeMap<&str, &str> = BTreeMap::new();
+        vars.insert("role", "qa");
+        vars.insert("identifier", "ENG-42");
+        let out = render_branch_template("symphony/{{role}}/{{identifier}}", &vars).unwrap();
+        assert_eq!(out, "symphony/qa/ENG-42");
+    }
+
+    // ----- GitWorktreeClaimer (Phase 6) -----------------------------------
+
+    /// Initialise an empty git repo with one commit on `main` so
+    /// `git worktree add` has a base ref to branch from. Centralised
+    /// here to keep the worktree tests focused on the claimer's
+    /// behaviour rather than git plumbing.
+    #[cfg(unix)]
+    async fn init_repo_with_main_commit() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "test@symphony.invalid"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(&args)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        }
+        std::fs::write(path.join("README.md"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(&args)
+                .output()
+                .await
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        }
+        dir
+    }
+
+    /// Read the branch a worktree is checked out on so the test can
+    /// witness the rendered branch template made it onto disk.
+    #[cfg(unix)]
+    async fn worktree_branch(path: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .await
+            .expect("git rev-parse");
+        assert!(out.status.success(), "rev-parse failed: {:?}", out);
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Happy path: claim materialises a worktree under `root`, on the
+    /// rendered branch, with the v2 envelope populated. This is the
+    /// regression guard for the Phase 6 git_worktree strategy.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_worktree_claim_creates_branch_and_worktree() {
+        let repo = init_repo_with_main_commit().await;
+        let root = TempDir::new().unwrap();
+        let claimer = GitWorktreeClaimer::new(
+            repo.path(),
+            root.path(),
+            "main",
+            "symphony/{{identifier}}",
+            CleanupPolicy::default(),
+        )
+        .unwrap();
+
+        let claim = claimer.claim("ENG-42", Some(7)).await.unwrap();
+
+        assert!(claim.path.is_dir());
+        assert!(claim.path.starts_with(claimer.root()));
+        assert_eq!(claim.strategy, ClaimStrategy::GitWorktree);
+        assert_eq!(claim.base_ref.as_deref(), Some("main"));
+        assert_eq!(claim.branch.as_deref(), Some("symphony/ENG-42"));
+        let owner = claim.owner.as_ref().expect("owner present");
+        assert_eq!(owner.identifier, "ENG-42");
+        assert_eq!(owner.work_item_id, Some(7));
+        assert_eq!(claim.cleanup, CleanupPolicy::RetainUntilDone);
+        assert_eq!(claim.verification.status, VerificationStatus::Pending);
+        assert!(claim.created_now);
+        assert_eq!(worktree_branch(&claim.path).await, "symphony/ENG-42");
+    }
+
+    /// SPEC §9.2-equivalent reuse semantics: the second claim for
+    /// the same identifier returns the existing worktree without
+    /// re-running `git worktree add`, and reports `created_now =
+    /// false`. The `after_create`-style firing decision (when later
+    /// phases unify hooks under a strategy dispatcher) depends on
+    /// this flag.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_worktree_claim_is_idempotent() {
+        let repo = init_repo_with_main_commit().await;
+        let root = TempDir::new().unwrap();
+        let claimer = GitWorktreeClaimer::new(
+            repo.path(),
+            root.path(),
+            "main",
+            "symphony/{{identifier}}",
+            CleanupPolicy::default(),
+        )
+        .unwrap();
+
+        let first = claimer.claim("ENG-42", None).await.unwrap();
+        let second = claimer.claim("ENG-42", None).await.unwrap();
+
+        assert_eq!(first.path, second.path);
+        assert!(first.created_now);
+        assert!(!second.created_now, "reuse must not report created_now");
+        assert_eq!(second.branch.as_deref(), Some("symphony/ENG-42"));
+    }
+
+    /// Branch template with a variable the claimer does not provide
+    /// is fatal — the operator must hear about a typo (`{{role}}`,
+    /// `{{parent}}`) before any worktree is created. The Phase 6
+    /// renderer only supplies `{{identifier}}`; richer context is a
+    /// Phase 7 concern.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_worktree_claim_rejects_unknown_template_variable() {
+        let repo = init_repo_with_main_commit().await;
+        let root = TempDir::new().unwrap();
+        let claimer = GitWorktreeClaimer::new(
+            repo.path(),
+            root.path(),
+            "main",
+            "symphony/{{role}}/{{identifier}}",
+            CleanupPolicy::default(),
+        )
+        .unwrap();
+
+        let err = claimer.claim("ENG-42", None).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+        // No directory should have been created on a render failure.
+        assert!(!root.path().join("ENG-42").exists());
+    }
+
+    /// Sanitisation rule must apply to git-worktree claims too: a
+    /// hostile identifier collapses to a single child component
+    /// under `root`, the rendered branch reflects the sanitised
+    /// form, and the path stays contained.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_worktree_claim_sanitises_identifier() {
+        let repo = init_repo_with_main_commit().await;
+        let root = TempDir::new().unwrap();
+        let claimer = GitWorktreeClaimer::new(
+            repo.path(),
+            root.path(),
+            "main",
+            "symphony/{{identifier}}",
+            CleanupPolicy::default(),
+        )
+        .unwrap();
+
+        let claim = claimer.claim("ORG/repo#7", None).await.unwrap();
+        assert_eq!(claim.path.parent().unwrap(), claimer.root());
+        assert_eq!(claim.path.file_name().unwrap(), "ORG_repo_7");
+        assert_eq!(claim.branch.as_deref(), Some("symphony/ORG_repo_7"));
+        assert_eq!(worktree_branch(&claim.path).await, "symphony/ORG_repo_7");
+    }
+
+    /// Reserved component (`..`) survives sanitisation but must be
+    /// rejected before any git invocation. Mirrors
+    /// [`LocalFsWorkspace`]'s containment guarantee.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_worktree_claim_rejects_dot_dot_identifier() {
+        let repo = init_repo_with_main_commit().await;
+        let root = TempDir::new().unwrap();
+        let claimer = GitWorktreeClaimer::new(
+            repo.path(),
+            root.path(),
+            "main",
+            "symphony/{{identifier}}",
+            CleanupPolicy::default(),
+        )
+        .unwrap();
+
+        let err = claimer.claim("..", None).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
+    }
+
+    /// `cleanup` flows verbatim from claimer config to the produced
+    /// claim so later cleanup logic (Phase 11+) can branch on it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn git_worktree_claim_propagates_cleanup_policy() {
+        let repo = init_repo_with_main_commit().await;
+        let root = TempDir::new().unwrap();
+        let claimer = GitWorktreeClaimer::new(
+            repo.path(),
+            root.path(),
+            "main",
+            "symphony/{{identifier}}",
+            CleanupPolicy::RemoveAfterRun,
+        )
+        .unwrap();
+
+        let claim = claimer.claim("ENG-1", None).await.unwrap();
+        assert_eq!(claim.cleanup, CleanupPolicy::RemoveAfterRun);
+    }
+
+    /// Constructor validates that `repo` exists. A typo in the
+    /// repo path is a deployment-config bug; surface it before any
+    /// claim attempt rather than failing every claim with a confusing
+    /// `git` error.
+    #[test]
+    fn git_worktree_claimer_rejects_missing_repo() {
+        let root = TempDir::new().unwrap();
+        let err = GitWorktreeClaimer::new(
+            root.path().join("nope"),
+            root.path(),
+            "main",
+            "symphony/{{identifier}}",
+            CleanupPolicy::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, WorkspaceError::InvalidRoot(_)));
     }
 
     /// Defaults document the "no work has been done yet" state of a
