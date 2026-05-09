@@ -177,7 +177,7 @@ One unchecked item per implementation iteration. Each item should land with test
     - [x] Wire `LeaseHeartbeat` into `FollowupApprovalRunner` under the same contract, with tests across approve/reject paths proving expiry advances mid-flight and pulse failures surface typed observations.
     - [x] Wire `LeaseHeartbeat` into `BudgetPauseRunner` under the same contract, with tests across resume/hold paths proving expiry advances mid-flight and pulse failures surface typed observations.
     - [x] Wire `LeaseHeartbeat` into `RecoveryRunner` under the same contract (recovery dispatches are themselves runs), with tests across reaped/orphaned outcomes proving expiry advances mid-flight and pulse failures surface typed observations.
-  - [ ] Surface expired-lease reap candidates from `RunRepository::find_expired_leases` into the `RecoveryQueueTick` source view so the recovery runner dispatches them, with tests proving expired leases trigger recovery dispatches once, released leases do not, and renewals (refreshed `lease_expires_at`) prune already-claimed candidates.
+  - [x] Surface expired-lease reap candidates from `RunRepository::find_expired_leases` into the `RecoveryQueueTick` source view so the recovery runner dispatches them, with tests proving expired leases trigger recovery dispatches once, released leases do not, and renewals (refreshed `lease_expires_at`) prune already-claimed candidates.
 - [ ] Add global/role/agent/repository concurrency limits.
 - [ ] Add retry policy with max retries, budget awareness, durable budget pauses, and `BudgetExceeded` events.
 - [ ] Add cancellation path that records durable run status.
