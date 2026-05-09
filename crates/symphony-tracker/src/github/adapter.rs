@@ -1,6 +1,6 @@
 //! `GitHubTracker` — first slice of the GitHub Issues adapter.
 //!
-//! Implements [`IssueTracker::fetch_active`] against the REST endpoint
+//! Implements [`TrackerRead::fetch_active`] against the REST endpoint
 //! `GET /repos/{owner}/{repo}/issues?state=open` via `octocrab`. The
 //! remaining trait methods return errors flagged as not-yet-implemented
 //! so the orchestrator never silently dispatches against an
@@ -38,7 +38,7 @@
 //! | `octocrab::Error::Hyper`/`Service`/etc. | `Transport`    |
 //! | `octocrab::Error::Serde`/`Json`         | `Malformed`    |
 //!
-//! [`IssueTracker::fetch_active`]: crate::IssueTracker::fetch_active
+//! [`TrackerRead::fetch_active`]: crate::TrackerRead::fetch_active
 
 use std::sync::Arc;
 
@@ -52,7 +52,7 @@ use octocrab::params::State as GhState;
 use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::IssueTracker;
+use crate::TrackerRead;
 use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
 use symphony_core::tracker_trait::{TrackerError, TrackerResult};
 
@@ -114,7 +114,7 @@ impl GitHubConfig {
     }
 }
 
-/// Production [`IssueTracker`] adapter targeting GitHub's REST API.
+/// Production [`TrackerRead`] adapter targeting GitHub's REST API.
 ///
 /// Cheap to clone — the underlying [`Octocrab`] handle is `Arc`-shared.
 #[derive(Clone)]
@@ -234,7 +234,7 @@ impl GitHubTracker {
 }
 
 #[async_trait]
-impl IssueTracker for GitHubTracker {
+impl TrackerRead for GitHubTracker {
     async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
         // Pull all open issues. GitHub's `/issues` endpoint also returns
         // pull requests (an "issue" in GitHub's data model is the
@@ -298,7 +298,7 @@ impl IssueTracker for GitHubTracker {
         //
         // No silent dropping: any 404 (or other failure) on a single id
         // surfaces as the whole call returning an error, matching the
-        // trait contract on [`IssueTracker::fetch_state`]. Otherwise a
+        // trait contract on [`TrackerRead::fetch_state`]. Otherwise a
         // deleted issue would masquerade as still-running.
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {

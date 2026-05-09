@@ -297,7 +297,7 @@ impl Default for TrackerConfig {
     }
 }
 
-/// Adapter discriminator for the `IssueTracker` trait.
+/// Adapter discriminator for the `TrackerRead` trait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackerKind {

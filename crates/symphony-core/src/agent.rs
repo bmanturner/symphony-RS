@@ -2,7 +2,7 @@
 //! concrete coding-agent backend (Codex app-server, Claude Code stream-json,
 //! the Tandem composite, …).
 //!
-//! Like [`crate::tracker_trait::IssueTracker`], this trait lives in
+//! Like [`crate::tracker_trait::TrackerRead`], this trait lives in
 //! `symphony-core` deliberately: the orchestrator never speaks Codex or
 //! Claude protocol. It only sees the normalized [`AgentEvent`] stream
 //! defined here. All backend-specific framing — Codex JSONL `app-server`

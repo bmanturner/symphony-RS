@@ -159,7 +159,7 @@ pub enum LoadError {
 /// Read `path` and build a [`MockTracker`] populated from the file.
 ///
 /// The returned tracker is fully constructed and ready to be wrapped in
-/// `Arc<dyn IssueTracker>`. The original [`Fixtures`] document is also
+/// `Arc<dyn TrackerRead>`. The original [`Fixtures`] document is also
 /// returned for tests / diagnostics — callers that don't need it can
 /// `let (tracker, _) = load(path)?;`.
 pub fn load(path: impl AsRef<Path>) -> Result<(MockTracker, Fixtures), LoadError> {
@@ -197,7 +197,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use symphony_core::tracker::{IssueId, IssueState};
-    use symphony_core::tracker_trait::IssueTracker;
+    use symphony_core::tracker_trait::TrackerRead;
 
     fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();

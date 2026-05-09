@@ -16,7 +16,7 @@
 //! number, leaving the test free to override only the fields that
 //! matter (state, labels, body, etc.).
 //!
-//! [`IssueTracker::fetch_active`]: symphony_tracker::IssueTracker::fetch_active
+//! [`TrackerRead::fetch_active`]: symphony_tracker::TrackerRead::fetch_active
 
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use symphony_core::tracker::{Issue, IssueId, IssueState};
 use symphony_core::tracker_trait::TrackerError;
 use symphony_tracker::conformance::{Scenario, github_canonical_scenario, run_full_suite};
-use symphony_tracker::{GitHubConfig, GitHubTracker, IssueTracker};
+use symphony_tracker::{GitHubConfig, GitHubTracker, TrackerRead};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -803,7 +803,7 @@ async fn github_against(scenario: Scenario) -> (MockServer, GitHubTracker) {
 async fn github_tracker_passes_the_full_conformance_suite() {
     let scenario = github_canonical_scenario();
     let (_server, tracker) = github_against(scenario.clone()).await;
-    let dyn_tracker: Arc<dyn IssueTracker> = Arc::new(tracker);
+    let dyn_tracker: Arc<dyn TrackerRead> = Arc::new(tracker);
     run_full_suite(dyn_tracker.as_ref(), &scenario).await;
 }
 

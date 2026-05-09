@@ -1,4 +1,4 @@
-//! `LinearTracker` — the production [`IssueTracker`] adapter for Linear.
+//! `LinearTracker` — the production [`TrackerRead`] adapter for Linear.
 //!
 //! The adapter speaks Linear's GraphQL API at
 //! `https://api.linear.app/graphql` (overridable for tests via
@@ -12,7 +12,7 @@
 //! Per SPEC §11.1, the three operations the orchestrator depends on are
 //! `fetch_candidate_issues`, `fetch_issues_by_states`, and
 //! `fetch_issue_states_by_ids`. The trait method names map 1:1 to those
-//! operations (see [`crate::IssueTracker`] doc comments for the rename
+//! operations (see [`crate::TrackerRead`] doc comments for the rename
 //! rationale). All Linear-specific concerns — pagination, GraphQL error
 //! shape, HTTP status interpretation, label lowercasing, priority
 //! rounding — are implemented in this file and stop here.
@@ -49,7 +49,7 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::IssueTracker;
+use crate::TrackerRead;
 use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
 use symphony_core::tracker_trait::{TrackerError, TrackerResult};
 
@@ -116,7 +116,7 @@ impl LinearConfig {
     }
 }
 
-/// Production [`IssueTracker`] adapter targeting Linear's GraphQL API.
+/// Production [`TrackerRead`] adapter targeting Linear's GraphQL API.
 ///
 /// Construct via [`LinearTracker::new`]; the resulting handle is cheap
 /// to clone (a `reqwest::Client` is internally `Arc`-shared) so the
@@ -307,7 +307,7 @@ impl LinearTracker {
 }
 
 #[async_trait]
-impl IssueTracker for LinearTracker {
+impl TrackerRead for LinearTracker {
     async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
         self.paginate_candidate().await
     }

@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use symphony_core::tracker::{Issue, IssueId, IssueState};
 use symphony_core::tracker_trait::TrackerError;
 use symphony_tracker::conformance::{Scenario, canonical_scenario, run_full_suite};
-use symphony_tracker::{IssueTracker, LinearConfig, LinearTracker};
+use symphony_tracker::{LinearConfig, LinearTracker, TrackerRead};
 use url::Url;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -238,7 +238,7 @@ async fn linear_against(scenario: Scenario) -> (MockServer, LinearTracker) {
 async fn linear_tracker_passes_the_full_conformance_suite() {
     let scenario = canonical_scenario();
     let (_server, tracker) = linear_against(scenario.clone()).await;
-    let dyn_tracker: Arc<dyn IssueTracker> = Arc::new(tracker);
+    let dyn_tracker: Arc<dyn TrackerRead> = Arc::new(tracker);
     run_full_suite(dyn_tracker.as_ref(), &scenario).await;
 }
 

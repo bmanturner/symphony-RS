@@ -1,4 +1,4 @@
-//! Cross-adapter conformance suite for the [`IssueTracker`] trait.
+//! Cross-adapter conformance suite for the [`TrackerRead`] trait.
 //!
 //! Each adapter shipped under `symphony-tracker` MUST appear here as an
 //! `rstest` `#[case]` so the same set of trait-level invariants runs
@@ -9,7 +9,7 @@
 //! ## How to add a new adapter
 //!
 //! 1. Build a fixture-loader that, given a [`Scenario`], returns a handle
-//!    implementing [`IssueTracker`]. For Linear/GitHub adapters this
+//!    implementing [`TrackerRead`]. For Linear/GitHub adapters this
 //!    means standing up a `wiremock` server keyed on the scenario.
 //! 2. Wrap that loader in a [`TrackerHarness::Builder`] entry below and
 //!    add it as another `#[case]` to each `#[rstest]` test.
@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use rstest::rstest;
-use symphony_tracker::IssueTracker;
+use symphony_tracker::TrackerRead;
 use symphony_tracker::conformance::{
     Scenario, assert_active_returns_only_active_states,
     assert_fetch_state_preserves_caller_ordering, assert_no_fabricated_optionals,
@@ -33,7 +33,7 @@ use symphony_tracker::conformance::{
 
 /// One adapter under test, packaged as a name + a builder closure.
 ///
-/// We use an opaque `fn(&Scenario) -> Arc<dyn IssueTracker>` rather than a
+/// We use an opaque `fn(&Scenario) -> Arc<dyn TrackerRead>` rather than a
 /// trait so each `#[case]` is a single function pointer — `rstest` plays
 /// best with `Copy` case values, and trait objects (or async closures)
 /// would force a more elaborate wrapper for no real gain.
@@ -43,10 +43,10 @@ use symphony_tracker::conformance::{
 /// independent setup, or returns a handle that lazily provisions on first
 /// trait call. The Linear/GitHub adapter authors will pick whichever shape
 /// reads cleanest — they only need to satisfy `Fn(&Scenario) ->
-/// Arc<dyn IssueTracker>`.
-type AdapterBuilder = fn(&Scenario) -> Arc<dyn IssueTracker>;
+/// Arc<dyn TrackerRead>`.
+type AdapterBuilder = fn(&Scenario) -> Arc<dyn TrackerRead>;
 
-fn build_mock(scenario: &Scenario) -> Arc<dyn IssueTracker> {
+fn build_mock(scenario: &Scenario) -> Arc<dyn TrackerRead> {
     Arc::new(populate_mock(scenario))
 }
 
@@ -154,7 +154,7 @@ async fn suite_rejects_an_adapter_that_leaks_a_terminal_issue_into_active() {
     let m = MockTracker::new();
     m.set_active(scenario.active_issues.clone());
 
-    let tracker: Arc<dyn IssueTracker> = Arc::new(m);
+    let tracker: Arc<dyn TrackerRead> = Arc::new(m);
     let panicked = tokio::task::spawn(async move {
         assert_active_returns_only_active_states(tracker.as_ref(), &scenario).await;
     })
@@ -185,7 +185,7 @@ async fn suite_rejects_an_adapter_that_fabricates_a_priority() {
         .collect();
     m.set_active(mutated);
 
-    let tracker: Arc<dyn IssueTracker> = Arc::new(m);
+    let tracker: Arc<dyn TrackerRead> = Arc::new(m);
     let scenario_for_task = scenario.clone();
     let panicked = tokio::task::spawn(async move {
         assert_no_fabricated_optionals(tracker.as_ref(), &scenario_for_task).await;
@@ -211,7 +211,7 @@ async fn suite_rejects_an_adapter_whose_fetch_state_silently_drops_terminal_ids(
     // Note: deliberately *not* calling set_terminal — terminal ids are
     // unknown to this mock, mirroring a buggy adapter.
 
-    let tracker: Arc<dyn IssueTracker> = Arc::new(m);
+    let tracker: Arc<dyn TrackerRead> = Arc::new(m);
     let scenario_for_task = scenario.clone();
     let panicked = tokio::task::spawn(async move {
         assert_state_refresh_reports_terminal_state_for_terminal_ids(
@@ -245,7 +245,7 @@ async fn suite_rejects_an_adapter_whose_terminal_recent_drops_known_terminal_iss
         .collect::<Vec<_>>();
     m.set_terminal(truncated);
 
-    let tracker: Arc<dyn IssueTracker> = Arc::new(m);
+    let tracker: Arc<dyn TrackerRead> = Arc::new(m);
     let scenario_for_task = scenario.clone();
     let panicked = tokio::task::spawn(async move {
         assert_terminal_recent_returns_all_known_terminal_issues(
@@ -275,7 +275,7 @@ async fn suite_rejects_an_adapter_whose_terminal_filter_falls_back_on_empty_inpu
     }
 
     #[async_trait]
-    impl IssueTracker for BrokenAdapter {
+    impl TrackerRead for BrokenAdapter {
         async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
             Ok(Vec::new())
         }
@@ -288,7 +288,7 @@ async fn suite_rejects_an_adapter_whose_terminal_filter_falls_back_on_empty_inpu
     }
 
     let scenario = canonical_scenario();
-    let tracker: Arc<dyn IssueTracker> = Arc::new(BrokenAdapter {
+    let tracker: Arc<dyn TrackerRead> = Arc::new(BrokenAdapter {
         all_terminal: scenario.terminal_issues.clone(),
     });
 

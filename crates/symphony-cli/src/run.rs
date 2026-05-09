@@ -17,7 +17,7 @@
 //!                          build_tracker  build_     build_agent_runner
 //!                                |    workspace          |
 //!                                v          v            v
-//!                          IssueTracker  Workspace    AgentRunner
+//!                          TrackerRead  Workspace    AgentRunner
 //!                                Manager
 //!                                \         |          /
 //!                                 \        |         /
@@ -75,7 +75,7 @@ use symphony_core::event_bus::EventBus;
 use symphony_core::poll_loop::{Dispatcher, PollLoop, PollLoopConfig};
 use symphony_core::state_machine::ReleaseReason;
 use symphony_core::tracker::Issue;
-use symphony_core::tracker_trait::IssueTracker;
+use symphony_core::tracker_trait::TrackerRead;
 use symphony_tracker::{
     GitHubConfig, GitHubTracker, LinearConfig, LinearTracker, fixtures as tracker_fixtures,
 };
@@ -216,7 +216,7 @@ fn install_ctrl_c(cancel: CancellationToken) {
 // Tracker factory
 // ---------------------------------------------------------------------------
 
-/// Build an [`IssueTracker`] from `cfg.tracker`.
+/// Build an [`TrackerRead`] from `cfg.tracker`.
 ///
 /// Credential resolution: the API token is read from the env via the
 /// adapter-specific name (`LINEAR_API_KEY`, `GITHUB_TOKEN`) and falls
@@ -232,7 +232,7 @@ fn install_ctrl_c(cancel: CancellationToken) {
 pub(crate) fn build_tracker(
     cfg: &WorkflowConfig,
     workflow_path: &std::path::Path,
-) -> Result<Arc<dyn IssueTracker>> {
+) -> Result<Arc<dyn TrackerRead>> {
     match cfg.tracker.kind {
         TrackerKind::Linear => {
             let project_slug = cfg

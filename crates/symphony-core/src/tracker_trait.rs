@@ -1,29 +1,40 @@
-//! The [`IssueTracker`] trait — the abstract seam between Symphony and any
-//! concrete issue-tracking backend (Linear, GitHub Issues, Jira, …).
+//! Tracker traits — the abstract seam between Symphony and any concrete
+//! issue-tracking backend (Linear, GitHub Issues, …).
 //!
-//! Per SPEC §11.1, every tracker adapter MUST support three operations:
-//! `fetch_candidate_issues`, `fetch_issues_by_states`, and
-//! `fetch_issue_states_by_ids`. We expose those as the trait methods
-//! [`IssueTracker::fetch_active`], [`IssueTracker::fetch_terminal_recent`],
-//! and [`IssueTracker::fetch_state`] respectively. The renames are
-//! intentional: the trait is the orchestrator-facing surface, and the
-//! shorter names read better at call sites in the poll loop. The doc
-//! comments below name the SPEC operation each method implements so a
-//! reader cross-checking against SPEC.md can find the mapping immediately.
+//! v2 splits the previous monolithic `TrackerRead` into two object-safe
+//! halves per SPEC v2 §7.1 and §7.2:
 //!
-//! ## Why the trait lives in `symphony-core`
+//! * [`TrackerRead`] — read-only candidate/state/recovery queries the
+//!   poll loop relies on. All current adapters MUST implement this.
+//! * [`TrackerMutations`] — write-side capabilities (create issue, comment,
+//!   add blocker, link parent/child, attach artifact). Adapters opt in;
+//!   workflows that require mutations check capability before dispatching.
+//!   The trait surface is intentionally a marker here — request/response
+//!   types and methods land in a follow-up checklist item.
+//!
+//! The split lets workflows detect read-only vs mutation-capable adapters
+//! and lets adapters that genuinely cannot mutate (e.g. an audit-log
+//! exporter) participate without faking writes.
+//!
+//! Method semantics on [`TrackerRead`] preserve the previous v1 contract
+//! verbatim — `fetch_active`, `fetch_state`, and especially
+//! `fetch_terminal_recent` (the startup/recovery sweep) keep their
+//! contracts so adapters and callers don't change behavior with the
+//! rename.
+//!
+//! ## Why the traits live in `symphony-core`
 //!
 //! Architectural tenet: the orchestrator never speaks Linear (or GitHub or
-//! Jira) protocol. It only sees the [`Issue`] model and this trait. Putting
-//! the trait alongside `Issue` keeps the abstract layer in one crate and
-//! makes the dependency direction obvious — `symphony-tracker` depends on
-//! `symphony-core`, never the reverse.
+//! Jira) protocol. It only sees the [`Issue`] model and these traits.
+//! Putting them alongside `Issue` keeps the abstract layer in one crate
+//! and makes the dependency direction obvious — `symphony-tracker`
+//! depends on `symphony-core`, never the reverse.
 //!
 //! ## Async, dynamic dispatch, and `Send + Sync`
 //!
-//! The orchestrator stores its tracker as `Arc<dyn IssueTracker>` and the
+//! The orchestrator stores its tracker as `Arc<dyn TrackerRead>` and the
 //! poll loop is multi-threaded under tokio. Methods therefore use
-//! `async-trait` for object-safe async, and the trait inherits `Send +
+//! `async-trait` for object-safe async, and the traits inherit `Send +
 //! Sync` so the box can cross task boundaries. Implementations whose
 //! internal state is not naturally `Sync` (a `reqwest::Client` is, but a
 //! `Cell` is not) need to wrap that state appropriately.
@@ -85,25 +96,25 @@ pub enum TrackerError {
 /// Convenience alias used throughout the trait surface.
 pub type TrackerResult<T> = Result<T, TrackerError>;
 
-/// Abstract issue-tracking backend.
+/// Read-only view onto an issue-tracking backend.
 ///
-/// One implementation per backend (Linear, GitHub Issues, Jira, …) plus
+/// One implementation per backend (Linear, GitHub Issues, …) plus
 /// `MockTracker` for tests. The trait is parameterised over no associated
-/// types so it can be erased to `dyn IssueTracker` and stored as
-/// `Arc<dyn IssueTracker>` inside the orchestrator's composition root.
+/// types so it can be erased to `dyn TrackerRead` and stored as
+/// `Arc<dyn TrackerRead>` inside the orchestrator's composition root.
 ///
 /// ## Method contracts
 ///
 /// Every method MUST return [`Issue`] values that satisfy the fabrication
 /// policy documented on the [`Issue`] type — `branch_name`, `priority`,
 /// and `blocked_by` left empty when the source backend does not provide
-/// them. The Phase 2 conformance suite enforces this.
+/// them. The conformance suite enforces this.
 ///
-/// Methods are read-only from the orchestrator's perspective. Symphony
-/// does not write back to the tracker (no comments, no state transitions);
-/// any future write surface would be a separate trait.
+/// The trait is read-only by design; mutation capability is expressed
+/// through the separate [`TrackerMutations`] trait so workflows can detect
+/// read-only vs mutation-capable adapters without runtime faking.
 #[async_trait]
-pub trait IssueTracker: Send + Sync {
+pub trait TrackerRead: Send + Sync {
     /// Return all issues currently in one of the configured *active*
     /// states for the configured project (SPEC §11.1 op 1,
     /// `fetch_candidate_issues`).
@@ -147,6 +158,25 @@ pub trait IssueTracker: Send + Sync {
     ) -> TrackerResult<Vec<Issue>>;
 }
 
+/// Mutation-side capabilities a tracker MAY support (SPEC v2 §7.2).
+///
+/// Adapters opt in by implementing this trait. Workflows that decompose
+/// parents into children, file blockers, or attach evidence MUST run
+/// against a mutation-capable adapter; advisory-only workflows can run
+/// with a [`TrackerRead`]-only adapter.
+///
+/// This trait is intentionally a marker right now: request/response types
+/// and the actual `create_issue` / `add_comment` / `add_blocker` /
+/// `link_parent_child` / `attach_artifact` methods land in a dedicated
+/// follow-up checklist item ("Add mutation request/response types"). The
+/// type is exposed in the public surface today so adapter scaffolding,
+/// capability reporting, and downstream code can already refer to it
+/// without a churn-cycle later.
+///
+/// `Send + Sync` for the same dyn-erasure reasons as [`TrackerRead`].
+#[async_trait]
+pub trait TrackerMutations: Send + Sync {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,13 +184,13 @@ mod tests {
     use std::sync::Arc;
 
     /// Minimal in-trait-test stub used to confirm the trait is
-    /// object-safe and that `Arc<dyn IssueTracker>` round-trips through
+    /// object-safe and that `Arc<dyn TrackerRead>` round-trips through
     /// the methods. Not a real `MockTracker` — that lives in
     /// `symphony-tracker::mock` once the dedicated checklist item lands.
     struct StubTracker;
 
     #[async_trait]
-    impl IssueTracker for StubTracker {
+    impl TrackerRead for StubTracker {
         async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
             Ok(vec![Issue::minimal("id-1", "ABC-1", "stub", "Todo")])
         }
@@ -182,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn trait_is_object_safe_and_callable_through_arc_dyn() {
-        let tracker: Arc<dyn IssueTracker> = Arc::new(StubTracker);
+        let tracker: Arc<dyn TrackerRead> = Arc::new(StubTracker);
 
         let active = tracker.fetch_active().await.unwrap();
         assert_eq!(active.len(), 1);
@@ -197,6 +227,21 @@ mod tests {
             .await
             .unwrap();
         assert!(terminal.is_empty());
+    }
+
+    /// `TrackerMutations` is intentionally a marker today; this test pins
+    /// the public-surface guarantee that the trait exists, is object-safe,
+    /// and inherits `Send + Sync` so adapters can scaffold against it
+    /// before request/response types land.
+    #[test]
+    fn tracker_mutations_is_object_safe_and_send_sync() {
+        struct ReadOnlyAdapter;
+        #[async_trait]
+        impl TrackerMutations for ReadOnlyAdapter {}
+
+        let _erased: Arc<dyn TrackerMutations> = Arc::new(ReadOnlyAdapter);
+        fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+        assert_send_sync::<dyn TrackerMutations>();
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! `status` is a *point-in-time* snapshot, distinct from the live TUI
 //! that lands in Phase 8 (`symphony watch`). It loads `WORKFLOW.md` with
 //! the same [`LayeredLoader`] the daemon uses, materialises the
-//! configured [`IssueTracker`], asks it for the current active issues,
+//! configured [`TrackerRead`], asks it for the current active issues,
 //! and prints a compact human-readable table. It is the operational
 //! answer to "if I started the orchestrator right now, what would it
 //! pick up?".
@@ -39,7 +39,7 @@ use symphony_config::{
     ConfigValidationError, LayeredLoadError, LayeredLoader, LoadedWorkflow, TrackerKind,
 };
 use symphony_core::tracker::Issue;
-use symphony_core::tracker_trait::{IssueTracker, TrackerError};
+use symphony_core::tracker_trait::{TrackerError, TrackerRead};
 
 use crate::run::build_tracker;
 
@@ -126,7 +126,7 @@ pub async fn run(path: &Path) -> StatusOutcome {
 /// without touching the file system. Production code only calls [`run`].
 pub async fn snapshot_with_tracker(
     loaded: Box<LoadedWorkflow>,
-    tracker: Arc<dyn IssueTracker>,
+    tracker: Arc<dyn TrackerRead>,
 ) -> StatusOutcome {
     match tracker.fetch_active().await {
         Ok(active) => StatusOutcome::Ok(Box::new(StatusSnapshot { loaded, active })),

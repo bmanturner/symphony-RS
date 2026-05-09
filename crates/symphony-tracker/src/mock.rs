@@ -1,10 +1,10 @@
-//! In-memory [`IssueTracker`] used for unit tests, the conformance suite,
+//! In-memory [`TrackerRead`] used for unit tests, the conformance suite,
 //! and the `--tracker mock` mode of `symphony run` (Phase 7 demo).
 //!
 //! ## Why a dedicated mock instead of `mockall`?
 //!
 //! Two reasons. First, the conformance suite (next checklist item) needs an
-//! adapter that can be exercised via the same `Arc<dyn IssueTracker>` seam
+//! adapter that can be exercised via the same `Arc<dyn TrackerRead>` seam
 //! as the real Linear and GitHub adapters; a per-test `mockall::mock!`
 //! double would diverge from real adapter behaviour in subtle ways
 //! (ordering, normalisation, error variants) and let bugs in the real
@@ -19,7 +19,7 @@
 //! hood), populate it with [`MockTracker::set_active`] /
 //! [`MockTracker::set_terminal`], optionally enqueue scripted errors with
 //! [`MockTracker::enqueue_active_error`] (and friends), then hand the mock
-//! to whatever code under test wants an `Arc<dyn IssueTracker>`. After the
+//! to whatever code under test wants an `Arc<dyn TrackerRead>`. After the
 //! test, inspect [`MockTracker::calls`] for the recorded invocation log.
 //!
 //! The mock is intentionally *honest about the trait contract*: it
@@ -28,7 +28,7 @@
 //! filtering the real adapters guarantee. The conformance suite then asserts
 //! these properties hold across every adapter, mock included.
 
-use crate::IssueTracker;
+use crate::TrackerRead;
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -92,7 +92,7 @@ struct MockState {
 ///
 /// Cheap to clone: internally an `Arc<Mutex<MockState>>`, so multiple
 /// handles share the same script. Useful for tests where the
-/// orchestrator-under-test holds an `Arc<dyn IssueTracker>` while the test
+/// orchestrator-under-test holds an `Arc<dyn TrackerRead>` while the test
 /// body retains a typed handle for assertions.
 #[derive(Debug, Clone, Default)]
 pub struct MockTracker {
@@ -185,7 +185,7 @@ impl MockTracker {
 }
 
 #[async_trait]
-impl IssueTracker for MockTracker {
+impl TrackerRead for MockTracker {
     async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
         let mut g = self.lock();
         g.calls.push(MockCall::FetchActive);
@@ -374,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn mock_is_usable_through_arc_dyn_issue_tracker() {
         let m = MockTracker::with_active(vec![issue("id-1", "ABC-1", "Todo")]);
-        let dyn_tracker: Arc<dyn IssueTracker> = Arc::new(m.clone());
+        let dyn_tracker: Arc<dyn TrackerRead> = Arc::new(m.clone());
 
         let active = dyn_tracker.fetch_active().await.unwrap();
         assert_eq!(active.len(), 1);

@@ -1,4 +1,4 @@
-//! Adapter-agnostic conformance suite for the [`IssueTracker`] trait.
+//! Adapter-agnostic conformance suite for the [`TrackerRead`] trait.
 //!
 //! Every concrete adapter (Linear, GitHub Issues, Mock, …) MUST satisfy a
 //! handful of cross-cutting properties that the orchestrator relies on:
@@ -28,7 +28,7 @@
 //!    and [`Scenario::terminal_issues`]. For Linear/GitHub adapters this
 //!    means standing up a `wiremock` server returning canned GraphQL/REST
 //!    payloads encoding the same issues.
-//! 2. Hand the tracker (as `&dyn IssueTracker`) plus the [`Scenario`] to
+//! 2. Hand the tracker (as `&dyn TrackerRead`) plus the [`Scenario`] to
 //!    [`run_full_suite`]. Any property violation panics with a descriptive
 //!    message naming the failing rule and the offending issue.
 //!
@@ -43,7 +43,7 @@
 //! cleanly with `assert_*` macros elsewhere in the same test. Returning a
 //! result would just push the `.unwrap()` outward without adding signal.
 
-use crate::{IssueTracker, MockTracker};
+use crate::{MockTracker, TrackerRead};
 use std::collections::HashSet;
 use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
 
@@ -315,7 +315,7 @@ pub fn populate_mock(scenario: &Scenario) -> MockTracker {
 ///
 /// SPEC §11.1 op 1 / §11.3.
 pub async fn assert_active_returns_only_active_states(
-    tracker: &dyn IssueTracker,
+    tracker: &dyn TrackerRead,
     scenario: &Scenario,
 ) {
     let active = tracker
@@ -361,7 +361,7 @@ pub async fn assert_active_returns_only_active_states(
 /// embed non-ASCII characters, or otherwise produce values whose
 /// normalised form does not equal `to_ascii_lowercase` of the source.
 pub async fn assert_state_normalization_is_lowercase(
-    tracker: &dyn IssueTracker,
+    tracker: &dyn TrackerRead,
     _scenario: &Scenario,
 ) {
     let active = tracker
@@ -397,7 +397,7 @@ pub async fn assert_state_normalization_is_lowercase(
 /// an adapter that synthesises a priority from labels, derives a branch
 /// name from the identifier, or guesses blockers from free-text body refs
 /// and forgets to leave `id = None`.
-pub async fn assert_no_fabricated_optionals(tracker: &dyn IssueTracker, scenario: &Scenario) {
+pub async fn assert_no_fabricated_optionals(tracker: &dyn TrackerRead, scenario: &Scenario) {
     let active = tracker
         .fetch_active()
         .await
@@ -433,7 +433,7 @@ pub async fn assert_no_fabricated_optionals(tracker: &dyn IssueTracker, scenario
 /// Adapters that reorder (e.g. because their backend returns by id-asc)
 /// MUST re-sort to match input order before returning.
 pub async fn assert_fetch_state_preserves_caller_ordering(
-    tracker: &dyn IssueTracker,
+    tracker: &dyn TrackerRead,
     scenario: &Scenario,
 ) {
     let mut ids = scenario.all_ids();
@@ -464,7 +464,7 @@ pub async fn assert_fetch_state_preserves_caller_ordering(
 /// Assert `fetch_terminal_recent` filters by the caller-supplied state
 /// list and uses case-insensitive comparison.
 pub async fn assert_terminal_recent_filters_by_states(
-    tracker: &dyn IssueTracker,
+    tracker: &dyn TrackerRead,
     scenario: &Scenario,
 ) {
     // Probe with the fixture's terminal-state list, plus mixed-casing to
@@ -522,7 +522,7 @@ pub async fn assert_terminal_recent_filters_by_states(
 /// not re-apply active-state filtering that would mask the transition.
 ///
 /// SPEC §16.3 reconciles in-flight workers against the tracker by calling
-/// `fetch_issue_states_by_ids` (our [`IssueTracker::fetch_state`]) every
+/// `fetch_issue_states_by_ids` (our [`TrackerRead::fetch_state`]) every
 /// tick: any worker whose issue has left the active states gets released.
 /// An adapter that mistakenly filters `fetch_state` by `active_states`
 /// would silently neuter that release, leaving the orchestrator running
@@ -532,14 +532,14 @@ pub async fn assert_terminal_recent_filters_by_states(
 /// We probe by asking for *every terminal* id the scenario knows about,
 /// then asserting:
 /// 1. **No silent drops** — every requested id appears in the response.
-///    The trait contract on [`IssueTracker::fetch_state`] is explicit
+///    The trait contract on [`TrackerRead::fetch_state`] is explicit
 ///    about this; a partial-result response would let a "deleted" issue
 ///    masquerade as still-running.
 /// 2. **Correct state** — each returned issue's state normalizes into
 ///    one of `scenario.terminal_states`. (We compare case-insensitively
 ///    because `IssueState` preserves source casing — see SPEC §11.3.)
 pub async fn assert_state_refresh_reports_terminal_state_for_terminal_ids(
-    tracker: &dyn IssueTracker,
+    tracker: &dyn TrackerRead,
     scenario: &Scenario,
 ) {
     if scenario.terminal_issues.is_empty() {
@@ -599,7 +599,7 @@ pub async fn assert_state_refresh_reports_terminal_state_for_terminal_ids(
 /// covers the *exclusion* direction (no non-terminal leakage) and the
 /// empty-filter rule. Together they pin down both sides of the contract.
 pub async fn assert_terminal_recent_returns_all_known_terminal_issues(
-    tracker: &dyn IssueTracker,
+    tracker: &dyn TrackerRead,
     scenario: &Scenario,
 ) {
     if scenario.terminal_issues.is_empty() {
@@ -633,7 +633,7 @@ pub async fn assert_terminal_recent_returns_all_known_terminal_issues(
 /// constructing their backend. Individual assertions are also `pub` so
 /// adapters can pick a subset (e.g. while iterating on a single failing
 /// rule).
-pub async fn run_full_suite(tracker: &dyn IssueTracker, scenario: &Scenario) {
+pub async fn run_full_suite(tracker: &dyn TrackerRead, scenario: &Scenario) {
     assert_active_returns_only_active_states(tracker, scenario).await;
     assert_state_normalization_is_lowercase(tracker, scenario).await;
     assert_no_fabricated_optionals(tracker, scenario).await;

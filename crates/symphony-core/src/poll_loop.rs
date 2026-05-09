@@ -4,7 +4,7 @@
 //!
 //! 1. Reaps any dispatch tasks that finished since the previous tick and
 //!    releases their claims back to the [`StateMachine`].
-//! 2. Asks the [`IssueTracker`] for the current set of *active* issues.
+//! 2. Asks the [`TrackerRead`] for the current set of *active* issues.
 //! 3. Walks that set, claiming any issue that is not already claimed and
 //!    spawning a [`Dispatcher`] task for it — up to a hard concurrency
 //!    cap drawn from `agent.max_concurrent_agents` (SPEC §5.3.5).
@@ -64,7 +64,7 @@ use crate::event_bus::EventBus;
 use crate::events::OrchestratorEvent;
 use crate::state_machine::{ClaimState, ReleaseReason, StateMachine};
 use crate::tracker::{Issue, IssueId};
-use crate::tracker_trait::{IssueTracker, TrackerError};
+use crate::tracker_trait::{TrackerError, TrackerRead};
 
 /// Pluggable handler invoked by the poll loop for each newly-claimed issue.
 ///
@@ -191,7 +191,7 @@ struct DispatchHandle {
 /// loop with [`PollLoop::tick`] for unit tests, or run it to completion
 /// with [`PollLoop::run`] in production.
 pub struct PollLoop {
-    tracker: Arc<dyn IssueTracker>,
+    tracker: Arc<dyn TrackerRead>,
     dispatcher: Arc<dyn Dispatcher>,
     config: PollLoopConfig,
     state: StateMachine,
@@ -214,7 +214,7 @@ pub struct PollLoop {
 impl PollLoop {
     /// Construct a fresh poll loop. The `state` ledger starts empty.
     pub fn new(
-        tracker: Arc<dyn IssueTracker>,
+        tracker: Arc<dyn TrackerRead>,
         dispatcher: Arc<dyn Dispatcher>,
         config: PollLoopConfig,
     ) -> Self {
@@ -226,7 +226,7 @@ impl PollLoop {
     /// orchestrator and the SSE handler so they share replay buffer
     /// sizing and subscriber accounting.
     pub fn with_event_bus(
-        tracker: Arc<dyn IssueTracker>,
+        tracker: Arc<dyn TrackerRead>,
         dispatcher: Arc<dyn Dispatcher>,
         config: PollLoopConfig,
         bus: EventBus,
@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl IssueTracker for StaticTracker {
+    impl TrackerRead for StaticTracker {
         async fn fetch_active(&self) -> crate::tracker_trait::TrackerResult<Vec<Issue>> {
             Ok(self.active.lock().unwrap().clone())
         }
@@ -819,7 +819,7 @@ mod tests {
     async fn tick_propagates_tracker_errors_without_panicking() {
         struct Failing;
         #[async_trait]
-        impl IssueTracker for Failing {
+        impl TrackerRead for Failing {
             async fn fetch_active(&self) -> crate::tracker_trait::TrackerResult<Vec<Issue>> {
                 Err(TrackerError::Transport("nope".into()))
             }
@@ -928,7 +928,7 @@ mod tests {
             drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(
-            Arc::clone(&tracker) as Arc<dyn IssueTracker>,
+            Arc::clone(&tracker) as Arc<dyn TrackerRead>,
             Arc::clone(&dispatcher) as Arc<dyn Dispatcher>,
             cfg,
         );
@@ -996,7 +996,7 @@ mod tests {
             drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(
-            Arc::clone(&tracker) as Arc<dyn IssueTracker>,
+            Arc::clone(&tracker) as Arc<dyn TrackerRead>,
             Arc::clone(&dispatcher) as Arc<dyn Dispatcher>,
             cfg,
         );
@@ -1091,7 +1091,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let dispatcher_clone = Arc::clone(&dispatcher);
-        let tracker_clone = Arc::clone(&tracker) as Arc<dyn IssueTracker>;
+        let tracker_clone = Arc::clone(&tracker) as Arc<dyn TrackerRead>;
         let started = tokio::spawn(async move {
             let loop_ = PollLoop::new(tracker_clone, dispatcher_clone as Arc<dyn Dispatcher>, cfg);
             loop_.run(cancel_clone).await;
@@ -1141,7 +1141,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let dispatcher_clone = Arc::clone(&dispatcher);
-        let tracker_clone = Arc::clone(&tracker) as Arc<dyn IssueTracker>;
+        let tracker_clone = Arc::clone(&tracker) as Arc<dyn TrackerRead>;
         let started = tokio::spawn(async move {
             let loop_ = PollLoop::new(tracker_clone, dispatcher_clone as Arc<dyn Dispatcher>, cfg);
             loop_.run(cancel_clone).await;
@@ -1184,7 +1184,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let dispatcher_clone = Arc::clone(&dispatcher);
-        let tracker_clone = Arc::clone(&tracker) as Arc<dyn IssueTracker>;
+        let tracker_clone = Arc::clone(&tracker) as Arc<dyn TrackerRead>;
         let started = std::time::Instant::now();
         let handle = tokio::spawn(async move {
             let loop_ = PollLoop::new(tracker_clone, dispatcher_clone as Arc<dyn Dispatcher>, cfg);
@@ -1300,7 +1300,7 @@ mod tests {
             drain_deadline: Duration::from_secs(1),
         };
         let mut loop_ = PollLoop::new(
-            Arc::clone(&tracker) as Arc<dyn IssueTracker>,
+            Arc::clone(&tracker) as Arc<dyn TrackerRead>,
             Arc::clone(&dispatcher) as Arc<dyn Dispatcher>,
             cfg,
         );

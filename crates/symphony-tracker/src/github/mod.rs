@@ -1,6 +1,6 @@
 //! GitHub Issues adapter.
 //!
-//! Companion to [`crate::linear`]: same trait surface (`IssueTracker`),
+//! Companion to [`crate::linear`]: same trait surface (`TrackerRead`),
 //! different wire protocol. The full trait — `fetch_active`,
 //! `fetch_state`, `fetch_terminal_recent` — is implemented on
 //! `octocrab`, with `blocked_by` recovered from issue body text and
@@ -27,7 +27,7 @@
 //! native GitHub state (`"open"` or `"closed"`). See
 //! `adapter::derive_state` for the exact rule and unit tests (private).
 //!
-//! [`IssueTracker::fetch_active`]: crate::IssueTracker::fetch_active
+//! [`TrackerRead::fetch_active`]: crate::TrackerRead::fetch_active
 
 pub mod adapter;
 pub use adapter::{GitHubConfig, GitHubTracker};
