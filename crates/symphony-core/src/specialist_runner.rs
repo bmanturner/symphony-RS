@@ -32,6 +32,7 @@
 //! narrow lets it slot into the existing composition root without
 //! disturbing PollLoop.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, Semaphore};
@@ -39,10 +40,14 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::blocker::RunRef;
 use crate::intake_tick::ActiveSetStore;
 use crate::lease::{LeaseClock, LeaseConfig, LeaseOwner};
 use crate::poll_loop::Dispatcher;
-use crate::run_lease::{LeaseAcquireOutcome, RunLeaseGuard, RunLeaseStore};
+use crate::run_lease::{
+    HeartbeatPulseObservation, LeaseAcquireOutcome, LeaseHeartbeat, RunLeaseGuard, RunLeaseStore,
+    pulse_observed,
+};
 use crate::specialist_tick::{SpecialistDispatchQueue, SpecialistDispatchRequest};
 use crate::state_machine::ReleaseReason;
 use crate::tracker::Issue;
@@ -94,6 +99,25 @@ impl SpecialistRunReport {
     }
 }
 
+/// Per-pulse heartbeat observation surfaced by
+/// [`SpecialistRunner::pulse_heartbeats`].
+///
+/// Pairs the typed [`HeartbeatPulseObservation`] from
+/// [`crate::run_lease::pulse_observed`] with the run/identifier the
+/// heartbeat targets so the scheduler can route the observation
+/// (durable run-status update on contention, recovery dispatch on
+/// not-found, transient-error log on backend error) without re-keying
+/// against the in-flight set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerHeartbeatObservation {
+    /// Durable run row the heartbeat was renewed against.
+    pub run_id: RunRef,
+    /// Tracker-facing identifier of the dispatch that owns the run row.
+    pub identifier: String,
+    /// Typed outcome of the renewal pulse.
+    pub observation: HeartbeatPulseObservation,
+}
+
 /// Outcome reported when a spawned dispatcher task completes.
 ///
 /// Returned in batches by [`SpecialistRunner::reap_completed`]. The
@@ -128,6 +152,20 @@ pub struct SpecialistRunner {
     /// releases it on terminal completion. Requests whose `run_id` is
     /// `None` bypass lease acquisition.
     leasing: Option<LeaseWiring>,
+    /// In-flight heartbeats, keyed by `run_id`. Populated when a lease
+    /// is acquired alongside a spawned dispatch and removed by the
+    /// spawned task at terminal release. [`Self::pulse_heartbeats`]
+    /// snapshots the map and renews each due lease through the
+    /// configured wiring's clock.
+    heartbeats: Arc<Mutex<HashMap<RunRef, HeartbeatRegistration>>>,
+}
+
+/// Per-run heartbeat registration: the human-readable identifier (so
+/// observations carry it back to the caller) plus the live heartbeat
+/// guarded by an async mutex (`pulse` is `&mut self`).
+struct HeartbeatRegistration {
+    identifier: String,
+    heartbeat: Arc<Mutex<LeaseHeartbeat>>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -160,6 +198,7 @@ impl SpecialistRunner {
             inflight: Mutex::new(JoinSet::new()),
             max_concurrent,
             leasing: None,
+            heartbeats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -262,8 +301,8 @@ impl SpecialistRunner {
             // dispatch and released on terminal completion. Permit is
             // only consumed once the lease is acquired so contention or
             // backend errors do not eat capacity.
-            let guard = match self.try_acquire_lease(&req).await {
-                LeaseAttempt::Acquired(guard) => guard,
+            let leased = match self.try_acquire_lease(&req).await {
+                LeaseAttempt::Acquired(leased) => leased,
                 LeaseAttempt::Skipped => None,
                 LeaseAttempt::Contended => {
                     drop(permit);
@@ -288,11 +327,27 @@ impl SpecialistRunner {
             let child_cancel = cancel.child_token();
             let identifier = req.identifier.clone();
             let issue_for_dispatch = issue.clone();
+            let heartbeat_run_id = req.run_id;
+            let heartbeats = self.heartbeats.clone();
+
+            // Register the heartbeat so a parallel `pulse_heartbeats`
+            // tick can renew the lease while dispatch is in flight.
+            // Registration happens before spawn so a tight scheduler
+            // tick sequence (spawn + immediate pulse) cannot miss it.
+            if let (Some(run_id), Some(d)) = (heartbeat_run_id, leased.as_ref()) {
+                heartbeats.lock().await.insert(
+                    run_id,
+                    HeartbeatRegistration {
+                        identifier: identifier.clone(),
+                        heartbeat: d.heartbeat.clone(),
+                    },
+                );
+            }
 
             let mut inflight = self.inflight.lock().await;
             inflight.spawn(async move {
                 let release_reason = dispatcher.dispatch(issue_for_dispatch, child_cancel).await;
-                if let Some(guard) = guard
+                if let Some(LeasedDispatch { guard, .. }) = leased
                     && let Err(err) = guard.release().await
                 {
                     warn!(
@@ -300,6 +355,12 @@ impl SpecialistRunner {
                         error = %err,
                         "specialist runner: lease release failed; relying on TTL reaper",
                     );
+                }
+                // Deregister after release so a concurrent
+                // `pulse_heartbeats` cannot re-acquire a lease the
+                // terminal release just cleared.
+                if let Some(run_id) = heartbeat_run_id {
+                    heartbeats.lock().await.remove(&run_id);
                 }
                 drop(permit); // explicit: release capacity at task exit
                 SpecialistDispatchOutcome {
@@ -349,10 +410,9 @@ impl SpecialistRunner {
 
 /// Outcome of [`SpecialistRunner::try_acquire_lease`].
 enum LeaseAttempt {
-    /// Either lease acquired (`Some(guard)`) or no run_id on the
-    /// request and lease wiring not exercised (`None`). Both cases
-    /// proceed to dispatch.
-    Acquired(Option<RunLeaseGuard>),
+    /// Either lease acquired (`Some(LeasedDispatch)`) or lease wiring
+    /// not configured (`None`). Both cases proceed to dispatch.
+    Acquired(Option<LeasedDispatch>),
     /// Lease wiring is configured but the request had no `run_id`
     /// reservation. Dispatch proceeds without a lease guard.
     Skipped,
@@ -364,7 +424,73 @@ enum LeaseAttempt {
     BackendError,
 }
 
+/// Bundle of artifacts produced by a successful lease acquisition: the
+/// RAII guard the spawned task consumes at terminal release, and the
+/// shared heartbeat the runner-driven pulse cadence renews.
+struct LeasedDispatch {
+    guard: RunLeaseGuard,
+    heartbeat: Arc<Mutex<LeaseHeartbeat>>,
+}
+
 impl SpecialistRunner {
+    /// Number of heartbeats currently registered against in-flight
+    /// dispatches. Diagnostic accessor for tests/scheduler logs.
+    pub async fn heartbeat_count(&self) -> usize {
+        self.heartbeats.lock().await.len()
+    }
+
+    /// Drive one renewal pass over every in-flight heartbeat.
+    ///
+    /// For each registered `(run_id, identifier, heartbeat)` the runner
+    /// checks [`LeaseHeartbeat::due`] against the configured wiring's
+    /// clock and, when due, invokes [`pulse_observed`] to renew through
+    /// the underlying [`RunLeaseStore::acquire`]. Heartbeats that are
+    /// not yet due are skipped silently — the pass is idle for them.
+    ///
+    /// Each pulsed heartbeat produces a [`RunnerHeartbeatObservation`]
+    /// in call order so the scheduler can:
+    ///
+    /// * log/forward [`HeartbeatPulseObservation::Renewed`] for
+    ///   diagnostics,
+    /// * route [`HeartbeatPulseObservation::Contended`] /
+    ///   [`HeartbeatPulseObservation::NotFound`] to durable
+    ///   run-status updates, and
+    /// * surface [`HeartbeatPulseObservation::BackendError`] without
+    ///   silently dropping the in-flight dispatch.
+    ///
+    /// Returns an empty vector when lease wiring is disabled. Holds no
+    /// runner locks across `acquire` calls — the heartbeats map is
+    /// snapshotted up front so terminal-release deregistration is not
+    /// blocked by a slow backend.
+    pub async fn pulse_heartbeats(&self) -> Vec<RunnerHeartbeatObservation> {
+        let Some(wiring) = self.leasing.as_ref() else {
+            return Vec::new();
+        };
+        let snapshot: Vec<(RunRef, String, Arc<Mutex<LeaseHeartbeat>>)> = {
+            let map = self.heartbeats.lock().await;
+            map.iter()
+                .map(|(run_id, reg)| (*run_id, reg.identifier.clone(), reg.heartbeat.clone()))
+                .collect()
+        };
+
+        let clock = wiring.clock.as_ref();
+        let ttl_ms = wiring.config.default_ttl_ms;
+        let mut out = Vec::new();
+        for (run_id, identifier, hb_arc) in snapshot {
+            let mut hb = hb_arc.lock().await;
+            if !hb.due(clock) {
+                continue;
+            }
+            let observation = pulse_observed(&mut hb, clock, ttl_ms).await;
+            out.push(RunnerHeartbeatObservation {
+                run_id,
+                identifier,
+                observation,
+            });
+        }
+        out
+    }
+
     async fn try_acquire_lease(&self, req: &SpecialistDispatchRequest) -> LeaseAttempt {
         let Some(wiring) = &self.leasing else {
             return LeaseAttempt::Acquired(None);
@@ -383,7 +509,19 @@ impl SpecialistRunner {
         )
         .await
         {
-            Ok(Ok(guard)) => LeaseAttempt::Acquired(Some(guard)),
+            Ok(Ok(guard)) => {
+                let heartbeat = LeaseHeartbeat::new(
+                    wiring.store.clone(),
+                    run_id,
+                    wiring.owner.clone(),
+                    ts.expires_at.clone(),
+                    wiring.config.renewal_margin_ms,
+                );
+                LeaseAttempt::Acquired(Some(LeasedDispatch {
+                    guard,
+                    heartbeat: Arc::new(Mutex::new(heartbeat)),
+                }))
+            }
             Ok(Err(LeaseAcquireOutcome::Contended { holder, expires_at })) => {
                 debug!(
                     identifier = %req.identifier,
@@ -952,6 +1090,288 @@ mod tests {
         assert_eq!(outcomes[0].release_reason, ReleaseReason::Completed);
         // Store untouched.
         assert!(store.release_calls().await.is_empty());
+    }
+
+    // ---- Heartbeat wiring (CHECKLIST_v2 Phase 11) ------------------
+
+    /// Test-only [`LeaseClock`] whose `now` can be advanced between
+    /// pulses. Mirrors the way a real wall-clock-backed clock evolves
+    /// across scheduler ticks; deterministic for tests because the
+    /// caller controls each advance.
+    #[derive(Debug)]
+    struct AdvanceableLeaseClock {
+        now: StdMutex<String>,
+    }
+
+    impl AdvanceableLeaseClock {
+        fn new(now: impl Into<String>) -> Self {
+            Self {
+                now: StdMutex::new(now.into()),
+            }
+        }
+        fn set(&self, now: impl Into<String>) {
+            *self.now.lock().unwrap() = now.into();
+        }
+    }
+
+    impl LeaseClock for AdvanceableLeaseClock {
+        fn timestamps(&self, ttl_ms: u64) -> crate::lease::LeaseTimestamps {
+            let now = self.now.lock().unwrap().clone();
+            // Same +<ttl>ms suffix as FixedLeaseClock so lex order is
+            // monotonic with wall-clock time.
+            let expires_at = format!("{}+{:012}ms", now, ttl_ms);
+            crate::lease::LeaseTimestamps { now, expires_at }
+        }
+    }
+
+    fn build_lease_runner_with_clock(
+        max_concurrent: usize,
+        dispatcher: Arc<RecordingDispatcher>,
+        active: Arc<ActiveSetStore>,
+        store: Arc<InMemoryRunLeaseStore>,
+        clock: Arc<AdvanceableLeaseClock>,
+    ) -> (Arc<SpecialistDispatchQueue>, SpecialistRunner) {
+        let queue = Arc::new(SpecialistDispatchQueue::new());
+        let runner = SpecialistRunner::new(queue.clone(), active, dispatcher, max_concurrent)
+            .with_leasing(store, lease_owner(), LeaseConfig::default(), clock);
+        (queue, runner)
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_advances_lease_expiry_during_long_running_dispatch() {
+        let active = store_with(vec![issue("id-1", "ENG-1")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate(); // hold dispatch open across pulses
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) = build_lease_runner_with_clock(
+            4,
+            dispatcher.clone(),
+            active,
+            store.clone(),
+            clock.clone(),
+        );
+        queue.enqueue(req_with_run("id-1", "ENG-1", 42));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(runner.heartbeat_count().await, 1);
+
+        let initial = store.snapshot(RunRef::new(42)).await.unwrap().1;
+
+        // Not yet inside the renewal window — pulse should be idle.
+        let observations = runner.pulse_heartbeats().await;
+        assert!(
+            observations.is_empty(),
+            "heartbeat should be idle while full TTL remains; got {observations:?}",
+        );
+        let after_idle = store.snapshot(RunRef::new(42)).await.unwrap().1;
+        assert_eq!(
+            after_idle, initial,
+            "store expiry must not change while heartbeat is idle",
+        );
+
+        // Advance the clock so the heartbeat is due, then pulse.
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        let obs = &observations[0];
+        assert_eq!(obs.run_id, RunRef::new(42));
+        assert_eq!(obs.identifier, "ENG-1");
+        assert_eq!(obs.observation, HeartbeatPulseObservation::Renewed);
+
+        let after_renewal = store.snapshot(RunRef::new(42)).await.unwrap().1;
+        assert!(
+            after_renewal > initial,
+            "lease_expires_at must advance after a successful pulse: {after_renewal} > {initial}",
+        );
+
+        // Release the gate so the dispatch completes; lease must be
+        // cleared exactly once on terminal release, and the heartbeat
+        // registry must drain.
+        dispatcher.release_gate();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].release_reason, ReleaseReason::Completed);
+        assert!(store.snapshot(RunRef::new(42)).await.is_none());
+        assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_surfaces_contended_observation() {
+        let active = store_with(vec![issue("id-1", "ENG-1")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) = build_lease_runner_with_clock(
+            4,
+            dispatcher.clone(),
+            active,
+            store.clone(),
+            clock.clone(),
+        );
+        queue.enqueue(req_with_run("id-1", "ENG-1", 42));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(runner.heartbeat_count().await, 1);
+
+        // A different owner takes over the lease with a far-future
+        // expiry — the heartbeat's pulse must surface Contended.
+        let intruder = LeaseOwner::new("other-host", "scheduler-test", 9).unwrap();
+        store.release(RunRef::new(42)).await.unwrap();
+        let outcome = store
+            .acquire(RunRef::new(42), &intruder, "Z9999+999999999999ms", "Z9999")
+            .await
+            .unwrap();
+        assert_eq!(outcome, LeaseAcquireOutcome::Acquired);
+
+        clock.set("T9"); // ensure renewal-due
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        match &observations[0].observation {
+            HeartbeatPulseObservation::Contended { holder, .. } => {
+                assert_eq!(holder, &intruder.to_string());
+            }
+            other => panic!("expected Contended, got {other:?}"),
+        }
+        assert_eq!(observations[0].run_id, RunRef::new(42));
+        assert_eq!(observations[0].identifier, "ENG-1");
+
+        // Cleanup so the spawned dispatch can finish.
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        // Heartbeat registry drains regardless of pulse outcomes.
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_surfaces_not_found_observation() {
+        let active = store_with(vec![issue("id-1", "ENG-1")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) = build_lease_runner_with_clock(
+            4,
+            dispatcher.clone(),
+            active,
+            store.clone(),
+            clock.clone(),
+        );
+        queue.enqueue(req_with_run("id-1", "ENG-1", 42));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        // Forcibly drop the run row from the store: the heartbeat's
+        // re-acquire must observe NotFound (rather than silently
+        // succeeding or panicking).
+        store.forget_run(RunRef::new(42)).await;
+
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].observation,
+            HeartbeatPulseObservation::NotFound
+        );
+        assert_eq!(observations[0].run_id, RunRef::new(42));
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_surfaces_backend_error_observation() {
+        let active = store_with(vec![issue("id-1", "ENG-1")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) = build_lease_runner_with_clock(
+            4,
+            dispatcher.clone(),
+            active,
+            store.clone(),
+            clock.clone(),
+        );
+        queue.enqueue(req_with_run("id-1", "ENG-1", 42));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        // Force the next acquire to error: the pulse must fold the
+        // backend error into a typed observation rather than panicking
+        // or silently dropping the in-flight dispatch.
+        store.fail_next("disk full").await;
+        clock.set("T9");
+        let observations = runner.pulse_heartbeats().await;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].observation,
+            HeartbeatPulseObservation::BackendError {
+                message: "disk full".to_string(),
+            },
+        );
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn pulse_heartbeats_is_noop_without_lease_wiring() {
+        let queue = Arc::new(SpecialistDispatchQueue::new());
+        let active = store_with(vec![issue("id-1", "ENG-1")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        let runner = SpecialistRunner::new(queue, active, dispatcher, 4);
+        let observations = runner.pulse_heartbeats().await;
+        assert!(observations.is_empty());
+        assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_release_clears_lease_exactly_once_after_pulses() {
+        let active = store_with(vec![issue("id-1", "ENG-1")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+        let store = Arc::new(InMemoryRunLeaseStore::new());
+        store.register_run(RunRef::new(42)).await;
+        let clock = Arc::new(AdvanceableLeaseClock::new("T0"));
+
+        let (queue, runner) = build_lease_runner_with_clock(
+            4,
+            dispatcher.clone(),
+            active,
+            store.clone(),
+            clock.clone(),
+        );
+        queue.enqueue(req_with_run("id-1", "ENG-1", 42));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        // Pulse twice during dispatch — both should renew.
+        clock.set("T1");
+        let r1 = runner.pulse_heartbeats().await;
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].observation, HeartbeatPulseObservation::Renewed);
+        clock.set("T2");
+        let r2 = runner.pulse_heartbeats().await;
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].observation, HeartbeatPulseObservation::Renewed);
+
+        dispatcher.release_gate();
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes[0].release_reason, ReleaseReason::Completed);
+
+        // Exactly one terminal release call recorded — pulses re-acquire
+        // through `acquire`, never `release`.
+        assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
+        assert!(store.snapshot(RunRef::new(42)).await.is_none());
+        assert_eq!(runner.heartbeat_count().await, 0);
     }
 
     #[tokio::test]

@@ -417,6 +417,14 @@ impl InMemoryRunLeaseStore {
         self.inner.lock().await.fail_with = Some(msg.into());
     }
 
+    /// Remove `run_id` entirely from the store so subsequent `acquire`
+    /// calls observe [`LeaseAcquireOutcome::NotFound`]. Useful for
+    /// simulating durable row deletion in tests (e.g. a recovery loop
+    /// reaping an orphaned run).
+    pub async fn forget_run(&self, run_id: RunRef) {
+        self.inner.lock().await.rows.remove(&run_id);
+    }
+
     /// Snapshot the current `(holder, expires_at)` for `run_id`.
     pub async fn snapshot(&self, run_id: RunRef) -> Option<(String, String)> {
         self.inner
