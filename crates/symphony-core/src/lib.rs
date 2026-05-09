@@ -14,6 +14,7 @@
 pub mod advisory;
 pub mod agent;
 pub mod blocker;
+pub mod decomposition;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
@@ -37,6 +38,10 @@ pub use agent::{
 };
 pub use blocker::{
     Blocker, BlockerError, BlockerId, BlockerOrigin, BlockerSeverity, BlockerStatus, RunRef,
+};
+pub use decomposition::{
+    ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
+    DecompositionStatus,
 };
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;

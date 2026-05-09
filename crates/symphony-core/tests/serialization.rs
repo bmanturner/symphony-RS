@@ -20,12 +20,13 @@ use symphony_core::tracker::IssueState;
 use symphony_core::work_item::TrackerStatus;
 use symphony_core::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, Blocker, BlockerId, BlockerOrigin,
-    BlockerRef, BlockerSeverity, BlockerStatus, BranchOrWorkspace, FollowupId,
-    FollowupIssueRequest, FollowupPolicy, FollowupStatus, Handoff, HandoffBlockerRequest,
-    HandoffFollowupRequest, IntegrationConflict, IntegrationId, IntegrationMergeStrategy,
-    IntegrationRecord, IntegrationStatus, Issue, IssueId, QaEvidence, QaOutcome, QaVerdict,
-    QaVerdictId, ReadyFor, RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName,
-    RunRef, UnknownStatePolicy, WorkItem, WorkItemId, WorkItemStatusClass,
+    BlockerRef, BlockerSeverity, BlockerStatus, BranchOrWorkspace, ChildKey, ChildProposal,
+    DecompositionId, DecompositionProposal, DecompositionStatus, FollowupId, FollowupIssueRequest,
+    FollowupPolicy, FollowupStatus, Handoff, HandoffBlockerRequest, HandoffFollowupRequest,
+    IntegrationConflict, IntegrationId, IntegrationMergeStrategy, IntegrationRecord,
+    IntegrationStatus, Issue, IssueId, QaEvidence, QaOutcome, QaVerdict, QaVerdictId, ReadyFor,
+    RoleAuthority, RoleAuthorityOverrides, RoleContext, RoleKind, RoleName, RunRef,
+    UnknownStatePolicy, WorkItem, WorkItemId, WorkItemStatusClass,
 };
 
 fn round_trip<T>(value: &T) -> T
@@ -55,6 +56,14 @@ fn id_newtypes_serialize_transparently() {
     assert_eq!(serde_json::to_string(&IntegrationId::new(7)).unwrap(), "7");
     assert_eq!(serde_json::to_string(&FollowupId::new(7)).unwrap(), "7");
     assert_eq!(
+        serde_json::to_string(&DecompositionId::new(7)).unwrap(),
+        "7"
+    );
+    assert_eq!(
+        serde_json::to_string(&ChildKey::new("backend")).unwrap(),
+        "\"backend\""
+    );
+    assert_eq!(
         serde_json::to_string(&IssueId::new("ENG-1")).unwrap(),
         "\"ENG-1\""
     );
@@ -69,6 +78,8 @@ fn id_newtypes_serialize_transparently() {
     assert_round_trip(QaVerdictId::new(42));
     assert_round_trip(IntegrationId::new(42));
     assert_round_trip(FollowupId::new(42));
+    assert_round_trip(DecompositionId::new(42));
+    assert_round_trip(ChildKey::new("ui"));
     assert_round_trip(IssueId::new("abc-123"));
     assert_round_trip(RoleName::new("integration_owner"));
 }
@@ -495,4 +506,58 @@ fn issue_round_trips_with_full_and_minimal_payloads() {
     };
     assert_round_trip(full);
     assert_round_trip(Issue::minimal("uuid-2", "ENG-2", "title", "Todo"));
+}
+
+#[test]
+fn decomposition_status_round_trips_every_variant() {
+    for status in DecompositionStatus::ALL {
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, format!("\"{}\"", status.as_str()));
+        assert_eq!(
+            serde_json::from_str::<DecompositionStatus>(&json).unwrap(),
+            status
+        );
+    }
+}
+
+#[test]
+fn decomposition_proposal_round_trips() {
+    let mut deps = std::collections::BTreeSet::new();
+    deps.insert(ChildKey::new("a"));
+    let a = ChildProposal::try_new(
+        "a",
+        "implement backend",
+        "models + endpoints",
+        RoleName::new("backend"),
+        Some("a body".into()),
+        vec!["passes integration tests".into()],
+        std::collections::BTreeSet::new(),
+        true,
+        Some("symphony/eng-1-backend".into()),
+        true,
+    )
+    .unwrap();
+    let b = ChildProposal::try_new(
+        "b",
+        "implement ui",
+        "react surface",
+        RoleName::new("frontend"),
+        None,
+        vec!["screenshot in PR".into()],
+        deps,
+        false,
+        None,
+        true,
+    )
+    .unwrap();
+    let proposal = DecompositionProposal::try_new(
+        DecompositionId::new(9),
+        WorkItemId::new(100),
+        RoleName::new("platform_lead"),
+        "split parent into backend + ui",
+        vec![a, b],
+        FollowupPolicy::ProposeForApproval,
+    )
+    .unwrap();
+    assert_round_trip(proposal);
 }
