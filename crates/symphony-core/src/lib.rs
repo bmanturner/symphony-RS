@@ -15,6 +15,7 @@ pub mod advisory;
 pub mod agent;
 pub mod blocker;
 pub mod decomposition;
+pub mod decomposition_runner;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
@@ -42,6 +43,11 @@ pub use blocker::{
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
     DecompositionStatus,
+};
+pub use decomposition_runner::{
+    ChildDraft, DecompositionContext, DecompositionDraft, DecompositionEligibility,
+    DecompositionPolicy, DecompositionRunner, DecompositionTriggers, RunnerError, SkipReason,
+    TriggerHit,
 };
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;

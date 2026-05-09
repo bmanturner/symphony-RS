@@ -64,7 +64,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Implement routing engine that maps normalized work items to roles from workflow config.
 - [x] Add tests for first-match and priority-based routing.
 - [x] Add decomposition proposal type with child scopes, role assignments, dependencies, and acceptance criteria.
-- [ ] Implement integration-owner decomposition runner path.
+- [x] Implement integration-owner decomposition runner path.
 - [ ] Add child issue creation through `TrackerMutations`, gated by `decomposition.child_issue_policy`.
 - [ ] Add parent/child edge persistence and blocker propagation.
 - [ ] Add guard preventing parent completion while required children are non-terminal.
