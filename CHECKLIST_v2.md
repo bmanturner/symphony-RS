@@ -107,7 +107,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [x] Add QA queue fed by draft PRs/integration handoffs or direct specialist handoffs for simple issues.
 - [x] Implement QA run request with draft PR ref, final branch/workspace, acceptance trace, changed files, CI/check status, and prior handoffs.
-- [ ] Add QA verdict persistence (widen `qa_verdicts.verdict` CHECK to the five SPEC §4.9 verdicts and persist `role`, `waiver_role`, `reason` alongside the existing evidence/trace columns).
+- [x] Add QA verdict persistence (widen `qa_verdicts.verdict` CHECK to the five SPEC §4.9 verdicts and persist `role`, `waiver_role`, `reason` alongside the existing evidence/trace columns).
 - [ ] Add blocker creation from QA verdict when failures are found.
 - [ ] Add policy: QA blockers block parent completion by default; QA waivers require a configured waiver role and reason.
 - [ ] Add rework routing after QA failure.

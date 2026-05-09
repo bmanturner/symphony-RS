@@ -349,9 +349,9 @@ mod tests {
         db.conn()
             .execute(
                 "INSERT INTO qa_verdicts \
-                    (work_item_id, run_id, verdict, evidence, acceptance_trace, \
-                     blockers_created, created_at) \
-                 VALUES (?1, ?2, 'pass', NULL, NULL, NULL, ?3)",
+                    (work_item_id, run_id, role, verdict, \
+                     evidence, acceptance_trace, blockers_created, created_at) \
+                 VALUES (?1, ?2, 'qa', 'passed', NULL, NULL, NULL, ?3)",
                 rusqlite::params![work_item.0, run.0, now],
             )
             .expect("insert qa_verdict");

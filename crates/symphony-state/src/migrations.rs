@@ -336,10 +336,82 @@ const V2_PULL_REQUEST_RECORDS: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 3] = [
+/// Widens the `qa_verdicts.verdict` CHECK to the five SPEC v2 §4.9 verdicts
+/// and persists verdict authorship/waiver metadata required by SPEC v2
+/// §5.12: the authoring `role`, an optional `waiver_role`, and an
+/// optional operator-facing `reason`.
+///
+/// SQLite cannot widen a CHECK constraint or add NOT NULL columns in
+/// place, so this migration follows the documented "12-step" recreate
+/// pattern: build the new table, copy rows with the legacy three-state
+/// verdict mapped onto the new five-state vocabulary, drop the old
+/// table, rename, and reinstate the index.
+///
+/// The legacy → SPEC mapping mirrors the docstring in
+/// `symphony-core::qa::QaOutcome` (Phase 2 collapsed five verdicts into
+/// three storage states):
+///
+/// * `pass`         → `passed`
+/// * `fail`         → `failed_needs_rework` (the safer of the two failure
+///   variants — it does not require a referenced blocker, which legacy
+///   rows cannot supply)
+/// * `inconclusive` → `inconclusive`
+///
+/// Existing rows are imported with `role = 'qa'` (the SPEC default
+/// `qa_gate` role name) and `waiver_role` / `reason` left `NULL`.
+const V2_QA_VERDICT_AUTHORSHIP: Migration = Migration {
+    version: 2_026_050_804,
+    name: "v2_qa_verdict_authorship",
+    sql: r#"
+        CREATE TABLE qa_verdicts_new (
+            id                INTEGER PRIMARY KEY,
+            work_item_id      INTEGER NOT NULL
+                REFERENCES work_items(id) ON DELETE CASCADE,
+            run_id            INTEGER NOT NULL
+                REFERENCES runs(id) ON DELETE CASCADE,
+            role              TEXT    NOT NULL,
+            verdict           TEXT    NOT NULL
+                CHECK (verdict IN
+                    ('passed', 'failed_with_blockers',
+                     'failed_needs_rework', 'inconclusive', 'waived')),
+            waiver_role       TEXT,
+            reason            TEXT,
+            evidence          TEXT,
+            acceptance_trace  TEXT,
+            blockers_created  TEXT,
+            created_at        TEXT    NOT NULL
+        );
+
+        INSERT INTO qa_verdicts_new
+            (id, work_item_id, run_id, role, verdict,
+             waiver_role, reason,
+             evidence, acceptance_trace, blockers_created, created_at)
+        SELECT id, work_item_id, run_id, 'qa',
+               CASE verdict
+                   WHEN 'pass'         THEN 'passed'
+                   WHEN 'fail'         THEN 'failed_needs_rework'
+                   WHEN 'inconclusive' THEN 'inconclusive'
+                   ELSE verdict
+               END,
+               NULL, NULL,
+               evidence, acceptance_trace, blockers_created, created_at
+          FROM qa_verdicts;
+
+        DROP TABLE qa_verdicts;
+        ALTER TABLE qa_verdicts_new RENAME TO qa_verdicts;
+
+        CREATE INDEX idx_qa_verdicts_work_item
+            ON qa_verdicts(work_item_id);
+        CREATE INDEX idx_qa_verdicts_role
+            ON qa_verdicts(role);
+    "#,
+};
+
+const MIGRATIONS: [Migration; 4] = [
     V2_INITIAL_SCHEMA,
     V2_INTEGRATION_RECORDS,
     V2_PULL_REQUEST_RECORDS,
+    V2_QA_VERDICT_AUTHORSHIP,
 ];
 
 #[cfg(test)]
@@ -390,7 +462,7 @@ mod tests {
         let db = open_migrated();
         assert_eq!(
             db.applied_versions().unwrap(),
-            vec![2_026_050_801, 2_026_050_802, 2_026_050_803]
+            vec![2_026_050_801, 2_026_050_802, 2_026_050_803, 2_026_050_804,]
         );
     }
 
@@ -401,13 +473,13 @@ mod tests {
         let second = db.migrate(migrations()).expect("second apply");
         assert_eq!(
             first.applied,
-            vec![2_026_050_801, 2_026_050_802, 2_026_050_803]
+            vec![2_026_050_801, 2_026_050_802, 2_026_050_803, 2_026_050_804,]
         );
         assert!(first.skipped.is_empty());
         assert!(second.applied.is_empty());
         assert_eq!(
             second.skipped,
-            vec![2_026_050_801, 2_026_050_802, 2_026_050_803]
+            vec![2_026_050_801, 2_026_050_802, 2_026_050_803, 2_026_050_804,]
         );
     }
 
@@ -480,11 +552,104 @@ mod tests {
             .expect("insert run");
         let err = db.conn().execute(
             "INSERT INTO qa_verdicts
-                (work_item_id, run_id, verdict, created_at)
-             VALUES (?1, 1, 'maybe', '2026-05-08T00:00:00Z')",
+                (work_item_id, run_id, role, verdict, created_at)
+             VALUES (?1, 1, 'qa', 'maybe', '2026-05-08T00:00:00Z')",
             params![wi],
         );
         assert!(err.is_err(), "CHECK should reject unknown verdict");
+    }
+
+    #[test]
+    fn qa_verdict_check_accepts_all_five_spec_verdicts() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO runs
+                    (id, work_item_id, role, agent, status, created_at)
+                 VALUES (1, ?1, 'qa_gate', 'claude', 'completed',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("insert run");
+        for verdict in [
+            "passed",
+            "failed_with_blockers",
+            "failed_needs_rework",
+            "inconclusive",
+            "waived",
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO qa_verdicts
+                        (work_item_id, run_id, role, verdict, created_at)
+                     VALUES (?1, 1, 'qa', ?2, '2026-05-08T00:00:00Z')",
+                    params![wi, verdict],
+                )
+                .unwrap_or_else(|err| panic!("CHECK should accept verdict `{verdict}`: {err}"));
+        }
+    }
+
+    #[test]
+    fn qa_verdict_persists_role_waiver_role_and_reason() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO runs
+                    (id, work_item_id, role, agent, status, created_at)
+                 VALUES (1, ?1, 'qa_gate', 'claude', 'completed',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("insert run");
+        db.conn()
+            .execute(
+                "INSERT INTO qa_verdicts
+                    (work_item_id, run_id, role, verdict,
+                     waiver_role, reason, created_at)
+                 VALUES (?1, 1, 'qa', 'waived',
+                         'platform_lead', 'accepted risk',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("insert waived verdict");
+        let (role, verdict, waiver_role, reason): (String, String, Option<String>, Option<String>) =
+            db.conn()
+                .query_row(
+                    "SELECT role, verdict, waiver_role, reason
+                       FROM qa_verdicts
+                      WHERE work_item_id = ?1",
+                    params![wi],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read back row");
+        assert_eq!(role, "qa");
+        assert_eq!(verdict, "waived");
+        assert_eq!(waiver_role.as_deref(), Some("platform_lead"));
+        assert_eq!(reason.as_deref(), Some("accepted risk"));
+    }
+
+    #[test]
+    fn qa_verdict_role_column_is_not_null() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO runs
+                    (id, work_item_id, role, agent, status, created_at)
+                 VALUES (1, ?1, 'qa_gate', 'claude', 'completed',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("insert run");
+        let err = db.conn().execute(
+            "INSERT INTO qa_verdicts
+                (work_item_id, run_id, verdict, created_at)
+             VALUES (?1, 1, 'passed', '2026-05-08T00:00:00Z')",
+            params![wi],
+        );
+        assert!(err.is_err(), "role NOT NULL should reject missing role");
     }
 
     #[test]
