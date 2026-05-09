@@ -189,6 +189,20 @@ pub struct WorkflowConfig {
     /// enforce that `approval_role` resolves to a configured role.
     #[serde(default)]
     pub followups: FollowupConfig,
+
+    /// Multi-scope concurrency limits. Captures global, per-agent-profile,
+    /// and per-repository caps that the kernel's `ConcurrencyGate`
+    /// (added in a follow-up subtask) acquires before each dispatch.
+    /// Per-role caps remain on `roles.<name>.max_concurrent`.
+    ///
+    /// The legacy `agent.max_concurrent_agents` field continues to work
+    /// as a deprecated alias for [`ConcurrencyConfig::global_max`]: when
+    /// the typed `concurrency.global_max` is set it wins; when it is
+    /// unset, [`WorkflowConfig::resolved_global_concurrency`] falls back
+    /// to `agent.max_concurrent_agents` so existing fixtures keep
+    /// working unchanged.
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -221,8 +235,57 @@ impl Default for WorkflowConfig {
             pull_requests: PullRequestConfig::default(),
             qa: QaConfig::default(),
             followups: FollowupConfig::default(),
+            concurrency: ConcurrencyConfig::default(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// concurrency
+// ---------------------------------------------------------------------------
+
+/// Multi-scope concurrency limits surfaced as typed config so the
+/// kernel's `ConcurrencyGate` can acquire `(scope_kind, scope_key)`
+/// permits before each dispatch.
+///
+/// Three scopes live here:
+///
+/// 1. [`ConcurrencyConfig::global_max`] — overall in-flight cap. When
+///    set, it supersedes the deprecated `agent.max_concurrent_agents`
+///    alias. When unset, [`WorkflowConfig::resolved_global_concurrency`]
+///    falls back to `agent.max_concurrent_agents`.
+/// 2. [`ConcurrencyConfig::per_agent_profile`] — caps keyed by
+///    [`WorkflowConfig::agents`] profile names. Validated against the
+///    `agents` map at load time.
+/// 3. [`ConcurrencyConfig::per_repository`] — caps keyed by repository
+///    slug. Validated against [`TrackerConfig::repository`] at load
+///    time; future multi-repo support will widen the registry without
+///    a schema change.
+///
+/// Per-role caps are intentionally *not* defined here — they remain on
+/// [`RoleConfig::max_concurrent`] to keep the role definition the
+/// single source of truth for role authority. The gate primitive will
+/// query both surfaces when it acquires permits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    /// Overall in-flight dispatch cap across the orchestrator. `None`
+    /// inherits the deprecated `agent.max_concurrent_agents` alias.
+    /// Zero is rejected by [`WorkflowConfig::validate`].
+    #[serde(default)]
+    pub global_max: Option<u32>,
+
+    /// Per-agent-profile dispatch caps keyed by entries in
+    /// [`WorkflowConfig::agents`]. Unknown keys and zero values are
+    /// rejected at validate time.
+    #[serde(default)]
+    pub per_agent_profile: BTreeMap<String, u32>,
+
+    /// Per-repository dispatch caps keyed by repository slug. Today
+    /// only [`TrackerConfig::repository`] is recognised; unknown keys
+    /// and zero values are rejected at validate time.
+    #[serde(default)]
+    pub per_repository: BTreeMap<String, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,6 +2469,48 @@ pub enum ConfigValidationError {
     #[error("agent.max_concurrent_agents must be > 0 (got {0})")]
     MaxConcurrentZero(u32),
 
+    /// `concurrency.global_max` must be a positive integer when set.
+    /// Mirrors [`ConfigValidationError::MaxConcurrentZero`] for the
+    /// typed replacement of the deprecated `agent.max_concurrent_agents`
+    /// alias.
+    #[error("concurrency.global_max must be > 0 when set (got {0})")]
+    ConcurrencyGlobalMaxZero(u32),
+
+    /// A `concurrency.per_agent_profile` or `concurrency.per_repository`
+    /// entry has a zero cap. Zero would deadlock the gate at the
+    /// matching scope, so reject at load time rather than wedge a
+    /// running orchestrator.
+    #[error("{field} cap for `{key}` must be > 0 (got 0)")]
+    ConcurrencyZeroCap {
+        /// `concurrency.per_agent_profile` or
+        /// `concurrency.per_repository`.
+        field: String,
+        /// The offending map key (profile name or repository slug).
+        key: String,
+    },
+
+    /// A `concurrency.per_agent_profile` key does not resolve to a
+    /// profile defined in [`WorkflowConfig::agents`].
+    #[error(
+        "concurrency.per_agent_profile references profile `{profile}` which is not defined under `agents`"
+    )]
+    UnknownConcurrencyAgentProfile {
+        /// The agent profile name that failed to resolve.
+        profile: String,
+    },
+
+    /// A `concurrency.per_repository` key does not resolve to a known
+    /// repository slug. Today the only recognised slug is
+    /// [`TrackerConfig::repository`]; future multi-repo support will
+    /// widen the registry without a schema change.
+    #[error(
+        "concurrency.per_repository references repository `{repository}` which is not a known repository slug"
+    )]
+    UnknownConcurrencyRepository {
+        /// The repository slug that failed to resolve.
+        repository: String,
+    },
+
     /// `polling.interval_ms` must be > 0 — a zero interval would
     /// produce a busy-spin tick loop.
     #[error("polling.interval_ms must be > 0 (got {0})")]
@@ -2648,7 +2753,55 @@ impl WorkflowConfig {
         self.validate_workspace_default_strategy()?;
         self.validate_role_and_agent_references()?;
         self.validate_required_role_kinds()?;
+        self.validate_concurrency()?;
         Ok(())
+    }
+
+    /// Validate the typed [`ConcurrencyConfig`] block. Rejects zero
+    /// caps, unknown agent-profile keys, and unknown repository
+    /// slugs. Per-role caps are validated against `roles` elsewhere.
+    fn validate_concurrency(&self) -> Result<(), ConfigValidationError> {
+        if let Some(0) = self.concurrency.global_max {
+            return Err(ConfigValidationError::ConcurrencyGlobalMaxZero(0));
+        }
+        for (profile, cap) in &self.concurrency.per_agent_profile {
+            if *cap == 0 {
+                return Err(ConfigValidationError::ConcurrencyZeroCap {
+                    field: "concurrency.per_agent_profile".to_string(),
+                    key: profile.clone(),
+                });
+            }
+            if !self.agents.contains_key(profile) {
+                return Err(ConfigValidationError::UnknownConcurrencyAgentProfile {
+                    profile: profile.clone(),
+                });
+            }
+        }
+        for (repo, cap) in &self.concurrency.per_repository {
+            if *cap == 0 {
+                return Err(ConfigValidationError::ConcurrencyZeroCap {
+                    field: "concurrency.per_repository".to_string(),
+                    key: repo.clone(),
+                });
+            }
+            let known = self.tracker.repository.as_deref() == Some(repo.as_str());
+            if !known {
+                return Err(ConfigValidationError::UnknownConcurrencyRepository {
+                    repository: repo.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Effective global concurrency cap. Prefers
+    /// [`ConcurrencyConfig::global_max`] when set, falling back to the
+    /// deprecated [`AgentConfig::max_concurrent_agents`] alias so
+    /// existing fixtures keep working unchanged.
+    pub fn resolved_global_concurrency(&self) -> u32 {
+        self.concurrency
+            .global_max
+            .unwrap_or(self.agent.max_concurrent_agents)
     }
 
     /// `active_states` and `terminal_states` must be disjoint
@@ -6254,6 +6407,187 @@ agent:
             Err(ConfigValidationError::MissingIntegrationOwnerRole {
                 feature: "pull_requests".into(),
             })
+        );
+    }
+
+    fn mock_backend_profile() -> AgentProfileConfig {
+        AgentProfileConfig::Backend(Box::new(AgentBackendProfile {
+            backend: AgentBackend::Mock,
+            description: None,
+            command: None,
+            model: None,
+            system_prompt: None,
+            tools: Vec::new(),
+            env: BTreeMap::new(),
+            memory: None,
+            approval_policy: None,
+            sandbox_policy: None,
+            max_turns: None,
+            turn_timeout_ms: None,
+            stall_timeout_ms: None,
+            token_budget: None,
+            cost_budget_usd: None,
+        }))
+    }
+
+    #[test]
+    fn concurrency_defaults_are_empty() {
+        let cfg = WorkflowConfig::default();
+        assert_eq!(cfg.concurrency.global_max, None);
+        assert!(cfg.concurrency.per_agent_profile.is_empty());
+        assert!(cfg.concurrency.per_repository.is_empty());
+        // Resolver falls back to the legacy alias when `global_max` is unset.
+        assert_eq!(
+            cfg.resolved_global_concurrency(),
+            cfg.agent.max_concurrent_agents
+        );
+    }
+
+    #[test]
+    fn concurrency_global_max_overrides_legacy_alias() {
+        // The deprecation contract: when both `concurrency.global_max`
+        // and `agent.max_concurrent_agents` are set, the typed field
+        // wins. This is the precedence rule the CHECKLIST_v2 subtask
+        // calls out.
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.agent.max_concurrent_agents = 4;
+        cfg.concurrency.global_max = Some(7);
+        assert_eq!(cfg.resolved_global_concurrency(), 7);
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn concurrency_legacy_alias_used_when_typed_field_unset() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.agent.max_concurrent_agents = 3;
+        assert_eq!(cfg.resolved_global_concurrency(), 3);
+    }
+
+    #[test]
+    fn concurrency_block_roundtrips() {
+        let yaml = r#"
+schema_version: 1
+tracker:
+  kind: github
+  repository: foglet-io/rust-symphony
+agents:
+  fast:
+    backend: mock
+concurrency:
+  global_max: 6
+  per_agent_profile:
+    fast: 2
+  per_repository:
+    foglet-io/rust-symphony: 4
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.concurrency.global_max, Some(6));
+        assert_eq!(
+            parsed.concurrency.per_agent_profile.get("fast").copied(),
+            Some(2),
+        );
+        assert_eq!(
+            parsed
+                .concurrency
+                .per_repository
+                .get("foglet-io/rust-symphony")
+                .copied(),
+            Some(4),
+        );
+        assert_eq!(parsed.validate(), Ok(()));
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn concurrency_unknown_nested_key_is_rejected() {
+        // `deny_unknown_fields` coverage: typos under `concurrency:`
+        // must surface, not silently default.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+concurrency:
+  globalmax: 4
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("globalmax") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn concurrency_global_max_zero_is_rejected_by_validate() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.concurrency.global_max = Some(0);
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::ConcurrencyGlobalMaxZero(0)),
+        );
+    }
+
+    #[test]
+    fn concurrency_zero_per_agent_profile_cap_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.agents.insert("fast".into(), mock_backend_profile());
+        cfg.concurrency.per_agent_profile.insert("fast".into(), 0);
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::ConcurrencyZeroCap {
+                field: "concurrency.per_agent_profile".into(),
+                key: "fast".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn concurrency_unknown_per_agent_profile_key_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.concurrency.per_agent_profile.insert("ghost".into(), 2);
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownConcurrencyAgentProfile {
+                profile: "ghost".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn concurrency_zero_per_repository_cap_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.concurrency
+            .per_repository
+            .insert("foglet-io/rust-symphony".into(), 0);
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::ConcurrencyZeroCap {
+                field: "concurrency.per_repository".into(),
+                key: "foglet-io/rust-symphony".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn concurrency_unknown_per_repository_key_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.concurrency
+            .per_repository
+            .insert("foglet-io/something-else".into(), 2);
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnknownConcurrencyRepository {
+                repository: "foglet-io/something-else".into(),
+            }),
         );
     }
 }
