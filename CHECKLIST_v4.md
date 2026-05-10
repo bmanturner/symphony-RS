@@ -4,7 +4,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 0 — v4 Grounding
 
-- [x] Add `SPEC_v4.md` to product docs/references and link it from role/workflow docs without redefining v2 roles or v3 dependency behavior.
+- [x] Add `SPEC_v4.md` to product docs/references and link it from role/workflow docs without redefining v2 roles or v3 dependency behavior. Cross-link `CHECKLIST_v5.md` here because v4 finishes prompt-side doctrine while v5 finishes live agent ↔ kernel communication.
 - [x] Add a sample `.symphony/roles/` directory to fixtures with `AGENTS.md` and `SOUL.md` for platform lead, QA, and at least two specialist roles.
 - [x] Define the canonical prompt assembly order in docs: global workflow prompt, role instructions, role SOUL, agent profile system prompt, run context, graph/blockers, output schema.
 - [x] Explicitly document that the platform-lead assignment catalog is generated from `WORKFLOW.md`, not from per-role `ASSIGNMENT.md` files.
@@ -80,7 +80,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add tests proving QA is not listed as a normal implementation child role unless workflow explicitly allows manual QA task issues.
 - [x] Add tests proving platform lead has enough prompt context to emit `assigned_role` for each child without guessing from terse descriptions.
 - [x] Add an integration-owner prompt builder (SPEC v4 §5 integration block) for the consolidation/PR phase, distinct from the decomposition phase.
-- [x] Surface latest `Handoff` per child (SPEC v4 §5.2) in the integration-owner prompt: `summary`, `changed_files`, `tests_run`, `verification_evidence`, `known_risks`, `branch_or_workspace`, `ready_for`. Read from `HandoffRepository::latest_handoff` via `IntegrationChild.latest_handoff`.
+- [x] Surface latest `Handoff` per child (SPEC v4 §5.2) in the integration-owner prompt: `summary`, `changed_files`, `tests_run`, `verification_evidence`, `known_risks`, `branch_or_workspace`, `ready_for`. Read from `HandoffRepository::latest_handoff` via `IntegrationChild.latest_handoff`. See `CHECKLIST_v5.md` for the MCP/tool path that turns this prompt-side handoff contract into live agent ↔ kernel communication.
 - [x] Add tests proving the integration-owner prompt includes each child's latest handoff fields and not just bare `identifier`/`title`/`status`.
 - [x] Add tests proving the integration-owner prompt distinguishes children that produced no handoff (e.g. waived) from children with handoffs.
 
@@ -98,7 +98,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Ensure QA prompt construction treats QA as a gate over integrated output, not a normal implementation child by default.
 - [x] Add tests proving QA verdict schema and evidence requirements are present.
 - [x] Add tests proving QA can see child handoffs and integration summary.
-- [x] Read child handoffs from `HandoffRepository::latest_handoff` (same source as Phase 6 integration-owner prompt) and include the SPEC v4 §5.2 fields. Both Phase 6 and Phase 8 must agree on the rendering format so a child handoff reads identically downstream.
+- [x] Read child handoffs from `HandoffRepository::latest_handoff` (same source as Phase 6 integration-owner prompt) and include the SPEC v4 §5.2 fields. Both Phase 6 and Phase 8 must agree on the rendering format so a child handoff reads identically downstream. See `CHECKLIST_v5.md` for the remaining live agent ↔ kernel communication work.
 
 ## Phase 9 — Fixtures and Examples
 
@@ -134,4 +134,4 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 13 — Forward Reference
 
-- [ ] Cross-link `CHECKLIST_v5.md` from the Phase 0 grounding and from the integration / QA prompt phases. v4 closes the prompt-side gaps; v5 closes the agent ↔ kernel communication gaps. The product is not end-to-end runnable on a live agent until both are complete.
+- [x] Cross-link `CHECKLIST_v5.md` from the Phase 0 grounding and from the integration / QA prompt phases. v4 closes the prompt-side gaps; v5 closes the agent ↔ kernel communication gaps. The product is not end-to-end runnable on a live agent until both are complete.
