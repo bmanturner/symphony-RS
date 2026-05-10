@@ -151,7 +151,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add deterministic test scenario: QA files blocker, blocker routes to specialist, integration reruns, QA passes.
 - [x] Add deterministic test scenario: specialist files non-blocking follow-up while current work proceeds.
 - [x] Add deterministic test scenario: dirty/wrong branch blocks agent launch.
-- [ ] Add deterministic test scenario: integration owner cannot close parent with unresolved child.
+- [x] Add deterministic test scenario: integration owner cannot close parent with unresolved child.
 - [ ] Add crash/restart scenario proving durable recovery of queued/running/blocked work.
 
 ## Phase 14 — Documentation and Productization
