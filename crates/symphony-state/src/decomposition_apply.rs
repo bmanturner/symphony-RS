@@ -141,6 +141,27 @@ pub fn record_required_dependency_sync_failure(
     })
 }
 
+/// Record a best-effort tracker blocker-sync failure without changing
+/// local dispatch truth.
+///
+/// Under `tracker_sync: best_effort`, Symphony's local open `blocks`
+/// edge remains authoritative. The failure is still durable and
+/// retryable through edge sync metadata, but the blocked child's status
+/// is not demoted merely because the tracker mirror failed.
+pub fn record_best_effort_dependency_sync_failure(
+    db: &mut StateDb,
+    edge: &WorkItemEdgeRecord,
+    error: &str,
+    now: &str,
+) -> crate::StateResult<()> {
+    db.record_tracker_edge_sync_failure(TrackerEdgeSyncFailure {
+        edge_id: edge.id,
+        error,
+        attempted_at: now,
+    })?;
+    Ok(())
+}
+
 /// Persist tracker-created decomposition children and their local graph.
 ///
 /// The operation is recoverable rather than all-or-nothing: child
@@ -651,5 +672,62 @@ mod tests {
         );
         assert_eq!(blocked_child_after.tracker_status, "blocked");
         assert_eq!(blocked_child_after.updated_at, "2026-05-10T00:01:00Z");
+    }
+
+    #[test]
+    fn best_effort_tracker_sync_failure_records_retry_metadata_without_parking_child() {
+        let mut db = open();
+        let parent = seed_parent(&mut db);
+        let proposal = proposal(parent);
+        let persisted =
+            persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
+                .expect("dependencies materialize");
+        let edge = persisted
+            .dependency_edges
+            .iter()
+            .find(|edge| edge.reason.as_deref() == Some("B depends on A"))
+            .expect("B is blocked by A")
+            .clone();
+
+        let child_before = db.get_work_item(edge.child_id).unwrap().unwrap();
+        assert_eq!(
+            child_before.status_class,
+            WorkItemStatusClass::Ready.as_str()
+        );
+        assert_eq!(child_before.tracker_status, "open");
+
+        record_best_effort_dependency_sync_failure(
+            &mut db,
+            &edge,
+            "Linear issueRelationCreate timed out",
+            "2026-05-10T00:02:00Z",
+        )
+        .expect("record best-effort sync failure");
+
+        let failed_edge = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(failed_edge.status, "open");
+        assert_eq!(failed_edge.tracker_sync_status.as_deref(), Some("failed"));
+        assert_eq!(
+            failed_edge.tracker_sync_last_error.as_deref(),
+            Some("Linear issueRelationCreate timed out")
+        );
+        assert_eq!(failed_edge.tracker_sync_attempts, 1);
+        assert_eq!(
+            failed_edge.tracker_sync_last_attempt_at.as_deref(),
+            Some("2026-05-10T00:02:00Z")
+        );
+
+        let child_after = db.get_work_item(edge.child_id).unwrap().unwrap();
+        assert_eq!(
+            child_after.status_class,
+            WorkItemStatusClass::Ready.as_str()
+        );
+        assert_eq!(child_after.tracker_status, "open");
+        assert_eq!(child_after.updated_at, NOW);
+        assert_eq!(
+            db.list_incoming_open_blockers(edge.child_id).unwrap().len(),
+            1,
+            "the local open blocker remains the authoritative dispatch gate"
+        );
     }
 }

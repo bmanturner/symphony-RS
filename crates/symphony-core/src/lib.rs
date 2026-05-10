@@ -114,7 +114,8 @@ pub use decomposition::{
 };
 pub use decomposition_applier::{
     AppliedChild, AppliedDecomposition, ApplyError, DecompositionApplier,
-    DefaultDecompositionApplier, DependencyTrackerSyncMode, apply_decomposition,
+    DefaultDecompositionApplier, DependencyBlockerSyncOutcome, DependencyTrackerSyncMode,
+    FailedDependencyBlockerSync, SyncedDependencyBlocker, apply_decomposition,
     sync_decomposition_dependency_blockers,
 };
 pub use decomposition_runner::{

@@ -87,6 +87,27 @@ pub struct SyncedDependencyBlocker {
     pub tracker_edge_id: Option<String>,
 }
 
+/// Non-fatal tracker mirror failure for a best-effort dependency edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedDependencyBlockerSync {
+    /// Proposal-local key of the prerequisite child.
+    pub blocker: ChildKey,
+    /// Proposal-local key of the waiting child.
+    pub blocked: ChildKey,
+    /// Operator-facing tracker error suitable for durable retry state.
+    pub error: String,
+}
+
+/// Tracker mirror outcome for one decomposition dependency edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyBlockerSyncOutcome {
+    /// The tracker accepted the structural blocker relation.
+    Synced(SyncedDependencyBlocker),
+    /// `tracker_sync: best_effort` tried to mirror the edge, failed, and
+    /// left local Symphony gating authoritative.
+    Failed(FailedDependencyBlockerSync),
+}
+
 /// Tracker-side policy for mirroring decomposition dependency blockers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyTrackerSyncMode {
@@ -263,7 +284,7 @@ pub async fn sync_decomposition_dependency_blockers(
     tracker: &dyn TrackerMutations,
     capabilities: TrackerCapabilities,
     mode: DependencyTrackerSyncMode,
-) -> Result<Vec<SyncedDependencyBlocker>, ApplyError> {
+) -> Result<Vec<DependencyBlockerSyncOutcome>, ApplyError> {
     if mode == DependencyTrackerSyncMode::LocalOnly {
         return Ok(Vec::new());
     }
@@ -280,7 +301,7 @@ pub async fn sync_decomposition_dependency_blockers(
         .iter()
         .map(|child| (&child.key, &child.tracker_id))
         .collect();
-    let mut synced = Vec::new();
+    let mut outcomes = Vec::new();
 
     for child in &proposal.children {
         let Some(blocked_tracker_id) = tracker_ids.get(&child.key).copied() else {
@@ -307,21 +328,36 @@ pub async fn sync_decomposition_dependency_blockers(
                     blocker: blocker_tracker_id.clone(),
                     reason: Some(format!("{} depends on {}", child.key, dependency)),
                 })
-                .await
-                .map_err(|source| ApplyError::DependencyBlockerSyncFailed {
-                    blocker: dependency.clone(),
-                    blocked: child.key.clone(),
-                    source,
-                })?;
-            synced.push(SyncedDependencyBlocker {
-                blocker: dependency.clone(),
-                blocked: child.key.clone(),
-                tracker_edge_id: response.edge_id,
-            });
+                .await;
+            match response {
+                Ok(response) => outcomes.push(DependencyBlockerSyncOutcome::Synced(
+                    SyncedDependencyBlocker {
+                        blocker: dependency.clone(),
+                        blocked: child.key.clone(),
+                        tracker_edge_id: response.edge_id,
+                    },
+                )),
+                Err(source) if mode == DependencyTrackerSyncMode::BestEffort => {
+                    outcomes.push(DependencyBlockerSyncOutcome::Failed(
+                        FailedDependencyBlockerSync {
+                            blocker: dependency.clone(),
+                            blocked: child.key.clone(),
+                            error: source.to_string(),
+                        },
+                    ));
+                }
+                Err(source) => {
+                    return Err(ApplyError::DependencyBlockerSyncFailed {
+                        blocker: dependency.clone(),
+                        blocked: child.key.clone(),
+                        source,
+                    });
+                }
+            }
         }
     }
 
-    Ok(synced)
+    Ok(outcomes)
 }
 
 /// Render a child's tracker body from its scope, description, and
@@ -444,6 +480,7 @@ mod tests {
         calls: Mutex<Vec<TrackerCall>>,
         fail_create_for: Option<String>,
         fail_link_for: Option<String>,
+        add_blocker_error: Option<String>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +497,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 fail_create_for: None,
                 fail_link_for: None,
+                add_blocker_error: None,
             }
         }
 
@@ -470,6 +508,11 @@ mod tests {
 
         fn fail_link(mut self, title_marker: impl Into<String>) -> Self {
             self.fail_link_for = Some(title_marker.into());
+            self
+        }
+
+        fn with_add_blocker_error(mut self, error: impl Into<String>) -> Self {
+            self.add_blocker_error = Some(error.into());
             self
         }
 
@@ -525,6 +568,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(TrackerCall::AddBlocker(request));
+            if let Some(error) = &self.add_blocker_error {
+                return Err(TrackerError::Transport(error.clone()));
+            }
             Ok(AddBlockerResponse {
                 edge_id: Some("edge-1".to_string()),
             })
@@ -778,7 +824,7 @@ mod tests {
         .await
         .unwrap();
 
-        let synced = sync_decomposition_dependency_blockers(
+        let outcomes = sync_decomposition_dependency_blockers(
             &proposal,
             &applied,
             &tracker,
@@ -800,12 +846,14 @@ mod tests {
         assert_eq!(blocker.blocked.as_str(), "1001");
         assert_eq!(blocker.reason.as_deref(), Some("b depends on a"));
         assert_eq!(
-            synced,
-            vec![SyncedDependencyBlocker {
-                blocker: ChildKey::new("a"),
-                blocked: ChildKey::new("b"),
-                tracker_edge_id: Some("edge-1".to_string()),
-            }]
+            outcomes,
+            vec![DependencyBlockerSyncOutcome::Synced(
+                SyncedDependencyBlocker {
+                    blocker: ChildKey::new("a"),
+                    blocked: ChildKey::new("b"),
+                    tracker_edge_id: Some("edge-1".to_string()),
+                }
+            )]
         );
     }
 
@@ -833,7 +881,7 @@ mod tests {
             ],
         };
 
-        let synced = sync_decomposition_dependency_blockers(
+        let outcomes = sync_decomposition_dependency_blockers(
             &proposal,
             &applied,
             &tracker,
@@ -844,7 +892,7 @@ mod tests {
         .unwrap();
 
         assert!(tracker.calls().is_empty());
-        assert!(synced.is_empty());
+        assert!(outcomes.is_empty());
     }
 
     #[tokio::test]
@@ -879,7 +927,7 @@ mod tests {
             proposal_id: proposal.id,
             children: Vec::new(),
         };
-        let synced = sync_decomposition_dependency_blockers(
+        let outcomes = sync_decomposition_dependency_blockers(
             &proposal,
             &applied,
             &tracker,
@@ -893,6 +941,52 @@ mod tests {
         .await
         .unwrap();
         assert!(tracker.calls().is_empty());
-        assert!(synced.is_empty());
+        assert!(outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn best_effort_dependency_sync_records_failed_outcome_without_error() {
+        let proposal = proposal(FollowupPolicy::CreateDirectly);
+        let tracker = RecordingTracker::new().with_add_blocker_error("linear unavailable");
+        let applied = AppliedDecomposition {
+            proposal_id: proposal.id,
+            children: vec![
+                AppliedChild {
+                    key: ChildKey::new("a"),
+                    tracker_id: IssueId::new("A"),
+                    identifier: "A".to_string(),
+                    url: None,
+                    linked_parent: false,
+                },
+                AppliedChild {
+                    key: ChildKey::new("b"),
+                    tracker_id: IssueId::new("B"),
+                    identifier: "B".to_string(),
+                    url: None,
+                    linked_parent: false,
+                },
+            ],
+        };
+
+        let outcomes = sync_decomposition_dependency_blockers(
+            &proposal,
+            &applied,
+            &tracker,
+            TrackerCapabilities::FULL,
+            DependencyTrackerSyncMode::BestEffort,
+        )
+        .await
+        .expect("best-effort failure is non-fatal");
+
+        assert_eq!(
+            outcomes,
+            vec![DependencyBlockerSyncOutcome::Failed(
+                FailedDependencyBlockerSync {
+                    blocker: ChildKey::new("a"),
+                    blocked: ChildKey::new("b"),
+                    error: "tracker transport failure: linear unavailable".to_string(),
+                }
+            )]
+        );
     }
 }
