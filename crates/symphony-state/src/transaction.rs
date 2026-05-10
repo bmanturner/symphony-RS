@@ -178,6 +178,15 @@ impl<'conn> StateTransaction<'conn> {
         crate::edges::record_tracker_edge_sync_failure_in(&self.tx, failure)
     }
 
+    /// Record that workflow policy intentionally kept an edge local-only
+    /// inside this transaction.
+    pub fn record_tracker_edge_sync_local_only(
+        &mut self,
+        local_only: crate::edges::TrackerEdgeSyncLocalOnly<'_>,
+    ) -> StateResult<bool> {
+        crate::edges::record_tracker_edge_sync_local_only_in(&self.tx, local_only)
+    }
+
     /// Propagation query: every open `blocks` edge that gates `target`
     /// either directly or via `parent_child` descendants.
     pub fn list_open_blockers_for_subtree(

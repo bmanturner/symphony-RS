@@ -45,7 +45,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Persist returned tracker edge IDs where adapters provide them.
 - [x] Implement `tracker_sync: required` behavior: keep affected children blocked when tracker blocker mutation fails.
 - [x] Implement `tracker_sync: best_effort` behavior: local gating remains authoritative while failed tracker sync is visible/retryable.
-- [ ] Implement `tracker_sync: local_only` behavior: skip tracker blocker mutation and optionally render advisory comments/text.
+- [x] Implement `tracker_sync: local_only` behavior: skip tracker blocker mutation and optionally render advisory comments/text.
 - [ ] Add Linear mutation tests proving `issueRelationCreate(type: "blocks")` is called with `issue_id = blocker` and `related_issue_id = blocked`.
 - [ ] Add GitHub tests proving `add_blocker` and `link_parent_child` remain false unless a real structural implementation lands.
 - [ ] Add conformance tests proving label/body/comment-only GitHub behavior never masquerades as structural blocker support.

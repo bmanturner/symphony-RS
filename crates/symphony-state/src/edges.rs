@@ -217,6 +217,15 @@ pub struct TrackerEdgeSyncFailure<'a> {
     pub attempted_at: &'a str,
 }
 
+/// Local-only tracker policy metadata for an existing dependency edge.
+#[derive(Debug, Clone)]
+pub struct TrackerEdgeSyncLocalOnly<'a> {
+    /// Local `work_item_edges` row that was intentionally not mirrored.
+    pub edge_id: EdgeId,
+    /// RFC3339 timestamp for the policy decision.
+    pub recorded_at: &'a str,
+}
+
 /// CRUD over `work_item_edges`.
 pub trait WorkItemEdgeRepository {
     /// Insert a new edge and return its persisted form.
@@ -260,6 +269,13 @@ pub trait WorkItemEdgeRepository {
     fn record_tracker_edge_sync_failure(
         &mut self,
         failure: TrackerEdgeSyncFailure<'_>,
+    ) -> StateResult<bool>;
+
+    /// Record that workflow policy intentionally kept this dependency
+    /// edge local-only. Returns `Ok(false)` when the row does not exist.
+    fn record_tracker_edge_sync_local_only(
+        &mut self,
+        local_only: TrackerEdgeSyncLocalOnly<'_>,
     ) -> StateResult<bool>;
 
     /// List edges where `parent_id = source` and `edge_type = kind`,
@@ -470,6 +486,22 @@ pub(crate) fn record_tracker_edge_sync_failure_in(
     Ok(updated == 1)
 }
 
+pub(crate) fn record_tracker_edge_sync_local_only_in(
+    conn: &Connection,
+    local_only: TrackerEdgeSyncLocalOnly<'_>,
+) -> StateResult<bool> {
+    let updated = conn.execute(
+        "UPDATE work_item_edges
+            SET tracker_edge_id = NULL,
+                tracker_sync_status = 'local_only',
+                tracker_sync_last_error = NULL,
+                tracker_sync_last_attempt_at = ?2
+          WHERE id = ?1",
+        params![local_only.edge_id.0, local_only.recorded_at],
+    )?;
+    Ok(updated == 1)
+}
+
 pub(crate) fn list_outgoing_in(
     conn: &Connection,
     source: WorkItemId,
@@ -608,6 +640,13 @@ impl WorkItemEdgeRepository for StateDb {
         failure: TrackerEdgeSyncFailure<'_>,
     ) -> StateResult<bool> {
         record_tracker_edge_sync_failure_in(self.conn(), failure)
+    }
+
+    fn record_tracker_edge_sync_local_only(
+        &mut self,
+        local_only: TrackerEdgeSyncLocalOnly<'_>,
+    ) -> StateResult<bool> {
+        record_tracker_edge_sync_local_only_in(self.conn(), local_only)
     }
 
     fn list_outgoing(
@@ -1089,6 +1128,42 @@ mod tests {
         assert_eq!(
             fetched.tracker_sync_last_attempt_at.as_deref(),
             Some("2026-05-08T00:02:00Z")
+        );
+    }
+
+    #[test]
+    fn record_tracker_edge_sync_local_only_marks_policy_without_retry_attempt() {
+        let mut db = open();
+        let blocker = seed_item(&mut db, "ENG-1");
+        let blocked = seed_item(&mut db, "ENG-2");
+        let edge = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: blocker,
+                blocked_id: blocked,
+                reason: "blocked depends on blocker",
+                now: "2026-05-08T00:00:00Z",
+            }])
+            .expect("create dependency blocker")
+            .pop()
+            .expect("edge should be returned");
+
+        assert!(
+            db.record_tracker_edge_sync_local_only(TrackerEdgeSyncLocalOnly {
+                edge_id: edge.id,
+                recorded_at: "2026-05-08T00:03:00Z",
+            })
+            .expect("record local-only policy")
+        );
+
+        let fetched = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(fetched.status, "open");
+        assert_eq!(fetched.tracker_edge_id, None);
+        assert_eq!(fetched.tracker_sync_status.as_deref(), Some("local_only"));
+        assert_eq!(fetched.tracker_sync_last_error, None);
+        assert_eq!(fetched.tracker_sync_attempts, 0);
+        assert_eq!(
+            fetched.tracker_sync_last_attempt_at.as_deref(),
+            Some("2026-05-08T00:03:00Z")
         );
     }
 

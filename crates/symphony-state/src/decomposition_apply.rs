@@ -16,7 +16,7 @@ use symphony_core::work_item::WorkItemStatusClass;
 
 use crate::edges::{
     EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge, TrackerEdgeSyncFailure,
-    WorkItemEdgeRecord, WorkItemEdgeRepository,
+    TrackerEdgeSyncLocalOnly, WorkItemEdgeRecord, WorkItemEdgeRepository,
 };
 use crate::repository::{NewWorkItem, WorkItemId, WorkItemRecord};
 use crate::{StateDb, StateError};
@@ -158,6 +158,25 @@ pub fn record_best_effort_dependency_sync_failure(
         edge_id: edge.id,
         error,
         attempted_at: now,
+    })?;
+    Ok(())
+}
+
+/// Record that workflow policy intentionally kept a dependency blocker
+/// local-only.
+///
+/// Under `tracker_sync: local_only`, Symphony must not call structural
+/// tracker blocker mutation APIs. The local open edge remains the
+/// dispatch gate, and this metadata tells operator/retry surfaces that
+/// the missing tracker edge is policy, not an unattempted or failed sync.
+pub fn record_local_only_dependency_sync(
+    db: &mut StateDb,
+    edge: &WorkItemEdgeRecord,
+    now: &str,
+) -> crate::StateResult<()> {
+    db.record_tracker_edge_sync_local_only(TrackerEdgeSyncLocalOnly {
+        edge_id: edge.id,
+        recorded_at: now,
     })?;
     Ok(())
 }
@@ -728,6 +747,51 @@ mod tests {
             db.list_incoming_open_blockers(edge.child_id).unwrap().len(),
             1,
             "the local open blocker remains the authoritative dispatch gate"
+        );
+    }
+
+    #[test]
+    fn local_only_tracker_sync_records_policy_without_tracker_attempt_or_child_demotion() {
+        let mut db = open();
+        let parent = seed_parent(&mut db);
+        let proposal = proposal(parent);
+        let persisted =
+            persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
+                .expect("dependencies materialize");
+        let edge = persisted
+            .dependency_edges
+            .iter()
+            .find(|edge| edge.reason.as_deref() == Some("B depends on A"))
+            .expect("B is blocked by A")
+            .clone();
+
+        record_local_only_dependency_sync(&mut db, &edge, "2026-05-10T00:03:00Z")
+            .expect("record local-only sync policy");
+
+        let local_only_edge = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(local_only_edge.status, "open");
+        assert_eq!(local_only_edge.tracker_edge_id, None);
+        assert_eq!(
+            local_only_edge.tracker_sync_status.as_deref(),
+            Some("local_only")
+        );
+        assert_eq!(local_only_edge.tracker_sync_last_error, None);
+        assert_eq!(local_only_edge.tracker_sync_attempts, 0);
+        assert_eq!(
+            local_only_edge.tracker_sync_last_attempt_at.as_deref(),
+            Some("2026-05-10T00:03:00Z")
+        );
+
+        let child_after = db.get_work_item(edge.child_id).unwrap().unwrap();
+        assert_eq!(
+            child_after.status_class,
+            WorkItemStatusClass::Ready.as_str()
+        );
+        assert_eq!(child_after.tracker_status, "open");
+        assert_eq!(
+            db.list_incoming_open_blockers(edge.child_id).unwrap().len(),
+            1,
+            "local Symphony edge remains the dispatch gate under local_only"
         );
     }
 }
