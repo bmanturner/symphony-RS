@@ -51,6 +51,9 @@ use crate::run_lease::{
     HeartbeatPulseObservation, LeaseAcquireOutcome, LeaseHeartbeat, RunLeaseGuard, RunLeaseStore,
     pulse_observed,
 };
+use crate::scope_contention_broadcaster::{
+    ContentionSubject, ScopeContentionEventBroadcaster, ScopeFields,
+};
 use crate::specialist_tick::{SpecialistDispatchQueue, SpecialistDispatchRequest};
 use crate::state_machine::ReleaseReason;
 use crate::tracker::Issue;
@@ -125,6 +128,11 @@ impl SpecialistRunReport {
 pub struct ScopeContendedObservation {
     /// Tracker-facing identifier the parked request carries.
     pub identifier: String,
+    /// Durable run row reserved for this dispatch, if the request had
+    /// one. Drives the [`ContentionSubject`] used by the durable
+    /// [`ScopeContentionEventBroadcaster`]: `Run(run_id)` when present,
+    /// `Identifier(identifier)` otherwise.
+    pub run_id: Option<RunRef>,
     /// The kind of scope that contended.
     pub scope_kind: ScopeKind,
     /// The scope key (role/profile/repo label, or `""` for `Global`).
@@ -136,13 +144,34 @@ pub struct ScopeContendedObservation {
 }
 
 impl ScopeContendedObservation {
-    fn from_contention(identifier: String, contended: &ScopeContended) -> Self {
+    fn from_contention(
+        identifier: String,
+        run_id: Option<RunRef>,
+        contended: &ScopeContended,
+    ) -> Self {
         Self {
             identifier,
+            run_id,
             scope_kind: contended.scope.kind(),
             scope_key: contended.scope.key().to_owned(),
             in_flight: contended.in_flight,
             cap: contended.cap,
+        }
+    }
+
+    fn subject(&self) -> ContentionSubject {
+        match self.run_id {
+            Some(r) => ContentionSubject::Run(r.get()),
+            None => ContentionSubject::Identifier(self.identifier.clone()),
+        }
+    }
+
+    fn fields(&self) -> ScopeFields {
+        ScopeFields {
+            scope_kind: self.scope_kind,
+            scope_key: self.scope_key.clone(),
+            in_flight: self.in_flight,
+            cap: self.cap,
         }
     }
 }
@@ -212,6 +241,15 @@ pub struct SpecialistRunner {
     /// completion. When `None`, only the local capacity semaphore caps
     /// concurrency.
     concurrency_gate: Option<ConcurrencyGate>,
+    /// Optional durable scope-contention broadcaster. When `Some`, every
+    /// `run_pending` pass — including idle passes — feeds the runner's
+    /// per-pass [`ScopeContendedObservation`]s into the shared dedup
+    /// log so exactly one
+    /// [`crate::events::OrchestratorEvent::ScopeCapReached`] event is
+    /// broadcast on the bus and persisted via the configured sink per
+    /// contention episode. When `None`, observations remain on the run
+    /// report only.
+    scope_contention_broadcaster: Option<Arc<ScopeContentionEventBroadcaster>>,
 }
 
 /// Per-run heartbeat registration: the human-readable identifier (so
@@ -254,7 +292,27 @@ impl SpecialistRunner {
             leasing: None,
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
             concurrency_gate: None,
+            scope_contention_broadcaster: None,
         }
+    }
+
+    /// Wire a [`ScopeContentionEventBroadcaster`] into the runner.
+    ///
+    /// After every [`Self::run_pending`] pass — including idle passes
+    /// with zero contentions — the runner forwards its per-request
+    /// observations to the broadcaster. The broadcaster's per-pass
+    /// dedup log is what enforces the "one
+    /// [`crate::events::OrchestratorEvent::ScopeCapReached`] per
+    /// contention episode" invariant on the bus and the persistence
+    /// sink. Idle passes with no current contentions are required to
+    /// terminate stale episodes from the prior pass; the runner therefore
+    /// always invokes the broadcaster when wiring is configured.
+    pub fn with_scope_contention_broadcaster(
+        mut self,
+        broadcaster: Arc<ScopeContentionEventBroadcaster>,
+    ) -> Self {
+        self.scope_contention_broadcaster = Some(broadcaster);
+        self
     }
 
     /// Wire a [`ConcurrencyGate`] into the runner.
@@ -336,6 +394,12 @@ impl SpecialistRunner {
         work.extend(self.queue.drain());
 
         if work.is_empty() {
+            // Even on an idle pass we must notify the broadcaster so any
+            // episodes that were active in a prior pass get terminated
+            // (the dedup log treats absence as "episode ended"). Without
+            // this, a parked dispatch that drains terminally would leave
+            // a stale episode in the log forever.
+            self.broadcast_pass_observations(&[]);
             return SpecialistRunReport::default();
         }
 
@@ -379,6 +443,7 @@ impl SpecialistRunner {
                         .scope_contentions
                         .push(ScopeContendedObservation::from_contention(
                             req.identifier.clone(),
+                            req.run_id,
                             &contended,
                         ));
                     debug!(
@@ -486,7 +551,19 @@ impl SpecialistRunner {
             *deferred = new_deferred;
         }
 
+        // Feed this pass's contentions into the durable broadcaster
+        // (when wired). Always called — a pass with zero contentions
+        // ends any episodes that were active last pass.
+        self.broadcast_pass_observations(&report.scope_contentions);
+
         report
+    }
+
+    fn broadcast_pass_observations(&self, observations: &[ScopeContendedObservation]) {
+        let Some(bx) = self.scope_contention_broadcaster.as_ref() else {
+            return;
+        };
+        bx.observe_mixed_pass(observations.iter().map(|obs| (obs.subject(), obs.fields())));
     }
 
     /// Drain every dispatcher task that has finished since the last
@@ -1737,6 +1814,296 @@ mod tests {
         assert_eq!(report.spawned, 1);
         assert!(report.scope_contentions.is_empty());
         assert_eq!(report.deferred_scope_contention, 0);
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    // ---- Scope-contention broadcaster wiring (CHECKLIST_v2 Phase 11
+    //      §195 specialist subtask) -------------------------------------
+
+    use crate::event_bus::EventBus;
+    use crate::events::OrchestratorEvent;
+    use crate::scope_contention_broadcaster::{
+        ScopeContentionEventBroadcaster, ScopeContentionEventSink, ScopeContentionSinkError,
+    };
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: StdMutex<Vec<OrchestratorEvent>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn snapshot(&self) -> Vec<OrchestratorEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ScopeContentionEventSink for RecordingSink {
+        fn append_scope_cap_reached(
+            &self,
+            event: &OrchestratorEvent,
+        ) -> Result<i64, ScopeContentionSinkError> {
+            assert!(matches!(event, OrchestratorEvent::ScopeCapReached { .. }));
+            self.events.lock().unwrap().push(event.clone());
+            Ok(self.events.lock().unwrap().len() as i64)
+        }
+    }
+
+    fn req_full_with_run(
+        id: &str,
+        identifier: &str,
+        role: &str,
+        run_id: i64,
+    ) -> SpecialistDispatchRequest {
+        SpecialistDispatchRequest {
+            issue_id: id.into(),
+            identifier: identifier.into(),
+            role: RoleName::new(role),
+            rule_index: None,
+            run_id: Some(crate::blocker::RunRef::new(run_id)),
+            agent_profile: None,
+            repository: None,
+        }
+    }
+
+    /// N consecutive contended passes for the same dispatch produce
+    /// exactly one durable `ScopeCapReached` event.
+    #[tokio::test]
+    async fn broadcaster_dedups_repeated_contention_to_one_event_per_episode() {
+        let queue = Arc::new(SpecialistDispatchQueue::new());
+        let active = store_with(vec![issue("id-1", "ENG-1"), issue("id-2", "ENG-2")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("specialist".into()), 1);
+
+        let bus = EventBus::default();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus.clone(),
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = SpecialistRunner::new(queue.clone(), active, dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster.clone());
+
+        // ENG-1 spawns; ENG-2 contends on the Role scope every pass.
+        queue.enqueue(req_full("id-1", "ENG-1", "specialist", None, None));
+        queue.enqueue(req_full("id-2", "ENG-2", "specialist", None, None));
+
+        for _ in 0..5 {
+            let _ = runner.run_pending(CancellationToken::new()).await;
+        }
+
+        let persisted = sink.snapshot();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "5 contended passes must produce 1 durable event, got {persisted:?}",
+        );
+        match &persisted[0] {
+            OrchestratorEvent::ScopeCapReached {
+                run_id,
+                identifier,
+                scope_kind,
+                scope_key,
+                ..
+            } => {
+                assert!(run_id.is_none(), "ENG-2 had no run_id reservation");
+                assert_eq!(identifier.as_deref(), Some("ENG-2"));
+                assert_eq!(*scope_kind, ScopeKind::Role);
+                assert_eq!(scope_key, "specialist");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        dispatcher.release_gate();
+        // Drain the in-flight dispatch first, then run another pass so
+        // the deferred request (which never spawned because the gate
+        // contended) gets picked up before reaping.
+        let _ = wait_for_outcomes(&runner, 1).await;
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    /// `run_id` is populated on the durable event when the request had
+    /// reserved a run row; absent otherwise.
+    #[tokio::test]
+    async fn broadcaster_reports_run_id_when_request_carries_one() {
+        let queue = Arc::new(SpecialistDispatchQueue::new());
+        let active = store_with(vec![issue("id-1", "ENG-1"), issue("id-2", "ENG-2")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("specialist".into()), 1);
+
+        let bus = EventBus::default();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus.clone(),
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = SpecialistRunner::new(queue.clone(), active, dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster.clone());
+
+        // First request takes the only Role permit; the second request
+        // contends and carries a reserved run row (id 99).
+        queue.enqueue(req_full("id-1", "ENG-1", "specialist", None, None));
+        queue.enqueue(req_full_with_run("id-2", "ENG-2", "specialist", 99));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        let persisted = sink.snapshot();
+        assert_eq!(persisted.len(), 1);
+        match &persisted[0] {
+            OrchestratorEvent::ScopeCapReached {
+                run_id, identifier, ..
+            } => {
+                assert_eq!(*run_id, Some(99));
+                assert!(
+                    identifier.is_none(),
+                    "Run-subject events must not carry an identifier",
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        dispatcher.release_gate();
+        // Drain the in-flight dispatch first, then run another pass so
+        // the deferred request (which never spawned because the gate
+        // contended) gets picked up before reaping.
+        let _ = wait_for_outcomes(&runner, 1).await;
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    /// Bus subscribers see the same event stream the persistence sink
+    /// receives.
+    #[tokio::test]
+    async fn broadcaster_emits_on_bus_in_lockstep_with_persistence() {
+        use futures::StreamExt;
+
+        let queue = Arc::new(SpecialistDispatchQueue::new());
+        let active = store_with(vec![issue("id-1", "ENG-1"), issue("id-2", "ENG-2")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("specialist".into()), 1);
+
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus.clone(),
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = SpecialistRunner::new(queue.clone(), active, dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster);
+
+        queue.enqueue(req_full("id-1", "ENG-1", "specialist", None, None));
+        queue.enqueue(req_full("id-2", "ENG-2", "specialist", None, None));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        let bus_event = rx.next().await.expect("event").expect("not lagged");
+        let persisted = sink.snapshot();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(bus_event, persisted[0]);
+
+        dispatcher.release_gate();
+        // Drain the in-flight dispatch first, then run another pass so
+        // the deferred request (which never spawned because the gate
+        // contended) gets picked up before reaping.
+        let _ = wait_for_outcomes(&runner, 1).await;
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    /// An idle pass after a contention episode terminates the episode in
+    /// the dedup log so a fresh contention re-emits.
+    #[tokio::test]
+    async fn idle_pass_terminates_episode_and_re_contention_re_emits() {
+        let queue = Arc::new(SpecialistDispatchQueue::new());
+        let active = store_with(vec![issue("id-1", "ENG-1"), issue("id-2", "ENG-2")]);
+        let dispatcher = Arc::new(RecordingDispatcher::new(ReleaseReason::Completed));
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("specialist".into()), 1);
+
+        let bus = EventBus::default();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus,
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = SpecialistRunner::new(queue.clone(), active, dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster);
+
+        // Episode 1: ENG-1 holds; ENG-2 contends. (RecordingDispatcher
+        // not gated → spawn completes immediately.)
+        dispatcher.enable_gate();
+        queue.enqueue(req_full("id-1", "ENG-1", "specialist", None, None));
+        queue.enqueue(req_full("id-2", "ENG-2", "specialist", None, None));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // Drain ENG-1 so the Role permit frees, then run a pass that
+        // spawns ENG-2 (no contention → episode ends).
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        // Episode for ENG-2 ended. No new event yet.
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // A truly idle pass while ENG-2 is in flight: still no new event.
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // Episode 2: enqueue ENG-3 against the still-held permit and
+        // observe a fresh event with the new identifier.
+        let active2 = store_with(vec![issue("id-3", "ENG-3")]);
+        // Replace the runner's active set view via a fresh enqueue +
+        // snapshot would be complex; instead enqueue another contender
+        // for the same in-flight ENG-2 by simulating ENG-3 entering.
+        let _ = active2; // silence unused warning; we use a separate pathway below
+
+        // Simpler: release ENG-2, then re-run with two fresh requests so
+        // we get a clean episode boundary.
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+
+        dispatcher.enable_gate();
+        queue.enqueue(req_full("id-1", "ENG-1", "specialist", None, None));
+        queue.enqueue(req_full("id-2", "ENG-2", "specialist", None, None));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        let persisted = sink.snapshot();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "second episode must re-emit after the first ended; got {persisted:?}",
+        );
+
+        dispatcher.release_gate();
+        // Drain the in-flight dispatch first, then run another pass so
+        // the deferred request (which never spawned because the gate
+        // contended) gets picked up before reaping.
+        let _ = wait_for_outcomes(&runner, 1).await;
+        let _ = runner.run_pending(CancellationToken::new()).await;
         let _ = wait_for_outcomes(&runner, 1).await;
     }
 }

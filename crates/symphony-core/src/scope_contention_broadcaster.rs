@@ -44,9 +44,8 @@ use std::sync::{Arc, Mutex};
 use crate::concurrency_gate::ScopeKind;
 use crate::event_bus::EventBus;
 use crate::events::OrchestratorEvent;
-use crate::scope_contention_log::{
-    ContentionObservation, ContentionSubject, ScopeContentionEventLog,
-};
+pub use crate::scope_contention_log::ContentionSubject;
+use crate::scope_contention_log::{ContentionObservation, ScopeContentionEventLog};
 
 /// Scope-side fields each runner observation contributes.
 ///
@@ -176,6 +175,33 @@ impl ScopeContentionEventBroadcaster {
                 .into_iter()
                 .map(|(identifier, fields)| ContentionObservation {
                     subject: ContentionSubject::Identifier(identifier),
+                    scope_kind: fields.scope_kind,
+                    scope_key: fields.scope_key,
+                    in_flight: fields.in_flight,
+                    cap: fields.cap,
+                });
+        self.observe_pass(observations)
+    }
+
+    /// Process a pass whose observations may carry either subject kind.
+    ///
+    /// The specialist runner reserves a `runs.id` only for some of its
+    /// dispatches (e.g. once a request flows through `RunRepository`),
+    /// so a single pass can mix `Run` and `Identifier` subjects. The
+    /// dedup contract requires *one* call per pass with the complete
+    /// observation set — calling [`Self::observe_run_pass`] and then
+    /// [`Self::observe_identifier_pass`] back-to-back would prematurely
+    /// end episodes from the first call. This helper feeds them through
+    /// a single [`ScopeContentionEventLog::observe_pass`] invocation.
+    pub fn observe_mixed_pass<I>(&self, observations: I) -> Vec<OrchestratorEvent>
+    where
+        I: IntoIterator<Item = (ContentionSubject, ScopeFields)>,
+    {
+        let observations =
+            observations
+                .into_iter()
+                .map(|(subject, fields)| ContentionObservation {
+                    subject,
                     scope_kind: fields.scope_kind,
                     scope_key: fields.scope_key,
                     in_flight: fields.in_flight,
