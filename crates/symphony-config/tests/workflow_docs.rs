@@ -10,6 +10,8 @@ const WORKSPACES_DOC: &str = include_str!("../../../docs/workspaces.md");
 const QA_DOC: &str = include_str!("../../../docs/qa.md");
 const UPGRADE_DOC: &str = include_str!("../../../docs/upgrade.md");
 const README_DOC: &str = include_str!("../../../README.md");
+const SEQUENTIAL_DECOMPOSITION_SCENARIO: &str =
+    include_str!("../../../tests/fixtures/decomposition-sequential/SCENARIO.md");
 
 #[test]
 fn complete_workflow_example_in_docs_loads_and_validates() {
@@ -279,6 +281,112 @@ fn quickstart_fixture_loads_and_readme_covers_v2_walkthrough() {
             "README quickstart should mention {required:?}"
         );
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecompositionScenario {
+    parent: ScenarioParent,
+    children: Vec<ScenarioChild>,
+    expected_blocks_edges: Vec<ScenarioBlocksEdge>,
+    dispatch_order: ScenarioDispatchOrder,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioParent {
+    key: String,
+    title: String,
+    integration_owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioChild {
+    key: String,
+    title: String,
+    role: String,
+    scope: String,
+    depends_on: Vec<String>,
+    acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioBlocksEdge {
+    blocker: String,
+    blocked: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioDispatchOrder {
+    initially_eligible: Vec<String>,
+    blocked_until_terminal: BTreeMap<String, Vec<String>>,
+}
+
+#[test]
+fn sequential_decomposition_fixture_documents_canonical_dependency_chain() {
+    let scenario = extract_marked_yaml(SEQUENTIAL_DECOMPOSITION_SCENARIO, "decomposition-scenario");
+    let parsed: DecompositionScenario =
+        serde_yaml::from_str(scenario).expect("sequential decomposition scenario should parse");
+
+    assert_eq!(parsed.parent.key, "parent");
+    assert_eq!(parsed.parent.integration_owner, "platform_lead");
+    assert_eq!(
+        parsed
+            .children
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["A", "B", "C"]
+    );
+    assert_eq!(
+        parsed
+            .children
+            .iter()
+            .map(|c| (c.key.clone(), c.depends_on.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("A".to_string(), Vec::<String>::new()),
+            ("B".to_string(), vec!["A".to_string()]),
+            ("C".to_string(), vec!["B".to_string()]),
+        ]
+    );
+    assert_eq!(
+        parsed
+            .expected_blocks_edges
+            .iter()
+            .map(|edge| (edge.blocker.as_str(), edge.blocked.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("A", "B"), ("B", "C")],
+        "fixture should encode prerequisite -> waiting-child blocks edges"
+    );
+    assert_eq!(parsed.dispatch_order.initially_eligible, vec!["A"]);
+    assert_eq!(
+        parsed.dispatch_order.blocked_until_terminal.get("B"),
+        Some(&vec!["A".to_string()])
+    );
+    assert_eq!(
+        parsed.dispatch_order.blocked_until_terminal.get("C"),
+        Some(&vec!["B".to_string()])
+    );
+
+    for child in &parsed.children {
+        assert!(!child.title.trim().is_empty());
+        assert!(!child.role.trim().is_empty());
+        assert!(!child.scope.trim().is_empty());
+        assert!(!child.acceptance_criteria.is_empty());
+    }
+    for edge in &parsed.expected_blocks_edges {
+        assert!(
+            edge.reason
+                .contains(&format!("{} depends on {}", edge.blocked, edge.blocker)),
+            "edge reason should keep the dependency direction visible"
+        );
+    }
+    assert!(!parsed.parent.title.trim().is_empty());
 }
 
 fn extract_marked_yaml<'a>(doc: &'a str, marker: &str) -> &'a str {
