@@ -36,6 +36,60 @@ use crate::routing::{RoutingContext, RoutingDecision, RoutingEngine};
 use crate::tracker::Issue;
 use crate::work_item::{TrackerStatus, WorkItem, WorkItemId, WorkItemStatusClass};
 
+/// One open blocker that prevents a specialist issue from dispatching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecialistBlockerSummary {
+    /// Identifier of the prerequisite/blocking child.
+    pub blocker_identifier: String,
+    /// Human-facing reason, usually from the `blocks` edge.
+    pub reason: Option<String>,
+}
+
+/// A specialist-routable issue parked by dependency blockers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecialistBlockedIssue {
+    /// Identifier of the waiting child.
+    pub identifier: String,
+    /// Open blockers that must clear before dispatch.
+    pub blockers: Vec<SpecialistBlockerSummary>,
+}
+
+/// Error returned by dependency gate lookups.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("specialist dependency gate failed for {identifier}: {message}")]
+pub struct SpecialistDependencyGateError {
+    /// Tracker-facing identifier being checked.
+    pub identifier: String,
+    /// Operator-facing failure detail.
+    pub message: String,
+}
+
+/// Dependency gate consulted immediately before specialist dispatch.
+///
+/// The production adapter can implement this over durable
+/// `work_item_edges.list_incoming_open_blockers`; the core tick keeps
+/// the dependency surface narrow so `symphony-core` does not depend on
+/// the state crate.
+pub trait SpecialistDependencyGate: Send + Sync {
+    /// Return open blockers for `issue`. Empty means dispatch-eligible.
+    fn open_blockers(
+        &self,
+        issue: &Issue,
+    ) -> Result<Vec<SpecialistBlockerSummary>, SpecialistDependencyGateError>;
+}
+
+#[derive(Debug, Default)]
+struct NoopSpecialistDependencyGate;
+
+impl SpecialistDependencyGate for NoopSpecialistDependencyGate {
+    fn open_blockers(
+        &self,
+        _issue: &Issue,
+    ) -> Result<Vec<SpecialistBlockerSummary>, SpecialistDependencyGateError> {
+        Ok(Vec::new())
+    }
+}
+
 /// One dispatch request emitted by the specialist queue tick.
 ///
 /// Plain serializable data so the eventual scheduler can persist it and
@@ -179,11 +233,16 @@ pub struct SpecialistQueueTick {
     routing: RoutingEngine,
     role_kinds: RoleKindLookup,
     queue: Arc<SpecialistDispatchQueue>,
+    dependency_gate: Arc<dyn SpecialistDependencyGate>,
     cadence: QueueTickCadence,
     /// Identifiers already emitted that are still present in the active
     /// set. Pruned at the start of each tick so identifiers leaving the
     /// active set become eligible to re-dispatch.
     claimed: Mutex<HashSet<String>>,
+    /// Current tick's dependency-parked issues. This gives status/debug
+    /// surfaces a reasoned parked set instead of making blocked children
+    /// disappear from the specialist queue.
+    blocked: Mutex<Vec<SpecialistBlockedIssue>>,
 }
 
 impl SpecialistQueueTick {
@@ -200,9 +259,17 @@ impl SpecialistQueueTick {
             routing,
             role_kinds,
             queue,
+            dependency_gate: Arc::new(NoopSpecialistDependencyGate),
             cadence,
             claimed: Mutex::new(HashSet::new()),
+            blocked: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Attach a durable dependency gate.
+    pub fn with_dependency_gate(mut self, gate: Arc<dyn SpecialistDependencyGate>) -> Self {
+        self.dependency_gate = gate;
+        self
     }
 
     /// Borrow the shared dispatch queue. Lets the composition root wire
@@ -218,6 +285,15 @@ impl SpecialistQueueTick {
             .lock()
             .expect("claimed set mutex poisoned")
             .len()
+    }
+
+    /// Snapshot issues parked by open dependency blockers on the most
+    /// recent tick.
+    pub fn blocked_snapshot(&self) -> Vec<SpecialistBlockedIssue> {
+        self.blocked
+            .lock()
+            .expect("blocked set mutex poisoned")
+            .clone()
     }
 }
 
@@ -243,6 +319,10 @@ impl QueueTick for SpecialistQueueTick {
             let mut claimed = self.claimed.lock().expect("claimed set mutex poisoned");
             claimed.retain(|id| active_ids.contains(id));
         }
+        self.blocked
+            .lock()
+            .expect("blocked set mutex poisoned")
+            .clear();
 
         let mut processed = 0usize;
         let mut deferred = 0usize;
@@ -277,6 +357,24 @@ impl QueueTick for SpecialistQueueTick {
                     // drift) instead of panicking inside a tick.
                     match self.role_kinds.get(&role) {
                         Some(kind) if !kind.is_kernel_special() => {
+                            let blockers = match self.dependency_gate.open_blockers(issue) {
+                                Ok(blockers) => blockers,
+                                Err(_e) => {
+                                    errors += 1;
+                                    continue;
+                                }
+                            };
+                            if !blockers.is_empty() {
+                                self.blocked
+                                    .lock()
+                                    .expect("blocked set mutex poisoned")
+                                    .push(SpecialistBlockedIssue {
+                                        identifier: issue.identifier.clone(),
+                                        blockers,
+                                    });
+                                deferred += 1;
+                                continue;
+                            }
                             self.queue.enqueue(SpecialistDispatchRequest {
                                 issue_id: issue.id.as_str().to_string(),
                                 identifier: issue.identifier.clone(),
@@ -339,6 +437,7 @@ mod tests {
     use super::*;
     use crate::routing::{RoutingMatch, RoutingMatchMode, RoutingRule, RoutingTable};
     use crate::tracker::Issue;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     fn cadence() -> QueueTickCadence {
@@ -394,6 +493,45 @@ mod tests {
         (tick, store, queue)
     }
 
+    #[derive(Debug, Default)]
+    struct FakeDependencyGate {
+        blockers: HashMap<String, Vec<SpecialistBlockerSummary>>,
+    }
+
+    impl FakeDependencyGate {
+        fn with_blocker(mut self, blocked: &str, blocker: &str) -> Self {
+            self.blockers
+                .entry(blocked.to_string())
+                .or_default()
+                .push(SpecialistBlockerSummary {
+                    blocker_identifier: blocker.to_string(),
+                    reason: Some(format!("{blocked} depends on {blocker}")),
+                });
+            self
+        }
+    }
+
+    impl SpecialistDependencyGate for FakeDependencyGate {
+        fn open_blockers(
+            &self,
+            issue: &Issue,
+        ) -> Result<Vec<SpecialistBlockerSummary>, SpecialistDependencyGateError> {
+            Ok(self
+                .blockers
+                .get(&issue.identifier)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    fn specialist_default_table() -> RoutingTable {
+        RoutingTable {
+            default_role: Some(RoleName::from("backend")),
+            match_mode: RoutingMatchMode::FirstMatch,
+            rules: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn tick_emits_dispatch_for_first_match_specialist() {
         let table = RoutingTable {
@@ -423,6 +561,118 @@ mod tests {
         assert_eq!(drained[1].identifier, "ENG-2");
         assert_eq!(drained[1].role, RoleName::from("backend"));
         assert_eq!(drained[1].rule_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn dependency_gate_dispatches_only_root_child_for_sequential_chain() {
+        let (tick, _store, queue) = build_tick(
+            vec![
+                issue("A", &["backend"]),
+                issue("B", &["backend"]),
+                issue("C", &["backend"]),
+            ],
+            specialist_default_table(),
+        );
+        let gate = Arc::new(
+            FakeDependencyGate::default()
+                .with_blocker("B", "A")
+                .with_blocker("C", "B"),
+        );
+        let mut tick = tick.with_dependency_gate(gate);
+
+        let outcome = tick.tick().await;
+        assert_eq!(outcome.considered, 3);
+        assert_eq!(outcome.processed, 1);
+        assert_eq!(outcome.deferred, 2);
+        assert_eq!(outcome.errors, 0);
+
+        let dispatched = queue.drain();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].identifier, "A");
+
+        let parked = tick.blocked_snapshot();
+        assert_eq!(parked.len(), 2);
+        assert_eq!(parked[0].identifier, "B");
+        assert_eq!(parked[0].blockers[0].blocker_identifier, "A");
+        assert_eq!(parked[1].identifier, "C");
+        assert_eq!(parked[1].blockers[0].blocker_identifier, "B");
+    }
+
+    #[tokio::test]
+    async fn dependency_gate_allows_parallel_roots_and_parks_join_child() {
+        let (tick, _store, queue) = build_tick(
+            vec![
+                issue("A", &["backend"]),
+                issue("B", &["backend"]),
+                issue("C", &["backend"]),
+            ],
+            specialist_default_table(),
+        );
+        let gate = Arc::new(
+            FakeDependencyGate::default()
+                .with_blocker("C", "A")
+                .with_blocker("C", "B"),
+        );
+        let mut tick = tick.with_dependency_gate(gate);
+
+        let outcome = tick.tick().await;
+        assert_eq!(outcome.processed, 2);
+        assert_eq!(outcome.deferred, 1);
+
+        let dispatched: Vec<String> = queue
+            .drain()
+            .into_iter()
+            .map(|req| req.identifier)
+            .collect();
+        assert_eq!(dispatched, vec!["A", "B"]);
+
+        let parked = tick.blocked_snapshot();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].identifier, "C");
+        let blockers: Vec<&str> = parked[0]
+            .blockers
+            .iter()
+            .map(|b| b.blocker_identifier.as_str())
+            .collect();
+        assert_eq!(blockers, vec!["A", "B"]);
+    }
+
+    #[tokio::test]
+    async fn dependency_gate_dispatches_child_after_all_blockers_clear() {
+        let (tick, store, queue) =
+            build_tick(vec![issue("C", &["backend"])], specialist_default_table());
+        let gate = Arc::new(
+            FakeDependencyGate::default()
+                .with_blocker("C", "A")
+                .with_blocker("C", "B"),
+        );
+        let mut tick = tick.with_dependency_gate(gate);
+
+        let first = tick.tick().await;
+        assert_eq!(first.processed, 0);
+        assert_eq!(first.deferred, 1);
+        assert!(queue.is_empty());
+        assert_eq!(tick.blocked_snapshot()[0].blockers.len(), 2);
+
+        store.replace(Vec::new());
+        tick.tick().await;
+
+        let gate = Arc::new(FakeDependencyGate::default());
+        let mut tick = SpecialistQueueTick::new(
+            store.clone(),
+            RoutingEngine::new(specialist_default_table()),
+            standard_role_kinds(),
+            queue.clone(),
+            cadence(),
+        )
+        .with_dependency_gate(gate);
+        store.replace(vec![issue("C", &["backend"])]);
+
+        let second = tick.tick().await;
+        assert_eq!(second.processed, 1);
+        assert_eq!(second.deferred, 0);
+        assert!(tick.blocked_snapshot().is_empty());
+        assert_eq!(queue.drain()[0].identifier, "C");
     }
 
     #[tokio::test]

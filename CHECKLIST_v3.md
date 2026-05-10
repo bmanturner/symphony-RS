@@ -48,16 +48,16 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Implement `tracker_sync: local_only` behavior: skip tracker blocker mutation and optionally render advisory comments/text.
 - [x] Add Linear mutation tests proving `issueRelationCreate(type: "blocks")` is called with `issue_id = blocker` and `related_issue_id = blocked`.
 - [x] Add GitHub tests proving `add_blocker` and `link_parent_child` remain false unless a real structural implementation lands.
-- [ ] Add conformance tests proving label/body/comment-only GitHub behavior never masquerades as structural blocker support.
+- [x] Add conformance tests proving label/body/comment-only GitHub behavior never masquerades as structural blocker support.
 
 ## Phase 5 — Specialist Dispatch Gating
 
-- [ ] Update specialist queue eligibility to consult incoming open `blocks` edges before dispatch.
-- [ ] Ensure root children with no blockers can dispatch in parallel subject to role/concurrency/budget/workspace limits.
-- [ ] Ensure blocked children remain parked with visible blocker reason instead of disappearing from queues.
-- [ ] Add tests proving only A dispatches initially for `A -> B -> C`.
-- [ ] Add tests proving A and B can dispatch concurrently for `A`, `B`, `C depends_on [A, B]`.
-- [ ] Add tests proving blocked children become eligible only after all prerequisite blockers are terminal/resolved/waived.
+- [x] Update specialist queue eligibility to consult incoming open `blocks` edges before dispatch.
+- [x] Ensure root children with no blockers can dispatch in parallel subject to role/concurrency/budget/workspace limits.
+- [x] Ensure blocked children remain parked with visible blocker reason instead of disappearing from queues.
+- [x] Add tests proving only A dispatches initially for `A -> B -> C`.
+- [x] Add tests proving A and B can dispatch concurrently for `A`, `B`, `C depends_on [A, B]`.
+- [x] Add tests proving blocked children become eligible only after all prerequisite blockers are terminal/resolved/waived.
 
 ## Phase 6 — Reconciliation and Auto-Resolution
 

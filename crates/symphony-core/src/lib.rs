@@ -236,7 +236,9 @@ pub use specialist_runner::{
     SpecialistRunReport, SpecialistRunner,
 };
 pub use specialist_tick::{
-    RoleKindLookup, SpecialistDispatchQueue, SpecialistDispatchRequest, SpecialistQueueTick,
+    RoleKindLookup, SpecialistBlockedIssue, SpecialistBlockerSummary, SpecialistDependencyGate,
+    SpecialistDependencyGateError, SpecialistDispatchQueue, SpecialistDispatchRequest,
+    SpecialistQueueTick,
 };
 pub use state_machine::{ClaimState, ReleaseReason, StateMachine, TransitionError};
 pub use tracker::{BlockerRef, Issue, IssueId, IssueState};
