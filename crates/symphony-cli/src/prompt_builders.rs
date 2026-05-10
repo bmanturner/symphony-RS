@@ -726,4 +726,172 @@ followups:
         assert!(qa_prompt.contains(&rendered_children));
         assert!(qa_prompt.contains("latest_handoff: none"));
     }
+
+    #[test]
+    fn fake_e2e_platform_lead_catalog_drives_backend_frontend_child_assignments() {
+        let mut issue = Issue::minimal("p", "ENG-1", "Ship API and TUI", "Todo");
+        issue.labels = vec!["epic".into()];
+        let prompt = build_decomposition_prompt(
+            &workflow(),
+            &packs(),
+            "Global {{identifier}}",
+            "platform_lead",
+            &issue,
+        )
+        .unwrap()
+        .render();
+
+        assert!(prompt.contains("## Role Catalog"));
+        assert!(prompt.contains("## backend"));
+        assert!(prompt.contains("- owns: Rust backend"));
+        assert!(prompt.contains("## frontend"));
+        assert!(prompt.contains("- owns: UI"));
+
+        let fake_lead_children = [
+            ("schema and repository changes", "backend"),
+            ("terminal UI wiring", "frontend"),
+        ];
+        for (scope, assigned_role) in fake_lead_children {
+            assert!(
+                prompt.contains(&format!("## {assigned_role}")),
+                "fake platform lead assigned `{scope}` to a role present in the catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn fake_e2e_qa_is_excluded_from_child_catalog_and_runs_after_integration() {
+        let parent = Issue::minimal("p", "ENG-1", "Integrated broad work", "Integration");
+        let catalog_prompt =
+            build_decomposition_prompt(&workflow(), &packs(), "Global", "platform_lead", &parent)
+                .unwrap()
+                .render();
+        assert!(!catalog_prompt.contains("## qa"));
+
+        let child_handoff = Handoff {
+            summary: "Specialist output ready".into(),
+            changed_files: vec!["crates/api.rs".into()],
+            tests_run: vec!["cargo test -p api".into()],
+            verification_evidence: vec!["green tests".into()],
+            known_risks: Vec::new(),
+            blockers_created: Vec::new(),
+            followups_created_or_proposed: Vec::new(),
+            branch_or_workspace: BranchOrWorkspace {
+                branch: Some("feat/api".into()),
+                workspace_path: Some("/tmp/api".into()),
+                base_ref: Some("main".into()),
+            },
+            ready_for: ReadyFor::Integration,
+            block_reason: None,
+            reporting_role: Some(RoleName::new("backend")),
+            verdict_request: None,
+        };
+        let children = vec![IntegrationChild {
+            child_id: WorkItemId::new(2),
+            identifier: "ENG-2".into(),
+            title: "API".into(),
+            status_class: WorkItemStatusClass::Done,
+            branch: Some("feat/api".into()),
+            latest_handoff: Some(child_handoff),
+        }];
+        let request = IntegrationRunRequest::try_new(
+            WorkItemId::new(1),
+            "ENG-1",
+            "Integrated broad work",
+            RoleName::new("platform_lead"),
+            symphony_core::IntegrationMergeStrategy::SequentialCherryPick,
+            IntegrationWorkspace {
+                path: PathBuf::from("/tmp/integration"),
+                strategy: "git_worktree".into(),
+                branch: Some("integration/eng-1".into()),
+                base_ref: Some("main".into()),
+            },
+            children.clone(),
+            IntegrationGates::default(),
+            0,
+            IntegrationRequestCause::AllChildrenTerminal,
+        )
+        .unwrap();
+        let integration_prompt =
+            build_integration_owner_prompt("Global", "platform_lead", &request)
+                .unwrap()
+                .render();
+        assert!(integration_prompt.contains("summary: Specialist output ready"));
+
+        let qa_prompt = build_qa_prompt(
+            "Global",
+            &InstructionPackBundle::default(),
+            "qa",
+            &parent,
+            &children,
+            Vec::new(),
+            vec!["Integrated output passes".into()],
+            Some("green"),
+        )
+        .unwrap()
+        .render();
+        assert!(qa_prompt.contains("qa_scope: integrated output gate"));
+        assert!(qa_prompt.contains("summary: Specialist output ready"));
+        assert!(qa_prompt.contains("ci_status: green"));
+    }
+
+    #[test]
+    fn fake_e2e_specialist_receives_role_pack_and_emits_valid_handoff() {
+        let mut packs = InstructionPackBundle::default();
+        packs.roles.insert(
+            "backend".into(),
+            specialist_pack("backend", "Backend role prompt", "Backend soul"),
+        );
+        packs.roles.insert(
+            "frontend".into(),
+            specialist_pack("frontend", "Frontend role prompt", "Frontend soul"),
+        );
+        let issue = Issue::minimal("c", "ENG-2", "Backend child", "Todo");
+        let prompt = build_specialist_prompt(
+            "Global",
+            &packs,
+            "backend",
+            None,
+            &issue,
+            None,
+            Vec::new(),
+            vec!["State is durable".into()],
+        )
+        .unwrap()
+        .render();
+
+        assert!(prompt.contains("Backend role prompt"));
+        assert!(prompt.contains("Backend soul"));
+        assert!(!prompt.contains("Frontend role prompt"));
+        assert!(prompt.contains("\"summary\""));
+        assert!(prompt.contains("\"ready_for\""));
+
+        let fake_handoff = Handoff {
+            summary: "Durable state change complete".into(),
+            changed_files: vec!["crates/symphony-state/src/lib.rs".into()],
+            tests_run: vec!["cargo test -p symphony-state".into()],
+            verification_evidence: vec!["state tests passed".into()],
+            known_risks: vec!["migration order must stay stable".into()],
+            blockers_created: Vec::new(),
+            followups_created_or_proposed: Vec::new(),
+            branch_or_workspace: BranchOrWorkspace {
+                branch: Some("feat/eng-2".into()),
+                workspace_path: Some("/tmp/eng-2".into()),
+                base_ref: Some("main".into()),
+            },
+            ready_for: ReadyFor::Integration,
+            block_reason: None,
+            reporting_role: Some(RoleName::new("backend")),
+            verdict_request: None,
+        };
+        fake_handoff.validate().unwrap();
+        assert_eq!(
+            fake_handoff.ready_for.consequence(),
+            symphony_core::handoff::ReadyForConsequence::EnqueueIntegration
+        );
+        assert_eq!(
+            fake_handoff.reporting_role.as_ref().map(|r| r.as_str()),
+            Some("backend")
+        );
+    }
 }

@@ -383,4 +383,43 @@ mod tests {
         );
         assert_eq!(metadata[0].content_hash.as_deref(), Some("hash123"));
     }
+
+    #[test]
+    fn prompt_preview_fails_missing_instruction_file_before_agent_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_path = dir.path().join("WORKFLOW.md");
+        std::fs::write(
+            &workflow_path,
+            r#"---
+roles:
+  backend:
+    kind: specialist
+    instructions:
+      role_prompt: .symphony/roles/backend/MISSING.md
+agents:
+  mock:
+    backend: mock
+---
+Global
+"#,
+        )
+        .unwrap();
+
+        let outcome = run(&DebugCommand::Prompt(DebugPromptArgs {
+            path: workflow_path,
+            role: "backend".into(),
+            identifier: "ENG-1".into(),
+            title: "Missing instruction".into(),
+            state: "Todo".into(),
+            json: false,
+            unsafe_unredacted: false,
+        }));
+
+        match outcome {
+            DebugOutcome::LoadFailed(err) => {
+                assert!(err.to_string().contains("MISSING.md"));
+            }
+            other => panic!("expected load failure before preview, got {other:?}"),
+        }
+    }
 }

@@ -119,10 +119,10 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 11 — End-to-End Scenarios
 
-- [ ] Add deterministic fake E2E: platform lead receives generated role catalog and decomposes a parent into correctly assigned backend/frontend children.
-- [ ] Add deterministic fake E2E: role catalog excludes QA as a child implementer and QA runs only after integration.
-- [ ] Add deterministic fake E2E: specialist receives its own instruction pack and emits a structured handoff satisfying role-specific expectations.
-- [ ] Add deterministic fake E2E: missing role instruction file fails before agent launch.
+- [x] Add deterministic fake E2E: platform lead receives generated role catalog and decomposes a parent into correctly assigned backend/frontend children.
+- [x] Add deterministic fake E2E: role catalog excludes QA as a child implementer and QA runs only after integration.
+- [x] Add deterministic fake E2E: specialist receives its own instruction pack and emits a structured handoff satisfying role-specific expectations.
+- [x] Add deterministic fake E2E: missing role instruction file fails before agent launch.
 
 ## Phase 12 — Documentation
 
