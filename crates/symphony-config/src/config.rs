@@ -1356,6 +1356,12 @@ pub enum RoleKind {
     Custom,
 }
 
+impl RoleKind {
+    fn child_owning_catalog_role(self) -> bool {
+        matches!(self, Self::Specialist | Self::Reviewer | Self::Operator)
+    }
+}
+
 /// One entry in the `roles` map (SPEC v2 §5.4).
 ///
 /// Most authority flags default to "unset" (`None`) rather than `false`
@@ -1422,6 +1428,93 @@ pub struct RoleConfig {
     /// to a single role definition.
     #[serde(default)]
     pub required_for_done: Option<bool>,
+
+    /// File-backed role instruction pack paths.
+    #[serde(default)]
+    pub instructions: RoleInstructionConfig,
+
+    /// Structured assignment metadata rendered into the platform-lead
+    /// role catalog.
+    #[serde(default)]
+    pub assignment: RoleAssignmentMetadata,
+}
+
+/// File-backed role doctrine paths for v4 instruction packs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoleInstructionConfig {
+    /// Long-form operating instructions for the role.
+    #[serde(default)]
+    pub role_prompt: Option<PathBuf>,
+
+    /// Stable behavioral doctrine / quality bar.
+    #[serde(default)]
+    pub soul: Option<PathBuf>,
+}
+
+/// Role-local assignment metadata for generated platform-lead catalogs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoleAssignmentMetadata {
+    /// Work this role should receive.
+    #[serde(default)]
+    pub owns: Vec<String>,
+
+    /// Work this role should not receive.
+    #[serde(default)]
+    pub does_not_own: Vec<String>,
+
+    /// Context or prerequisites this role usually needs.
+    #[serde(default)]
+    pub requires: Vec<String>,
+
+    /// Evidence expected in this role's handoff.
+    #[serde(default)]
+    pub handoff_expectations: Vec<String>,
+
+    /// Advisory role-local routing hints for catalog rendering.
+    #[serde(default)]
+    pub routing_hints: RoleRoutingHints,
+}
+
+impl RoleAssignmentMetadata {
+    fn is_empty(&self) -> bool {
+        self.owns.is_empty()
+            && self.does_not_own.is_empty()
+            && self.requires.is_empty()
+            && self.handoff_expectations.is_empty()
+            && self.routing_hints.is_empty()
+    }
+}
+
+/// Advisory routing hints local to one role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RoleRoutingHints {
+    /// Path globs this role usually owns.
+    #[serde(default)]
+    pub paths_any: Vec<String>,
+
+    /// Labels that suggest this role.
+    #[serde(default)]
+    pub labels_any: Vec<String>,
+
+    /// Issue type hints that suggest this role.
+    #[serde(default)]
+    pub issue_types_any: Vec<String>,
+
+    /// Domain strings that suggest this role.
+    #[serde(default)]
+    pub domains_any: Vec<String>,
+}
+
+impl RoleRoutingHints {
+    fn is_empty(&self) -> bool {
+        self.paths_any.is_empty()
+            && self.labels_any.is_empty()
+            && self.issue_types_any.is_empty()
+            && self.domains_any.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2901,6 +2994,12 @@ pub enum ConfigValidationWarning {
     /// decomposition dependencies can be rendered, but they no longer
     /// stop specialist dispatch.
     DependencyDispatchGateDisabled,
+    /// A specialist role has only a terse description and no structured
+    /// assignment metadata for the platform-lead catalog.
+    SpecialistRoleMissingAssignmentMetadata { role: String },
+    /// Decomposition is enabled but the generated catalog will lean on
+    /// fallback descriptions/routing rules for most child-owning roles.
+    DecompositionCatalogMostlyFallback,
 }
 
 impl std::fmt::Display for ConfigValidationWarning {
@@ -2909,6 +3008,14 @@ impl std::fmt::Display for ConfigValidationWarning {
             Self::DependencyDispatchGateDisabled => write!(
                 f,
                 "WARNING: decomposition.dependency_policy.dispatch_gate = false makes dependency edges observability-only; specialists may dispatch before prerequisites clear"
+            ),
+            Self::SpecialistRoleMissingAssignmentMetadata { role } => write!(
+                f,
+                "WARNING: role `{role}` has no structured assignment metadata; platform-lead catalog will fall back to terse description/routing hints"
+            ),
+            Self::DecompositionCatalogMostlyFallback => write!(
+                f,
+                "WARNING: decomposition is enabled but most child-owning roles lack structured assignment metadata; platform-lead catalog may be too thin for reliable assignment"
             ),
         }
     }
@@ -3000,6 +3107,28 @@ impl WorkflowConfig {
         let mut warnings = Vec::new();
         if !self.decomposition.dependency_policy.dispatch_gate {
             warnings.push(ConfigValidationWarning::DependencyDispatchGateDisabled);
+        }
+        let child_roles: Vec<(&String, &RoleConfig)> = self
+            .roles
+            .iter()
+            .filter(|(_, role)| role.kind.child_owning_catalog_role())
+            .collect();
+        let child_role_count = child_roles.len();
+        let mut thin_child_roles = 0usize;
+        for (name, role) in child_roles {
+            if role.assignment.is_empty() {
+                thin_child_roles += 1;
+                if role.kind == RoleKind::Specialist {
+                    warnings.push(
+                        ConfigValidationWarning::SpecialistRoleMissingAssignmentMetadata {
+                            role: name.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        if self.decomposition.enabled && thin_child_roles > child_role_count.saturating_div(2) {
+            warnings.push(ConfigValidationWarning::DecompositionCatalogMostlyFallback);
         }
         warnings
     }
@@ -6251,7 +6380,131 @@ hooks:
             can_file_blockers: None,
             can_file_followups: None,
             required_for_done: None,
+            instructions: RoleInstructionConfig::default(),
+            assignment: RoleAssignmentMetadata::default(),
         }
+    }
+
+    #[test]
+    fn role_instruction_and_assignment_metadata_round_trip() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  backend_engineer:
+    kind: specialist
+    description: Backend implementation
+    agent: codex_fast
+    instructions:
+      role_prompt: .symphony/roles/backend_engineer/AGENTS.md
+      soul: .symphony/roles/backend_engineer/SOUL.md
+    assignment:
+      owns:
+        - Rust core and state changes
+      does_not_own:
+        - TUI polish
+      requires:
+        - acceptance criteria
+      handoff_expectations:
+        - tests_run
+        - changed_files
+      routing_hints:
+        paths_any: [crates/**, tests/**]
+        labels_any: [backend]
+        issue_types_any: [implementation]
+        domains_any: [state]
+agents:
+  codex_fast:
+    backend: codex
+    command: codex app-server
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let role = parsed.roles.get("backend_engineer").unwrap();
+        assert_eq!(
+            role.instructions.role_prompt.as_deref(),
+            Some(std::path::Path::new(
+                ".symphony/roles/backend_engineer/AGENTS.md"
+            ))
+        );
+        assert_eq!(
+            role.instructions.soul.as_deref(),
+            Some(std::path::Path::new(
+                ".symphony/roles/backend_engineer/SOUL.md"
+            ))
+        );
+        assert_eq!(role.assignment.owns, vec!["Rust core and state changes"]);
+        assert_eq!(role.assignment.does_not_own, vec!["TUI polish"]);
+        assert_eq!(role.assignment.requires, vec!["acceptance criteria"]);
+        assert_eq!(
+            role.assignment.handoff_expectations,
+            vec!["tests_run", "changed_files"]
+        );
+        assert_eq!(
+            role.assignment.routing_hints.paths_any,
+            vec!["crates/**", "tests/**"]
+        );
+        assert_eq!(role.assignment.routing_hints.labels_any, vec!["backend"]);
+        assert_eq!(
+            role.assignment.routing_hints.issue_types_any,
+            vec!["implementation"]
+        );
+        assert_eq!(role.assignment.routing_hints.domains_any, vec!["state"]);
+
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn role_instruction_config_rejects_unknown_keys() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  backend_engineer:
+    kind: specialist
+    instructions:
+      role_promtp: .symphony/roles/backend_engineer/AGENTS.md
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("role_promtp") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn role_assignment_metadata_warnings_surface_thin_catalog_entries() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  platform_lead:
+    kind: integration_owner
+  backend_engineer:
+    kind: specialist
+    description: Backend implementation
+  frontend_engineer:
+    kind: specialist
+    description: Frontend implementation
+decomposition:
+  enabled: true
+  owner_role: platform_lead
+"#;
+        let cfg: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        let warnings = cfg.validation_warnings();
+        assert!(warnings.contains(
+            &ConfigValidationWarning::SpecialistRoleMissingAssignmentMetadata {
+                role: "backend_engineer".into()
+            }
+        ));
+        assert!(warnings.contains(
+            &ConfigValidationWarning::SpecialistRoleMissingAssignmentMetadata {
+                role: "frontend_engineer".into()
+            }
+        ));
+        assert!(warnings.contains(&ConfigValidationWarning::DecompositionCatalogMostlyFallback));
     }
 
     #[test]
