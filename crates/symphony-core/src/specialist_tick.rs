@@ -73,6 +73,13 @@ pub struct SpecialistDispatchRequest {
     /// `None` skips the `Repository` scope acquisition.
     #[serde(default)]
     pub repository: Option<String>,
+    /// Parent [`WorkItemId`] for cancellation observation. When set,
+    /// `observe_for_run_or_parent` (SPEC v2 §4.5 / Phase 11.5) will fall
+    /// back to the work-item keyspace if no run-keyed cancel is pending.
+    /// `None` reduces the observation to the run keyspace alone (or skips
+    /// it entirely when the request also lacks a `run_id`).
+    #[serde(default)]
+    pub parent_work_item_id: Option<WorkItemId>,
 }
 
 /// Shared FIFO of pending [`SpecialistDispatchRequest`]s.
@@ -278,6 +285,7 @@ impl QueueTick for SpecialistQueueTick {
                                 run_id: None,
                                 agent_profile: None,
                                 repository: None,
+                                parent_work_item_id: None,
                             });
                             self.claimed
                                 .lock()
@@ -674,6 +682,7 @@ mod tests {
             run_id: None,
             agent_profile: None,
             repository: None,
+            parent_work_item_id: None,
         });
         q.enqueue(SpecialistDispatchRequest {
             issue_id: "2".into(),
@@ -683,6 +692,7 @@ mod tests {
             run_id: None,
             agent_profile: None,
             repository: None,
+            parent_work_item_id: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
