@@ -139,6 +139,18 @@ pub struct WorkItemEdgeRecord {
     /// Provenance for this edge. Gates can use this to decide whether
     /// automatic resolution is safe.
     pub source: EdgeSource,
+    /// Tracker-native edge/relation id when a capable tracker mirrors
+    /// this local dependency edge.
+    pub tracker_edge_id: Option<String>,
+    /// Current tracker mirror state, stored stringly so the sync layer
+    /// can evolve its typed policy without another schema churn.
+    pub tracker_sync_status: Option<String>,
+    /// Last tracker sync error, if the mirror attempt failed.
+    pub tracker_sync_last_error: Option<String>,
+    /// Number of tracker sync attempts made for this edge.
+    pub tracker_sync_attempts: i64,
+    /// RFC3339 timestamp of the last tracker sync attempt, if any.
+    pub tracker_sync_last_attempt_at: Option<String>,
     /// RFC3339 row creation timestamp.
     pub created_at: String,
 }
@@ -227,7 +239,7 @@ pub trait WorkItemEdgeRepository {
     fn list_descendants_via_parent_child(&self, root: WorkItemId) -> StateResult<Vec<WorkItemId>>;
 }
 
-const EDGE_COLUMNS: &str = "id, parent_id, child_id, edge_type, reason, status, source, created_at";
+const EDGE_COLUMNS: &str = "id, parent_id, child_id, edge_type, reason, status, source, tracker_edge_id, tracker_sync_status, tracker_sync_last_error, tracker_sync_attempts, tracker_sync_last_attempt_at, created_at";
 
 fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemEdgeRecord> {
     let raw_kind: String = row.get(3)?;
@@ -255,7 +267,12 @@ fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemEdgeRecord> {
                 )
             })?
         },
-        created_at: row.get(7)?,
+        tracker_edge_id: row.get(7)?,
+        tracker_sync_status: row.get(8)?,
+        tracker_sync_last_error: row.get(9)?,
+        tracker_sync_attempts: row.get(10)?,
+        tracker_sync_last_attempt_at: row.get(11)?,
+        created_at: row.get(12)?,
     })
 }
 
@@ -437,6 +454,7 @@ mod tests {
     use super::*;
     use crate::migrations::migrations;
     use crate::repository::{NewWorkItem, WorkItemRepository};
+    use rusqlite::params;
 
     fn open() -> StateDb {
         let mut db = StateDb::open_in_memory().expect("open");
@@ -515,6 +533,11 @@ mod tests {
         assert_eq!(fetched.reason.as_deref(), Some("decomposition step 1"));
         assert_eq!(fetched.status, "linked");
         assert_eq!(fetched.source, EdgeSource::Unknown);
+        assert_eq!(fetched.tracker_edge_id, None);
+        assert_eq!(fetched.tracker_sync_status, None);
+        assert_eq!(fetched.tracker_sync_last_error, None);
+        assert_eq!(fetched.tracker_sync_attempts, 0);
+        assert_eq!(fetched.tracker_sync_last_attempt_at, None);
     }
 
     #[test]
@@ -550,6 +573,60 @@ mod tests {
 
         let fetched = db.get_edge(edge.id).unwrap().unwrap();
         assert_eq!(fetched.source, EdgeSource::Decomposition);
+    }
+
+    #[test]
+    fn edge_tracker_sync_metadata_round_trips_from_storage() {
+        let mut db = open();
+        let blocker = seed_item(&mut db, "ENG-1");
+        let blocked = seed_item(&mut db, "ENG-2");
+        let edge = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: blocker,
+                child_id: blocked,
+                edge_type: EdgeType::Blocks,
+                reason: Some("api depends on schema"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:00Z",
+            })
+            .expect("create decomposition blocker");
+
+        db.conn()
+            .execute(
+                "UPDATE work_item_edges
+                    SET tracker_edge_id = ?2,
+                        tracker_sync_status = ?3,
+                        tracker_sync_last_error = ?4,
+                        tracker_sync_attempts = ?5,
+                        tracker_sync_last_attempt_at = ?6
+                  WHERE id = ?1",
+                params![
+                    edge.id.0,
+                    "linear-relation-123",
+                    "failed",
+                    "tracker unavailable",
+                    2_i64,
+                    "2026-05-08T00:01:00Z",
+                ],
+            )
+            .expect("update tracker metadata");
+
+        let fetched = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.tracker_edge_id.as_deref(),
+            Some("linear-relation-123")
+        );
+        assert_eq!(fetched.tracker_sync_status.as_deref(), Some("failed"));
+        assert_eq!(
+            fetched.tracker_sync_last_error.as_deref(),
+            Some("tracker unavailable")
+        );
+        assert_eq!(fetched.tracker_sync_attempts, 2);
+        assert_eq!(
+            fetched.tracker_sync_last_attempt_at.as_deref(),
+            Some("2026-05-08T00:01:00Z")
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 2 — State Model and Repositories
 
 - [x] Add source/provenance metadata for `work_item_edges` so decomposition-sourced `blocks` edges can be distinguished from QA, follow-up, and human blockers.
-- [ ] Add tracker sync fields for dependency edges if missing: tracker edge id, sync status, last error, retry count, last attempted timestamp.
+- [x] Add tracker sync fields for dependency edges if missing: tracker edge id, sync status, last error, retry count, last attempted timestamp.
 - [ ] Add repository helpers to create decomposition dependency edges in one transaction after child `WorkItemId`s are known.
 - [ ] Add repository helper to list incoming open blocker edges for specialist dispatch eligibility.
 - [ ] Add repository helper to list decomposition-sourced open blockers whose blocker child is terminal and eligible for auto-resolution.

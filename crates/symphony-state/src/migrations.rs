@@ -550,7 +550,28 @@ const V3_EDGE_PROVENANCE: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 7] = [
+const V3_EDGE_TRACKER_SYNC_METADATA: Migration = Migration {
+    version: 2_026_051_002,
+    name: "v3_edge_tracker_sync_metadata",
+    sql: r#"
+        ALTER TABLE work_item_edges
+            ADD COLUMN tracker_edge_id TEXT;
+        ALTER TABLE work_item_edges
+            ADD COLUMN tracker_sync_status TEXT;
+        ALTER TABLE work_item_edges
+            ADD COLUMN tracker_sync_last_error TEXT;
+        ALTER TABLE work_item_edges
+            ADD COLUMN tracker_sync_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE work_item_edges
+            ADD COLUMN tracker_sync_last_attempt_at TEXT;
+
+        CREATE INDEX idx_work_item_edges_blocked_open
+            ON work_item_edges(child_id, edge_type, status)
+            WHERE edge_type = 'blocks' AND status = 'open';
+    "#,
+};
+
+const MIGRATIONS: [Migration; 8] = [
     V2_INITIAL_SCHEMA,
     V2_INTEGRATION_RECORDS,
     V2_PULL_REQUEST_RECORDS,
@@ -558,6 +579,7 @@ const MIGRATIONS: [Migration; 7] = [
     V2_RUNS_STATUS_CHECK,
     V2_CANCEL_REQUESTS,
     V3_EDGE_PROVENANCE,
+    V3_EDGE_TRACKER_SYNC_METADATA,
 ];
 
 #[cfg(test)]
@@ -617,6 +639,7 @@ mod tests {
                 2_026_050_805,
                 2_026_050_806,
                 2_026_051_001,
+                2_026_051_002,
             ]
         );
     }
@@ -636,6 +659,7 @@ mod tests {
                 2_026_050_805,
                 2_026_050_806,
                 2_026_051_001,
+                2_026_051_002,
             ]
         );
         assert!(first.skipped.is_empty());
@@ -650,8 +674,35 @@ mod tests {
                 2_026_050_805,
                 2_026_050_806,
                 2_026_051_001,
+                2_026_051_002,
             ]
         );
+    }
+
+    fn table_columns(db: &StateDb, table: &str) -> Vec<String> {
+        let mut stmt = db
+            .conn()
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare pragma");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query pragma");
+        rows.collect::<Result<Vec<_>, _>>().expect("read columns")
+    }
+
+    #[test]
+    fn v3_edge_tracker_sync_metadata_columns_exist() {
+        let db = open_migrated();
+        let columns = table_columns(&db, "work_item_edges");
+        for column in [
+            "tracker_edge_id",
+            "tracker_sync_status",
+            "tracker_sync_last_error",
+            "tracker_sync_attempts",
+            "tracker_sync_last_attempt_at",
+        ] {
+            assert!(columns.iter().any(|c| c == column), "missing `{column}`");
+        }
     }
 
     fn insert_work_item(db: &StateDb, identifier: &str) -> i64 {

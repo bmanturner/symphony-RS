@@ -1079,6 +1079,11 @@ mod tests {
                 reason: Some("ci red".into()),
                 status: "open".into(),
                 source: EdgeSource::Unknown,
+                tracker_edge_id: None,
+                tracker_sync_status: None,
+                tracker_sync_last_error: None,
+                tracker_sync_attempts: 0,
+                tracker_sync_last_attempt_at: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
         });
