@@ -1,33 +1,33 @@
 # Symphony-RS
 
-Rust port of OpenAI's Symphony — a headless, single-binary daemon that
-polls an issue tracker and dispatches AI coding agents at the issues it
-finds.
+Symphony-RS v2 is a headless specialist-agent orchestration product. It
+turns tracker issues into routed agent runs, single-owner integration,
+QA-gated closeout, blockers, follow-ups, and durable evidence.
 
-Symphony-RS deviates from the upstream spec in two ways:
+The product center is deliberately small:
 
-- **Agent-agnostic Agent Runner** — pluggable backends for `codex` and
-  `claude` (Claude Code), plus an experimental `tandem` mode that runs
-  both concurrently with a configurable lead.
-- **Trait-abstracted Issue Tracker** — Linear and GitHub Issues are both
-  v1 adapters behind a shared `IssueTracker` trait, exercised by a
-  conformance suite parameterised over the trait.
-
-The full design contract lives in [`SPEC.md`](./SPEC.md);
-[`ARCHITECTURE.md`](./ARCHITECTURE.md) records the layered diagram and
-the ADRs that have accumulated as the project evolved.
-
-## Status
-
-Phases 1–7 are landed. Phase 8 (out-of-process live TUI via HTTP SSE)
-is in progress — see [`CHECKLIST.md`](./CHECKLIST.md).
+- **Workflow kernel** — `WORKFLOW.md` defines roles, agents, routing,
+  decomposition, workspace/branch policy, integration, QA, follow-ups,
+  observability, budgets, and persistence.
+- **First-class gate roles** — `integration_owner` owns decomposition,
+  canonical integration branch/worktree truth, PR handoff, and parent
+  closeout; `qa_gate` can reject, file blockers, create follow-ups, and
+  force rework.
+- **Limited adapters** — production backends are GitHub/Linear trackers,
+  git workspaces, and Codex/Claude/Hermes agents. Test-only mock
+  adapters keep fixtures and deterministic scenarios reproducible.
 
 ## Quickstart
 
-This walkthrough takes a clean checkout to a first dispatched issue
-without needing a Linear or GitHub credential, and without `codex` or
-`claude` on `PATH`. It uses the in-repo `MockTracker` and
-`MockAgentRunner` so every step is reproducible offline.
+This walkthrough takes a clean checkout through the v2 workflow shape
+without needing a Linear/GitHub credential or a local Codex/Claude/Hermes
+binary. It uses the in-repo test fixture at
+[`tests/fixtures/quickstart-workflow/`](./tests/fixtures/quickstart-workflow/).
+
+The fixture is intentionally offline: `tracker.kind: mock` reads canned
+issues from `issues.yaml`, and `agents.mock_agent.backend: mock` returns
+scripted handoffs. Mock adapters are test-only; copy the workflow before
+using it as a production starting point.
 
 ### 1. Install the binary
 
@@ -37,89 +37,101 @@ From the repo root:
 cargo install --path crates/symphony-cli
 ```
 
-This places a `symphony` binary in `~/.cargo/bin`. Verify it's on
+This places a `symphony` binary in `~/.cargo/bin`. Verify it is on
 `PATH`:
 
 ```sh
 symphony --version
 ```
 
-### 2. Validate the quickstart workflow
+### 2. Inspect the v2 workflow fixture
 
-The fixture lives at
-[`tests/fixtures/quickstart-workflow/`](./tests/fixtures/quickstart-workflow/)
-and pairs a `WORKFLOW.md` (front-matter config + prompt body) with an
-`issues.yaml` of canned issues for the `MockTracker`.
+Open
+[`tests/fixtures/quickstart-workflow/WORKFLOW.md`](./tests/fixtures/quickstart-workflow/WORKFLOW.md).
+The front matter includes the core v2 sections:
+
+- `roles` with `platform_lead` as `kind: integration_owner`, `qa` as
+  `kind: qa_gate`, and `worker` as a configurable specialist.
+- `routing`, `decomposition`, `workspace`, `branching`, `integration`,
+  `pull_requests`, `qa`, and `followups`.
+- `observability` and budget settings that make the offline run easy to
+  inspect.
+
+The Markdown body below the front matter is the base prompt template.
+
+### 3. Validate the quickstart workflow
 
 ```sh
 symphony validate tests/fixtures/quickstart-workflow/WORKFLOW.md
 ```
 
-`validate` parses the front matter, layers `SYMPHONY_*` env overrides,
-checks invariants (SPEC §10.1), and prints the resolved config. Exits
-0 on success, non-zero on the first error — wire it into CI as a
-pre-deploy smoke test.
+`validate` parses the front matter and checks the typed v2 invariants:
+owner roles exist, role and agent references resolve, tracker states do
+not overlap, workspace/branch policy is coherent, and QA/follow-up gates
+are internally consistent. It exits 0 on success and non-zero on the
+first error.
 
-### 3. Inspect what would be dispatched
+### 4. Inspect queued work
 
-`symphony status` is a point-in-time snapshot of the tracker's active
-set — i.e. exactly what the next poll tick would see:
+`symphony status` can preview the tracker-backed candidates for this
+offline workflow:
 
 ```sh
 symphony status tests/fixtures/quickstart-workflow/WORKFLOW.md
 ```
 
-You should see two issues (`QUICK-1`, `QUICK-2`) listed under the
-`Todo` and `In Progress` states from `issues.yaml`.
+You should see the canned `QUICK-1` and `QUICK-2` issues from
+[`issues.yaml`](./tests/fixtures/quickstart-workflow/issues.yaml).
 
-### 4. Run the orchestrator against the fixture
+### 5. Run the orchestrator against the fixture
 
-`symphony run` starts the poll loop and dispatches issues at the
-configured agent. The quickstart fixture deliberately omits
-`workspace.root` so you can point the workspace at a scratch directory
-via the `SYMPHONY_WORKSPACE__ROOT` env var (figment env layering, SPEC
-§5.4):
+`symphony run` starts the v2 scheduler. The quickstart fixture omits
+`workspace.root` so a smoke run can point workspaces at a scratch
+directory via `SYMPHONY_WORKSPACE__ROOT`:
 
 ```sh
 mkdir -p /tmp/symphony-quickstart
 SYMPHONY_WORKSPACE__ROOT=/tmp/symphony-quickstart \
   RUST_LOG=info \
-  symphony run tests/fixtures/quickstart-workflow/WORKFLOW.md
+  symphony run tests/fixtures/quickstart-workflow/WORKFLOW.md \
+  --state-db /tmp/symphony-quickstart/state.db
 ```
 
-Within one poll tick (200ms in the fixture) the orchestrator:
+Within one scheduler tick (200 ms in the fixture), the orchestrator:
 
-1. Calls `MockTracker::fetch_active`, which returns the canned
-   `QUICK-1` and `QUICK-2` issues from `issues.yaml`.
-2. Claims each via the in-memory state machine (bounded by
-   `agent.max_concurrent_agents = 2`).
-3. Asks `WorkspaceManager` to materialize a per-issue directory under
-   `SYMPHONY_WORKSPACE__ROOT`. You should see `QUICK-1/` and `QUICK-2/`
-   appear in `/tmp/symphony-quickstart` — that's the smallest
-   observable evidence dispatch happened.
-4. Spawns the `MockAgentRunner`, which emits a scripted
-   `Started → Message → Completed` sequence per turn.
+1. Reads active candidates from `issues.yaml`.
+2. Maps tracker states to normalized work-item status classes.
+3. Routes work through the configured roles.
+4. Verifies workspace/branch policy before mutation-capable runs.
+5. Persists run/workspace/handoff/event evidence to the SQLite database
+   passed with `--state-db`.
+6. Executes the scripted mock agent.
 
 Press `Ctrl-C` to send SIGINT. The orchestrator logs
-`SIGINT received; cancelling poll loop`, drains in-flight turns up to
-the configured deadline, and exits 0 with `symphony run exited
-cleanly`.
+the shutdown path, cooperatively drains in-flight work, and exits cleanly.
 
-### 5. Switch to a real backend
+### 6. Switch to real adapters
 
-To swap the mock backends for real ones, edit the fixture's front
-matter (or copy it elsewhere) and change the `tracker.kind` and
-`agent.kind` values:
+To adapt the fixture for real work, copy it into your repository and
+replace the test-only adapters:
 
 - `tracker.kind: linear` — set `LINEAR_API_KEY` in the environment.
-- `tracker.kind: github` — set `GITHUB_TOKEN` and `tracker.repo`.
-- `agent.kind: codex` — requires `codex` on `PATH`.
-- `agent.kind: claude` — requires `claude` on `PATH`.
-- `agent.kind: tandem` — composes two of the above; see SPEC §6 and
-  ARCHITECTURE.md for the strategy knobs.
+- `tracker.kind: github` — set `GITHUB_TOKEN` and `tracker.repository`.
+- agent `backend: codex` — requires `codex` on `PATH`.
+- agent `backend: claude` — requires `claude` on `PATH`.
+- agent `backend: hermes` — requires `hermes` on `PATH`.
+- composite `strategy: tandem` — wraps two configured agent profiles for
+  review or split-implementation workflows.
 
-Every config key is documented inline in
-[`crates/symphony-config/src/types.rs`](./crates/symphony-config/src/types.rs).
+Keep `platform_lead`/`qa` if those names fit your team, or rename them
+while preserving the semantic role kinds: `integration_owner` and
+`qa_gate`.
+
+The full schema is documented in
+[`docs/workflow.md`](./docs/workflow.md), with role semantics in
+[`docs/roles.md`](./docs/roles.md), workspace policy in
+[`docs/workspaces.md`](./docs/workspaces.md), and QA behavior in
+[`docs/qa.md`](./docs/qa.md).
 
 ## Development
 
@@ -130,8 +142,14 @@ cargo test --workspace
 cargo doc --workspace --no-deps
 ```
 
-The build must be green at every commit — see the iteration protocol
-in [`CLAUDE.md`](./CLAUDE.md).
+The full verification gate for product changes is:
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo doc --workspace --no-deps
+```
 
 ## License
 

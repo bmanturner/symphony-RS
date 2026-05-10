@@ -24,13 +24,8 @@ schema_version: 1
 tracker:
   kind: mock
   fixtures: issues.yaml
-  unknown_state_policy: error
-  state_mapping:
-    intake: [Todo]
-    running: [In Progress]
-    done: [Done]
-    cancelled: [Cancelled]
-
+  active_states: [Todo, In Progress]
+  terminal_states: [Done, Cancelled]
 polling:
   # Tight tick so the smoke test can observe at least one dispatch
   # within a sub-second sleep window. Production deployments should
@@ -38,11 +33,6 @@ polling:
   interval_ms: 200
   jitter_ms: 0
   startup_reconcile_recent_terminal: false
-
-persistence:
-  kind: sqlite
-  path: .symphony/quickstart-state.db
-  event_log: .symphony/quickstart-events.ndjson
 
 roles:
   platform_lead:
@@ -65,9 +55,7 @@ roles:
 agents:
   mock_agent:
     backend: mock
-    max_concurrent_agents: 2
     max_turns: 4
-    max_retry_backoff_ms: 1000
 
 routing:
   default_role: worker
@@ -173,12 +161,6 @@ budgets:
   max_turns_per_run: 4
   max_retries: 1
   pause_policy: block_work_item
-
-security:
-  destructive_actions_require_approval: true
-  publish_purchase_deploy_require_human: true
-  network_policy: workflow_defined
-  secret_redaction: true
 
 hooks:
   timeout_ms: 5000

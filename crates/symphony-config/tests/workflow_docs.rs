@@ -2,13 +2,14 @@ use std::path::Path;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use symphony_config::{RoleConfig, RoleKind, WorkflowLoader};
+use symphony_config::{RoleConfig, RoleKind, TrackerKind, WorkflowLoader};
 
 const WORKFLOW_DOC: &str = include_str!("../../../docs/workflow.md");
 const ROLES_DOC: &str = include_str!("../../../docs/roles.md");
 const WORKSPACES_DOC: &str = include_str!("../../../docs/workspaces.md");
 const QA_DOC: &str = include_str!("../../../docs/qa.md");
 const UPGRADE_DOC: &str = include_str!("../../../docs/upgrade.md");
+const README_DOC: &str = include_str!("../../../README.md");
 
 #[test]
 fn complete_workflow_example_in_docs_loads_and_validates() {
@@ -218,6 +219,59 @@ fn upgrade_doc_covers_v2_migration_contract() {
         assert!(
             UPGRADE_DOC.contains(required),
             "upgrade doc should mention {required:?}"
+        );
+    }
+}
+
+#[test]
+fn quickstart_fixture_loads_and_readme_covers_v2_walkthrough() {
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/quickstart-workflow/WORKFLOW.md");
+    let loaded = WorkflowLoader::from_path(&fixture_path)
+        .expect("quickstart WORKFLOW.md fixture should load");
+
+    loaded
+        .config
+        .validate()
+        .expect("quickstart WORKFLOW.md fixture should validate");
+
+    assert_eq!(loaded.config.tracker.kind, TrackerKind::Mock);
+    assert_eq!(
+        loaded
+            .config
+            .roles
+            .get("platform_lead")
+            .expect("quickstart declares platform_lead")
+            .kind,
+        RoleKind::IntegrationOwner
+    );
+    assert_eq!(
+        loaded
+            .config
+            .roles
+            .get("qa")
+            .expect("quickstart declares qa")
+            .kind,
+        RoleKind::QaGate
+    );
+    assert!(
+        loaded.config.observability.event_bus,
+        "quickstart should keep durable event broadcasting enabled"
+    );
+
+    for required in [
+        "tests/fixtures/quickstart-workflow/",
+        "symphony validate tests/fixtures/quickstart-workflow/WORKFLOW.md",
+        "symphony status tests/fixtures/quickstart-workflow/WORKFLOW.md",
+        "symphony run tests/fixtures/quickstart-workflow/WORKFLOW.md",
+        "kind: integration_owner",
+        "kind: qa_gate",
+        "Mock adapters are test-only",
+        "docs/workflow.md",
+    ] {
+        assert!(
+            README_DOC.contains(required),
+            "README quickstart should mention {required:?}"
         );
     }
 }
