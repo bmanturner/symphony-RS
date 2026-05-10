@@ -8,6 +8,7 @@ const WORKFLOW_DOC: &str = include_str!("../../../docs/workflow.md");
 const ROLES_DOC: &str = include_str!("../../../docs/roles.md");
 const WORKSPACES_DOC: &str = include_str!("../../../docs/workspaces.md");
 const QA_DOC: &str = include_str!("../../../docs/qa.md");
+const UPGRADE_DOC: &str = include_str!("../../../docs/upgrade.md");
 
 #[test]
 fn complete_workflow_example_in_docs_loads_and_validates() {
@@ -199,6 +200,26 @@ fn qa_doc_example_parses_as_qa_config() {
             .evidence_required
             .visual_or_runtime_evidence_when_applicable
     );
+}
+
+#[test]
+fn upgrade_doc_covers_v2_migration_contract() {
+    for required in [
+        "tests/fixtures/sample-workflow/WORKFLOW.md",
+        "tests/fixtures/quickstart-workflow/WORKFLOW.md",
+        "docs/legacy/",
+        "docs/workflow.md",
+        "strategy: tandem",
+        "Keep Mocks Test-Only",
+        "kind: integration_owner",
+        "kind: qa_gate",
+        "symphony validate WORKFLOW.md",
+    ] {
+        assert!(
+            UPGRADE_DOC.contains(required),
+            "upgrade doc should mention {required:?}"
+        );
+    }
 }
 
 fn extract_marked_yaml<'a>(doc: &'a str, marker: &str) -> &'a str {

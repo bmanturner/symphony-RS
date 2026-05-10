@@ -19,6 +19,8 @@ The Markdown body becomes the base prompt for dispatched agents.
 
 Unknown YAML keys are rejected. The schema is intentionally strict so typos do not silently weaken workflow gates.
 
+For migration guidance from the original Symphony-RS fixture and planning shape, see `docs/upgrade.md`.
+
 ## Minimal Valid Shape
 
 A useful workflow normally declares roles, agents, routing, workspace policy, integration, QA, and follow-up policy. For validation only, a minimal Linear workflow can be as small as:
