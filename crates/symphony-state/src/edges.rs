@@ -176,6 +176,24 @@ pub struct NewWorkItemEdge<'a> {
     pub now: &'a str,
 }
 
+/// Insertion payload for a dependency edge emitted by a decomposition
+/// proposal after proposal-local child keys have been resolved to durable
+/// [`WorkItemId`]s.
+#[derive(Debug, Clone)]
+pub struct NewDecompositionBlockerEdge<'a> {
+    /// Prerequisite child that blocks downstream work. Stored as
+    /// `parent_id` on the resulting `blocks` edge.
+    pub blocker_id: WorkItemId,
+    /// Waiting child that must not dispatch until the blocker resolves.
+    /// Stored as `child_id` on the resulting `blocks` edge.
+    pub blocked_id: WorkItemId,
+    /// Operator-facing explanation, typically
+    /// `"<blocked> depends on <blocker>"`.
+    pub reason: &'a str,
+    /// RFC3339 row creation timestamp.
+    pub now: &'a str,
+}
+
 /// CRUD over `work_item_edges`.
 pub trait WorkItemEdgeRepository {
     /// Insert a new edge and return its persisted form.
@@ -185,6 +203,20 @@ pub trait WorkItemEdgeRepository {
     /// `(parent_id, child_id, edge_type)` UNIQUE constraint. Violations
     /// surface as [`crate::StateError::Sqlite`].
     fn create_edge(&mut self, new: NewWorkItemEdge<'_>) -> StateResult<WorkItemEdgeRecord>;
+
+    /// Insert a batch of decomposition-sourced dependency blockers in
+    /// one transaction.
+    ///
+    /// Every row is stored as an open `blocks` edge where
+    /// `parent_id = blocker_id`, `child_id = blocked_id`, and
+    /// `source = decomposition`. If any edge violates schema invariants
+    /// (for example a duplicate edge, self-edge, or missing endpoint),
+    /// the whole batch rolls back so downstream dispatch never observes
+    /// a partially materialized dependency graph.
+    fn create_decomposition_blocker_edges(
+        &mut self,
+        edges: &[NewDecompositionBlockerEdge<'_>],
+    ) -> StateResult<Vec<WorkItemEdgeRecord>>;
 
     /// Fetch a single edge by primary key.
     fn get_edge(&self, id: EdgeId) -> StateResult<Option<WorkItemEdgeRecord>>;
@@ -298,6 +330,28 @@ pub(crate) fn create_edge_in(
     Ok(get_edge_in(conn, id)?.expect("freshly inserted edge must be readable"))
 }
 
+pub(crate) fn create_decomposition_blocker_edges_in(
+    conn: &Connection,
+    edges: &[NewDecompositionBlockerEdge<'_>],
+) -> StateResult<Vec<WorkItemEdgeRecord>> {
+    let mut records = Vec::with_capacity(edges.len());
+    for edge in edges {
+        records.push(create_edge_in(
+            conn,
+            NewWorkItemEdge {
+                parent_id: edge.blocker_id,
+                child_id: edge.blocked_id,
+                edge_type: EdgeType::Blocks,
+                reason: Some(edge.reason),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: edge.now,
+            },
+        )?);
+    }
+    Ok(records)
+}
+
 pub(crate) fn get_edge_in(
     conn: &Connection,
     id: EdgeId,
@@ -389,6 +443,13 @@ pub(crate) fn list_open_blockers_for_subtree_in(
 impl WorkItemEdgeRepository for StateDb {
     fn create_edge(&mut self, new: NewWorkItemEdge<'_>) -> StateResult<WorkItemEdgeRecord> {
         create_edge_in(self.conn(), new)
+    }
+
+    fn create_decomposition_blocker_edges(
+        &mut self,
+        edges: &[NewDecompositionBlockerEdge<'_>],
+    ) -> StateResult<Vec<WorkItemEdgeRecord>> {
+        self.transaction(|tx| tx.create_decomposition_blocker_edges(edges))
     }
 
     fn get_edge(&self, id: EdgeId) -> StateResult<Option<WorkItemEdgeRecord>> {
@@ -573,6 +634,85 @@ mod tests {
 
         let fetched = db.get_edge(edge.id).unwrap().unwrap();
         assert_eq!(fetched.source, EdgeSource::Decomposition);
+    }
+
+    #[test]
+    fn create_decomposition_blocker_edges_persists_open_blocks_in_dependency_direction() {
+        let mut db = open();
+        let schema = seed_item(&mut db, "ENG-1");
+        let api = seed_item(&mut db, "ENG-2");
+        let ui = seed_item(&mut db, "ENG-3");
+
+        let edges = db
+            .create_decomposition_blocker_edges(&[
+                NewDecompositionBlockerEdge {
+                    blocker_id: schema,
+                    blocked_id: api,
+                    reason: "api depends on schema",
+                    now: "2026-05-08T00:00:00Z",
+                },
+                NewDecompositionBlockerEdge {
+                    blocker_id: api,
+                    blocked_id: ui,
+                    reason: "ui depends on api",
+                    now: "2026-05-08T00:00:01Z",
+                },
+            ])
+            .expect("create dependency blockers");
+
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].parent_id, schema);
+        assert_eq!(edges[0].child_id, api);
+        assert_eq!(edges[0].edge_type, EdgeType::Blocks);
+        assert_eq!(edges[0].status, "open");
+        assert_eq!(edges[0].source, EdgeSource::Decomposition);
+        assert_eq!(edges[0].reason.as_deref(), Some("api depends on schema"));
+        assert_eq!(edges[1].parent_id, api);
+        assert_eq!(edges[1].child_id, ui);
+
+        let incoming_api = db.list_incoming(api, EdgeType::Blocks).unwrap();
+        assert_eq!(
+            incoming_api.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+            vec![edges[0].id]
+        );
+        let outgoing_api = db.list_outgoing(api, EdgeType::Blocks).unwrap();
+        assert_eq!(
+            outgoing_api.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+            vec![edges[1].id]
+        );
+    }
+
+    #[test]
+    fn create_decomposition_blocker_edges_rolls_back_whole_batch_on_failure() {
+        let mut db = open();
+        let schema = seed_item(&mut db, "ENG-1");
+        let api = seed_item(&mut db, "ENG-2");
+        let ui = seed_item(&mut db, "ENG-3");
+
+        let err = db
+            .create_decomposition_blocker_edges(&[
+                NewDecompositionBlockerEdge {
+                    blocker_id: schema,
+                    blocked_id: api,
+                    reason: "api depends on schema",
+                    now: "2026-05-08T00:00:00Z",
+                },
+                NewDecompositionBlockerEdge {
+                    blocker_id: ui,
+                    blocked_id: ui,
+                    reason: "invalid self dependency",
+                    now: "2026-05-08T00:00:01Z",
+                },
+            ])
+            .expect_err("self edge should reject the batch");
+
+        assert!(matches!(err, crate::StateError::Sqlite(_)));
+        assert!(db.list_incoming(api, EdgeType::Blocks).unwrap().is_empty());
+        assert!(
+            db.list_outgoing(schema, EdgeType::Blocks)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

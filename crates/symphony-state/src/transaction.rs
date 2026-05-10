@@ -28,7 +28,8 @@
 use rusqlite::Transaction;
 
 use crate::edges::{
-    EdgeId, NewWorkItemEdge, WorkItemEdgeRecord, create_edge_in, get_edge_in,
+    EdgeId, NewDecompositionBlockerEdge, NewWorkItemEdge, WorkItemEdgeRecord,
+    create_decomposition_blocker_edges_in, create_edge_in, get_edge_in,
     list_open_blockers_for_subtree_in, update_edge_status_in,
 };
 use crate::events::{EventRecord, NewEvent};
@@ -131,6 +132,20 @@ impl<'conn> StateTransaction<'conn> {
     /// a half-built tree.
     pub fn create_edge(&mut self, new: NewWorkItemEdge<'_>) -> StateResult<WorkItemEdgeRecord> {
         create_edge_in(&self.tx, new)
+    }
+
+    /// Insert decomposition-sourced dependency blocker edges inside
+    /// this transaction.
+    ///
+    /// This is the transactional companion to
+    /// [`crate::edges::WorkItemEdgeRepository::create_decomposition_blocker_edges`]
+    /// for callers that are also creating child `work_items` or
+    /// `parent_child` edges in the same recoverable operation.
+    pub fn create_decomposition_blocker_edges(
+        &mut self,
+        edges: &[NewDecompositionBlockerEdge<'_>],
+    ) -> StateResult<Vec<WorkItemEdgeRecord>> {
+        create_decomposition_blocker_edges_in(&self.tx, edges)
     }
 
     /// Read an edge — useful when a transition needs to verify the
