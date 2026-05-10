@@ -6,6 +6,7 @@ use symphony_config::{RoleConfig, RoleKind, WorkflowLoader};
 
 const WORKFLOW_DOC: &str = include_str!("../../../docs/workflow.md");
 const ROLES_DOC: &str = include_str!("../../../docs/roles.md");
+const WORKSPACES_DOC: &str = include_str!("../../../docs/workspaces.md");
 
 #[test]
 fn complete_workflow_example_in_docs_loads_and_validates() {
@@ -96,6 +97,59 @@ fn roles_doc_example_parses_as_role_config() {
             .kind,
         RoleKind::Operator
     );
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspacesDocExample {
+    workspace: symphony_config::WorkspacePolicyConfig,
+    branching: symphony_config::BranchPolicyConfig,
+}
+
+#[test]
+fn workspaces_doc_example_parses_as_workspace_and_branch_config() {
+    let example = extract_marked_yaml(WORKSPACES_DOC, "workspaces-example");
+    let parsed: WorkspacesDocExample =
+        serde_yaml::from_str(example).expect("documented workspaces example should parse");
+
+    assert_eq!(
+        parsed.workspace.default_strategy.as_deref(),
+        Some("issue_worktree")
+    );
+    assert!(parsed.workspace.require_cwd_in_workspace);
+    assert!(parsed.workspace.forbid_untracked_outside_workspace);
+
+    let issue = parsed
+        .workspace
+        .strategies
+        .get("issue_worktree")
+        .expect("workspaces doc declares issue_worktree");
+    assert_eq!(
+        issue.kind,
+        symphony_config::WorkspaceStrategyKind::GitWorktree
+    );
+    assert_eq!(issue.base.as_deref(), Some("main"));
+    assert_eq!(
+        issue.branch_template.as_deref(),
+        Some("symphony/{{identifier}}")
+    );
+
+    let integration = parsed
+        .workspace
+        .strategies
+        .get("integration_worktree")
+        .expect("workspaces doc declares integration_worktree");
+    assert_eq!(
+        integration.kind,
+        symphony_config::WorkspaceStrategyKind::ExistingWorktree
+    );
+    assert_eq!(
+        integration.require_branch.as_deref(),
+        Some("symphony/integration/{{parent_identifier}}")
+    );
+
+    assert!(!parsed.branching.allow_same_branch_for_children);
+    assert!(parsed.branching.require_clean_tree_before_run);
 }
 
 fn extract_marked_yaml<'a>(doc: &'a str, marker: &str) -> &'a str {
