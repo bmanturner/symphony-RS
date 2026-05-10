@@ -67,6 +67,24 @@ pub enum StateError {
         /// The name supplied by the current binary.
         supplied_name: String,
     },
+
+    /// A typed run-status update was requested with a `(from, to)` pair
+    /// that is not allowed by `RunStatus::valid_transition`, or the
+    /// stored label could not be parsed as a known `RunStatus`.
+    ///
+    /// The `from` and `to` fields are stored as `String` rather than
+    /// `RunStatus` because this crate's error type is shared by call
+    /// sites that may not have a typed value in hand (e.g. an
+    /// unparseable legacy label coming back from SQLite). The kernel
+    /// `RunStatus` lives in `symphony-core`; the typed update API
+    /// converts before constructing the error.
+    #[error("invalid run status transition: {from} -> {to}")]
+    InvalidRunTransition {
+        /// The status currently recorded on the row, as a string.
+        from: String,
+        /// The status the caller attempted to transition to, as a string.
+        to: String,
+    },
 }
 
 /// Convenience result alias for the state crate.
@@ -378,5 +396,35 @@ mod tests {
             .expect("row");
         assert_eq!(label, "hello");
         assert_eq!(size, 7);
+    }
+
+    #[test]
+    fn invalid_run_transition_renders_expected_message() {
+        let err = StateError::InvalidRunTransition {
+            from: "completed".into(),
+            to: "running".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid run status transition: completed -> running"
+        );
+    }
+
+    #[test]
+    fn invalid_run_transition_debug_carries_fields() {
+        let err = StateError::InvalidRunTransition {
+            from: "queued".into(),
+            to: "completed".into(),
+        };
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("InvalidRunTransition"),
+            "debug must name the variant: {debug}"
+        );
+        assert!(debug.contains("queued"), "debug must include from: {debug}");
+        assert!(
+            debug.contains("completed"),
+            "debug must include to: {debug}"
+        );
     }
 }
