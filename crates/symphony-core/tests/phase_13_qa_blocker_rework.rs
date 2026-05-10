@@ -10,13 +10,13 @@ use std::path::PathBuf;
 use symphony_core::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, BlockerId, BlockerReworkInput,
     BlockerSeverity, BlockerStatus, BranchOrWorkspace, ChildKey, ChildProposal, ChildSnapshot,
-    DecompositionId, DecompositionProposal, FollowupPolicy, GateOperation, Handoff,
-    HandoffBlockerRequest, IntegrationChild, IntegrationGates, IntegrationId,
-    IntegrationMergeStrategy, IntegrationRecord, IntegrationRequestCause, IntegrationRunRequest,
-    IntegrationStatus, IntegrationWorkspace, OpenBlockerSnapshot, PullRequestProvider,
-    PullRequestRecord, PullRequestRecordId, PullRequestState, QaBlockerPolicy, QaBlockerSnapshot,
-    QaDraftPullRequest, QaEvidence, QaOutcome, QaRequestCause, QaReworkDecision, QaRunRequest,
-    QaVerdict, QaVerdictId, QaWorkspace, ReadyFor, RoleName, RunRef, WorkItemId,
+    DecompositionId, DecompositionProposal, DependencyApplicationEvidence, FollowupPolicy,
+    GateOperation, Handoff, HandoffBlockerRequest, IntegrationChild, IntegrationGates,
+    IntegrationId, IntegrationMergeStrategy, IntegrationRecord, IntegrationRequestCause,
+    IntegrationRunRequest, IntegrationStatus, IntegrationWorkspace, OpenBlockerSnapshot,
+    PullRequestProvider, PullRequestRecord, PullRequestRecordId, PullRequestState, QaBlockerPolicy,
+    QaBlockerSnapshot, QaDraftPullRequest, QaEvidence, QaOutcome, QaRequestCause, QaReworkDecision,
+    QaRunRequest, QaVerdict, QaVerdictId, QaWorkspace, ReadyFor, RoleName, RunRef, WorkItemId,
     WorkItemStatusClass, check_no_open_blockers, check_parent_can_close,
     check_qa_blockers_at_parent_close, collect_open, derive_qa_blockers, derive_qa_rework_routing,
 };
@@ -259,10 +259,13 @@ fn qa_files_blocker_routes_specialist_rework_integration_reruns_and_qa_passes() 
     )
     .expect("integration owner can decompose broad parent");
     proposal
-        .mark_applied(HashMap::from([
-            (ChildKey::new("api"), WorkItemId::new(CHILD_API)),
-            (ChildKey::new("cli"), WorkItemId::new(CHILD_CLI)),
-        ]))
+        .mark_applied(
+            HashMap::from([
+                (ChildKey::new("api"), WorkItemId::new(CHILD_API)),
+                (ChildKey::new("cli"), WorkItemId::new(CHILD_CLI)),
+            ]),
+            DependencyApplicationEvidence::none_required(),
+        )
         .expect("child issues are durable");
 
     let first_children = vec![

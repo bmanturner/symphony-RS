@@ -9,16 +9,16 @@ use std::path::PathBuf;
 
 use symphony_core::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, BranchOrWorkspace, ChildKey,
-    ChildProposal, ChildSnapshot, DecompositionId, DecompositionProposal, FollowupId,
-    FollowupPolicy, FollowupRequestInput, FollowupRouteDecision, FollowupStatus, Handoff,
-    HandoffFollowupRequest, IntegrationChild, IntegrationGates, IntegrationId,
-    IntegrationMergeStrategy, IntegrationRecord, IntegrationRequestCause, IntegrationRunRequest,
-    IntegrationStatus, IntegrationWorkspace, PullRequestProvider, PullRequestRecord,
-    PullRequestRecordId, PullRequestState, QaDraftPullRequest, QaEvidence, QaOutcome,
-    QaRequestCause, QaRunRequest, QaVerdict, QaVerdictId, QaWorkspace, ReadyFor, RoleAuthority,
-    RoleKind, RoleName, RunRef, WorkItemId, WorkItemStatusClass,
-    check_blocking_followups_at_parent_close, check_parent_can_close, derive_followups,
-    route_followup,
+    ChildProposal, ChildSnapshot, DecompositionId, DecompositionProposal,
+    DependencyApplicationEvidence, FollowupId, FollowupPolicy, FollowupRequestInput,
+    FollowupRouteDecision, FollowupStatus, Handoff, HandoffFollowupRequest, IntegrationChild,
+    IntegrationGates, IntegrationId, IntegrationMergeStrategy, IntegrationRecord,
+    IntegrationRequestCause, IntegrationRunRequest, IntegrationStatus, IntegrationWorkspace,
+    PullRequestProvider, PullRequestRecord, PullRequestRecordId, PullRequestState,
+    QaDraftPullRequest, QaEvidence, QaOutcome, QaRequestCause, QaRunRequest, QaVerdict,
+    QaVerdictId, QaWorkspace, ReadyFor, RoleAuthority, RoleKind, RoleName, RunRef, WorkItemId,
+    WorkItemStatusClass, check_blocking_followups_at_parent_close, check_parent_can_close,
+    derive_followups, route_followup,
 };
 
 const PARENT: i64 = 920;
@@ -187,10 +187,10 @@ fn specialist_non_blocking_followup_is_linked_while_current_work_reaches_done() 
     )
     .expect("integration owner can decompose parent");
     proposal
-        .mark_applied(HashMap::from([(
-            ChildKey::new("backend"),
-            WorkItemId::new(CHILD),
-        )]))
+        .mark_applied(
+            HashMap::from([(ChildKey::new("backend"), WorkItemId::new(CHILD))]),
+            DependencyApplicationEvidence::none_required(),
+        )
         .expect("child issue is durable");
 
     let followup_request = HandoffFollowupRequest {

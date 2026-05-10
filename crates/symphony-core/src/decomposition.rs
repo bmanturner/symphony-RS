@@ -272,6 +272,50 @@ pub enum DecompositionError {
         /// The child whose tracker id was missing.
         key: ChildKey,
     },
+    /// [`DecompositionProposal::mark_applied`] was called before every
+    /// proposal-local `depends_on` edge had a durable `blocks` edge.
+    #[error("decomposition cannot be applied: expected {expected} dependency edges, got {actual}")]
+    MissingDependencyEdges {
+        /// Number of durable dependency edges required by the proposal.
+        expected: usize,
+        /// Number of durable dependency edges the caller proved.
+        actual: usize,
+    },
+    /// The workflow requires tracker-side blocker sync, but the caller
+    /// has not recorded sync state for every dependency edge yet.
+    #[error(
+        "decomposition cannot be applied: expected {expected} tracker sync records, got {actual}"
+    )]
+    MissingTrackerSyncState {
+        /// Number of tracker sync records required.
+        expected: usize,
+        /// Number of tracker sync records the caller proved.
+        actual: usize,
+    },
+}
+
+/// Evidence that the state/tracker dependency bridge has completed
+/// enough work for a proposal to move to [`DecompositionStatus::Applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyApplicationEvidence {
+    /// Durable local `blocks` edges materialized from `depends_on`.
+    pub persisted_edge_count: usize,
+    /// Whether workflow policy requires tracker sync state before the
+    /// proposal may become fully applied.
+    pub tracker_sync_required: bool,
+    /// Number of dependency edges with recorded tracker sync state.
+    pub tracker_sync_record_count: usize,
+}
+
+impl DependencyApplicationEvidence {
+    /// Evidence for proposals with no dependency edges.
+    pub const fn none_required() -> Self {
+        Self {
+            persisted_edge_count: 0,
+            tracker_sync_required: false,
+            tracker_sync_record_count: 0,
+        }
+    }
 }
 
 /// One entry in a [`DecompositionProposal`].
@@ -576,11 +620,15 @@ impl DecompositionProposal {
 
     /// Mark an approved proposal as applied. `created_ids` maps every
     /// [`ChildKey`] to the tracker [`WorkItemId`] the integration loop
-    /// produced; missing keys cause an error so partial applies do not
-    /// silently corrupt the parent/child edge set.
+    /// produced; `dependency_evidence` proves the `depends_on` graph has
+    /// become durable local `blocks` edges and, when workflow policy
+    /// requires it, has recorded tracker-sync state. Missing evidence
+    /// keeps the proposal non-terminal so partial applies do not
+    /// silently corrupt dispatch truth.
     pub fn mark_applied(
         &mut self,
         created_ids: HashMap<ChildKey, WorkItemId>,
+        dependency_evidence: DependencyApplicationEvidence,
     ) -> Result<(), DecompositionError> {
         if self.status != DecompositionStatus::Approved {
             return Err(DecompositionError::InvalidTransition {
@@ -601,6 +649,25 @@ impl DecompositionProposal {
                     parent: self.parent,
                 });
             }
+        }
+        let expected_dependency_edges: usize = self
+            .children
+            .iter()
+            .map(|child| child.depends_on.len())
+            .sum();
+        if dependency_evidence.persisted_edge_count != expected_dependency_edges {
+            return Err(DecompositionError::MissingDependencyEdges {
+                expected: expected_dependency_edges,
+                actual: dependency_evidence.persisted_edge_count,
+            });
+        }
+        if dependency_evidence.tracker_sync_required
+            && dependency_evidence.tracker_sync_record_count != expected_dependency_edges
+        {
+            return Err(DecompositionError::MissingTrackerSyncState {
+                expected: expected_dependency_edges,
+                actual: dependency_evidence.tracker_sync_record_count,
+            });
         }
         for child in &mut self.children {
             child.created_issue_id = created_ids.get(&child.key).copied();
@@ -865,7 +932,15 @@ mod tests {
         let mut ids = HashMap::new();
         ids.insert(ChildKey::new("a"), WorkItemId::new(101));
         ids.insert(ChildKey::new("b"), WorkItemId::new(102));
-        p.mark_applied(ids).unwrap();
+        p.mark_applied(
+            ids,
+            DependencyApplicationEvidence {
+                persisted_edge_count: 1,
+                tracker_sync_required: false,
+                tracker_sync_record_count: 0,
+            },
+        )
+        .unwrap();
         assert_eq!(p.status, DecompositionStatus::Applied);
         assert_eq!(
             p.child(&ChildKey::new("a")).unwrap().created_issue_id,
@@ -886,7 +961,9 @@ mod tests {
         .unwrap();
         let mut ids = HashMap::new();
         ids.insert(ChildKey::new("a"), WorkItemId::new(101));
-        let err = p.mark_applied(ids).unwrap_err();
+        let err = p
+            .mark_applied(ids, DependencyApplicationEvidence::none_required())
+            .unwrap_err();
         assert!(matches!(err, DecompositionError::MissingCreatedId { .. }));
     }
 
@@ -903,8 +980,72 @@ mod tests {
         .unwrap();
         let mut ids = HashMap::new();
         ids.insert(ChildKey::new("a"), WorkItemId::new(100));
-        let err = p.mark_applied(ids).unwrap_err();
+        let err = p
+            .mark_applied(ids, DependencyApplicationEvidence::none_required())
+            .unwrap_err();
         assert!(matches!(err, DecompositionError::ChildIsParent { .. }));
+    }
+
+    #[test]
+    fn mark_applied_rejects_missing_dependency_edge_evidence() {
+        let mut p = DecompositionProposal::try_new(
+            DecompositionId::new(1),
+            WorkItemId::new(100),
+            RoleName::new("platform_lead"),
+            "x",
+            vec![child("a", &[], &["c"]), child("b", &["a"], &["c"])],
+            FollowupPolicy::CreateDirectly,
+        )
+        .unwrap();
+        let err = p
+            .mark_applied(
+                HashMap::from([
+                    (ChildKey::new("a"), WorkItemId::new(101)),
+                    (ChildKey::new("b"), WorkItemId::new(102)),
+                ]),
+                DependencyApplicationEvidence::none_required(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DecompositionError::MissingDependencyEdges {
+                expected: 1,
+                actual: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_applied_rejects_missing_required_tracker_sync_evidence() {
+        let mut p = DecompositionProposal::try_new(
+            DecompositionId::new(1),
+            WorkItemId::new(100),
+            RoleName::new("platform_lead"),
+            "x",
+            vec![child("a", &[], &["c"]), child("b", &["a"], &["c"])],
+            FollowupPolicy::CreateDirectly,
+        )
+        .unwrap();
+        let err = p
+            .mark_applied(
+                HashMap::from([
+                    (ChildKey::new("a"), WorkItemId::new(101)),
+                    (ChildKey::new("b"), WorkItemId::new(102)),
+                ]),
+                DependencyApplicationEvidence {
+                    persisted_edge_count: 1,
+                    tracker_sync_required: true,
+                    tracker_sync_record_count: 0,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DecompositionError::MissingTrackerSyncState {
+                expected: 1,
+                actual: 0
+            }
+        ));
     }
 
     #[test]

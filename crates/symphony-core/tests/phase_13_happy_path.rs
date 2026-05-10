@@ -12,13 +12,13 @@ use std::path::PathBuf;
 use symphony_core::{
     AcceptanceCriterionStatus, AcceptanceCriterionTrace, BranchOrWorkspace, ChildKey,
     ChildProposal, ChildSnapshot, DecompositionId, DecompositionProposal, DecompositionStatus,
-    FollowupPolicy, GateOperation, Handoff, IntegrationChild, IntegrationGates, IntegrationId,
-    IntegrationMergeStrategy, IntegrationRecord, IntegrationRequestCause, IntegrationRunRequest,
-    IntegrationStatus, IntegrationWorkspace, PullRequestProvider, PullRequestRecord,
-    PullRequestRecordId, PullRequestState, QaDraftPullRequest, QaEvidence, QaOutcome,
-    QaRequestCause, QaRunRequest, QaVerdict, QaVerdictId, QaWorkspace, ReadyFor, RoleName, RunRef,
-    WorkItemId, WorkItemStatusClass, check_no_open_blockers, check_parent_can_close,
-    check_qa_blockers_at_parent_close,
+    DependencyApplicationEvidence, FollowupPolicy, GateOperation, Handoff, IntegrationChild,
+    IntegrationGates, IntegrationId, IntegrationMergeStrategy, IntegrationRecord,
+    IntegrationRequestCause, IntegrationRunRequest, IntegrationStatus, IntegrationWorkspace,
+    PullRequestProvider, PullRequestRecord, PullRequestRecordId, PullRequestState,
+    QaDraftPullRequest, QaEvidence, QaOutcome, QaRequestCause, QaRunRequest, QaVerdict,
+    QaVerdictId, QaWorkspace, ReadyFor, RoleName, RunRef, WorkItemId, WorkItemStatusClass,
+    check_no_open_blockers, check_parent_can_close, check_qa_blockers_at_parent_close,
 };
 
 const PARENT: i64 = 42;
@@ -120,10 +120,13 @@ fn broad_parent_decomposes_integrates_opens_pr_passes_qa_marks_ready_and_closes(
     assert_eq!(proposal.roots().len(), 2);
 
     proposal
-        .mark_applied(HashMap::from([
-            (ChildKey::new("backend"), WorkItemId::new(CHILD_BACKEND)),
-            (ChildKey::new("operator"), WorkItemId::new(CHILD_UI)),
-        ]))
+        .mark_applied(
+            HashMap::from([
+                (ChildKey::new("backend"), WorkItemId::new(CHILD_BACKEND)),
+                (ChildKey::new("operator"), WorkItemId::new(CHILD_UI)),
+            ]),
+            DependencyApplicationEvidence::none_required(),
+        )
         .expect("all proposed children get durable tracker ids");
     assert_eq!(proposal.status, DecompositionStatus::Applied);
 

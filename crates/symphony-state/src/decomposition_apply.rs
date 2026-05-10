@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 
-use symphony_core::decomposition::{ChildKey, DecompositionProposal, DecompositionStatus};
+use symphony_core::decomposition::{
+    ChildKey, DecompositionProposal, DecompositionStatus, DependencyApplicationEvidence,
+};
 use symphony_core::decomposition_applier::{AppliedChild, AppliedDecomposition};
 use symphony_core::work_item::WorkItemStatusClass;
 
@@ -52,6 +54,18 @@ impl PersistedAppliedDecomposition {
                 )
             })
             .collect()
+    }
+
+    /// Evidence required by [`DecompositionProposal::mark_applied`] once
+    /// local dependency materialization has succeeded. Tracker sync is
+    /// not required by this Phase 3 persistence helper; Phase 4's sync
+    /// path can build stricter evidence after recording mirror state.
+    pub fn local_dependency_evidence(&self) -> DependencyApplicationEvidence {
+        DependencyApplicationEvidence {
+            persisted_edge_count: self.dependency_edges.len(),
+            tracker_sync_required: false,
+            tracker_sync_record_count: 0,
+        }
     }
 }
 

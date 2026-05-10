@@ -110,7 +110,7 @@ pub use concurrency_gate::{
 };
 pub use decomposition::{
     ChildKey, ChildProposal, DecompositionError, DecompositionId, DecompositionProposal,
-    DecompositionStatus,
+    DecompositionStatus, DependencyApplicationEvidence,
 };
 pub use decomposition_applier::{
     AppliedChild, AppliedDecomposition, ApplyError, DecompositionApplier,

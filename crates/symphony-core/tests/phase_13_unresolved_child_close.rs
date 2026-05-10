@@ -10,10 +10,10 @@ use std::path::PathBuf;
 
 use symphony_core::{
     BranchOrWorkspace, ChildKey, ChildProposal, ChildSnapshot, DecompositionId,
-    DecompositionProposal, FollowupPolicy, Handoff, IntegrationChild, IntegrationGates,
-    IntegrationMergeStrategy, IntegrationRequestCause, IntegrationRequestError,
-    IntegrationRunRequest, IntegrationWorkspace, ParentCloseError, ReadyFor, RoleName, WorkItemId,
-    WorkItemStatusClass, check_parent_can_close,
+    DecompositionProposal, DependencyApplicationEvidence, FollowupPolicy, Handoff,
+    IntegrationChild, IntegrationGates, IntegrationMergeStrategy, IntegrationRequestCause,
+    IntegrationRequestError, IntegrationRunRequest, IntegrationWorkspace, ParentCloseError,
+    ReadyFor, RoleName, WorkItemId, WorkItemStatusClass, check_parent_can_close,
 };
 
 const PARENT: i64 = 1_300;
@@ -106,10 +106,13 @@ fn integration_owner_cannot_close_parent_with_unresolved_required_child() {
     )
     .expect("integration owner can decompose broad parent");
     proposal
-        .mark_applied(HashMap::from([
-            (ChildKey::new("api"), WorkItemId::new(CHILD_API)),
-            (ChildKey::new("cli"), WorkItemId::new(CHILD_CLI)),
-        ]))
+        .mark_applied(
+            HashMap::from([
+                (ChildKey::new("api"), WorkItemId::new(CHILD_API)),
+                (ChildKey::new("cli"), WorkItemId::new(CHILD_CLI)),
+            ]),
+            DependencyApplicationEvidence::none_required(),
+        )
         .expect("child issues are durable");
 
     let integration_err = IntegrationRunRequest::try_new(
