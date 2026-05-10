@@ -12,7 +12,9 @@ use symphony_core::decomposition::{ChildKey, DecompositionProposal, Decompositio
 use symphony_core::decomposition_applier::{AppliedChild, AppliedDecomposition};
 use symphony_core::work_item::WorkItemStatusClass;
 
-use crate::edges::{EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge};
+use crate::edges::{
+    EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge, WorkItemEdgeRecord,
+};
 use crate::repository::{NewWorkItem, WorkItemId, WorkItemRecord};
 use crate::{StateDb, StateError, StateResult};
 
@@ -30,6 +32,10 @@ pub struct PersistedAppliedChild {
 pub struct PersistedAppliedDecomposition {
     /// Persisted children in proposal declaration order.
     pub children: Vec<PersistedAppliedChild>,
+    /// Local open `blocks` edges materialized from
+    /// [`symphony_core::decomposition::ChildProposal::depends_on`] in
+    /// dependency declaration order.
+    pub dependency_edges: Vec<WorkItemEdgeRecord>,
 }
 
 impl PersistedAppliedDecomposition {
@@ -149,10 +155,11 @@ pub fn persist_applied_decomposition(
                 },
             )
             .collect();
-        tx.create_decomposition_blocker_edges(&blocker_edges)?;
+        let dependency_edges = tx.create_decomposition_blocker_edges(&blocker_edges)?;
 
         Ok(PersistedAppliedDecomposition {
             children: persisted,
+            dependency_edges,
         })
     })
 }
@@ -288,6 +295,42 @@ mod tests {
         let c = WorkItemId(ids[&ChildKey::new("C")].get());
         assert_eq!(db.list_incoming_open_blockers(b).unwrap().len(), 1);
         assert_eq!(db.list_incoming_open_blockers(c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn materializes_each_depends_on_as_a_local_open_blocks_edge() {
+        let mut db = open();
+        let parent = seed_parent(&mut db);
+        let proposal = proposal(parent);
+
+        let persisted =
+            persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
+                .expect("persist");
+        let ids = persisted.child_work_item_ids();
+        let a = WorkItemId(ids[&ChildKey::new("A")].get());
+        let b = WorkItemId(ids[&ChildKey::new("B")].get());
+        let c = WorkItemId(ids[&ChildKey::new("C")].get());
+
+        assert_eq!(persisted.dependency_edges.len(), 2);
+        assert_eq!(persisted.dependency_edges[0].parent_id, a);
+        assert_eq!(persisted.dependency_edges[0].child_id, b);
+        assert_eq!(persisted.dependency_edges[0].edge_type, EdgeType::Blocks);
+        assert_eq!(persisted.dependency_edges[0].status, "open");
+        assert_eq!(
+            persisted.dependency_edges[0].source,
+            EdgeSource::Decomposition
+        );
+        assert_eq!(
+            persisted.dependency_edges[0].reason.as_deref(),
+            Some("B depends on A")
+        );
+
+        assert_eq!(persisted.dependency_edges[1].parent_id, b);
+        assert_eq!(persisted.dependency_edges[1].child_id, c);
+        assert_eq!(
+            persisted.dependency_edges[1].reason.as_deref(),
+            Some("C depends on B")
+        );
     }
 
     #[test]

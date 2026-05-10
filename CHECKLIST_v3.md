@@ -32,7 +32,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 3 — Decomposition Application
 
 - [x] Extend decomposition application orchestration to persist `parent_child` edges and child `work_items` before materializing dependency `blocks` edges.
-- [ ] For each `ChildProposal.depends_on`, resolve both `ChildKey`s to created child `WorkItemId`s and create a local open `blocks` edge.
+- [x] For each `ChildProposal.depends_on`, resolve both `ChildKey`s to created child `WorkItemId`s and create a local open `blocks` edge.
 - [ ] Preserve partial child creation state when child creation succeeds but dependency materialization fails.
 - [ ] Prevent a decomposition proposal from being marked fully applied until dependency edges are persisted and, when required, tracker sync state is recorded.
 - [ ] Add tests for successful `A -> B -> C` child creation plus local `blocks` edge materialization.
