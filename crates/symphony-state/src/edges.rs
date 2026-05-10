@@ -251,6 +251,18 @@ pub trait WorkItemEdgeRepository {
         blocked: WorkItemId,
     ) -> StateResult<Vec<WorkItemEdgeRecord>>;
 
+    /// List decomposition-sourced open `Blocks` edges whose blocker
+    /// work item (`parent_id`) is already terminal.
+    ///
+    /// This is the reconciliation primitive for v3 dependency
+    /// auto-resolution. It deliberately filters to
+    /// `source = decomposition` so QA, follow-up, and human blockers do
+    /// not clear merely because their blocker work item reached a
+    /// terminal status class.
+    fn list_decomposition_blockers_with_terminal_blocker(
+        &self,
+    ) -> StateResult<Vec<WorkItemEdgeRecord>>;
+
     /// Return all `Blocks` edges in `open` status that gate `target` —
     /// either directly (`child_id = target`) or transitively via
     /// `ParentChild` descendants of `target`.
@@ -438,6 +450,28 @@ pub(crate) fn list_incoming_open_blockers_in(
     Ok(out)
 }
 
+pub(crate) fn list_decomposition_blockers_with_terminal_blocker_in(
+    conn: &Connection,
+) -> StateResult<Vec<WorkItemEdgeRecord>> {
+    let sql = "SELECT e.id, e.parent_id, e.child_id, e.edge_type, e.reason, e.status, e.source, \
+                e.tracker_edge_id, e.tracker_sync_status, e.tracker_sync_last_error, \
+                e.tracker_sync_attempts, e.tracker_sync_last_attempt_at, e.created_at \
+           FROM work_item_edges e \
+           JOIN work_items blocker ON blocker.id = e.parent_id \
+          WHERE e.edge_type = 'blocks' \
+            AND e.status = 'open' \
+            AND e.source = 'decomposition' \
+            AND lower(blocker.status_class) IN ('done', 'cancelled') \
+          ORDER BY e.id ASC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], map_edge)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn list_open_blockers_for_subtree_in(
     conn: &Connection,
     target: WorkItemId,
@@ -511,6 +545,12 @@ impl WorkItemEdgeRepository for StateDb {
         list_incoming_open_blockers_in(self.conn(), blocked)
     }
 
+    fn list_decomposition_blockers_with_terminal_blocker(
+        &self,
+    ) -> StateResult<Vec<WorkItemEdgeRecord>> {
+        list_decomposition_blockers_with_terminal_blocker_in(self.conn())
+    }
+
     fn list_open_blockers_for_subtree(
         &self,
         target: WorkItemId,
@@ -559,12 +599,16 @@ mod tests {
     }
 
     fn seed_item(db: &mut StateDb, identifier: &str) -> WorkItemId {
+        seed_item_with_status(db, identifier, "ready")
+    }
+
+    fn seed_item_with_status(db: &mut StateDb, identifier: &str, status_class: &str) -> WorkItemId {
         db.create_work_item(NewWorkItem {
             tracker_id: "github",
             identifier,
             parent_id: None,
             title: "demo",
-            status_class: "ready",
+            status_class,
             tracker_status: "open",
             assigned_role: None,
             assigned_agent: None,
@@ -936,7 +980,7 @@ mod tests {
                 Some("schema before api"),
             ))
             .unwrap();
-        let _resolved = db
+        let _other_edge_kind = db
             .create_edge(new_edge(
                 blocker_b,
                 blocked,
@@ -973,6 +1017,123 @@ mod tests {
         assert_eq!(blockers[0].child_id, blocked);
         assert_eq!(blockers[0].edge_type, EdgeType::Blocks);
         assert_eq!(blockers[0].status, "open");
+    }
+
+    #[test]
+    fn list_decomposition_blockers_with_terminal_blocker_returns_auto_resolvable_edges() {
+        let mut db = open();
+        let done_schema = seed_item_with_status(&mut db, "ENG-1", "done");
+        let cancelled_backend = seed_item_with_status(&mut db, "ENG-2", "cancelled");
+        let running_api = seed_item(&mut db, "ENG-3");
+        let waiting_ui = seed_item(&mut db, "ENG-4");
+
+        let edge_a = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: done_schema,
+                child_id: running_api,
+                edge_type: EdgeType::Blocks,
+                reason: Some("api depends on schema"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:00Z",
+            })
+            .unwrap();
+        let edge_b = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: cancelled_backend,
+                child_id: waiting_ui,
+                edge_type: EdgeType::Blocks,
+                reason: Some("ui depends on backend"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:01Z",
+            })
+            .unwrap();
+
+        let edges = db
+            .list_decomposition_blockers_with_terminal_blocker()
+            .unwrap();
+
+        assert_eq!(
+            edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+            vec![edge_a.id, edge_b.id]
+        );
+        assert_eq!(edges[0].parent_id, done_schema);
+        assert_eq!(edges[0].child_id, running_api);
+    }
+
+    #[test]
+    fn list_decomposition_blockers_with_terminal_blocker_filters_non_auto_resolvable_edges() {
+        let mut db = open();
+        let done = seed_item_with_status(&mut db, "ENG-1", "DONE");
+        let running = seed_item(&mut db, "ENG-2");
+        let blocked_a = seed_item(&mut db, "ENG-3");
+        let blocked_b = seed_item(&mut db, "ENG-4");
+        let blocked_c = seed_item(&mut db, "ENG-5");
+
+        let eligible = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: done,
+                child_id: blocked_a,
+                edge_type: EdgeType::Blocks,
+                reason: Some("api depends on schema"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:00Z",
+            })
+            .unwrap();
+        let _non_terminal_blocker = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: running,
+                child_id: blocked_b,
+                edge_type: EdgeType::Blocks,
+                reason: Some("ui depends on api"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:01Z",
+            })
+            .unwrap();
+        let _resolved = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: done,
+                child_id: blocked_b,
+                edge_type: EdgeType::RelatesTo,
+                reason: Some("not a blocker"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:02Z",
+            })
+            .unwrap();
+        let _qa_blocker = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: done,
+                child_id: blocked_c,
+                edge_type: EdgeType::Blocks,
+                reason: Some("qa found a defect"),
+                status: "open",
+                source: EdgeSource::Qa,
+                now: "2026-05-08T00:00:03Z",
+            })
+            .unwrap();
+
+        db.update_edge_status(eligible.id, "resolved").unwrap();
+        let _other_followup_kind = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: done,
+                child_id: blocked_a,
+                edge_type: EdgeType::FollowupOf,
+                reason: Some("different kind allowed"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:04Z",
+            })
+            .unwrap();
+
+        assert!(
+            db.list_decomposition_blockers_with_terminal_blocker()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
