@@ -407,11 +407,94 @@ const V2_QA_VERDICT_AUTHORSHIP: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 4] = [
+/// Adds a CHECK constraint to `runs.status` covering the six SPEC v2 §4.5
+/// run-status labels (`queued`, `running`, `completed`, `failed`,
+/// `cancelled`, `cancel_requested`) and backfills any rows whose stored
+/// label predates the canonical vocabulary.
+///
+/// Backfill rules:
+///
+/// * `'succeeded'` — the legacy alias for the terminal-success state — is
+///   rewritten to `'completed'` so it survives the new CHECK.
+/// * Any other out-of-set value is rewritten to `'failed'` defensively.
+///   The kernel never produced such labels, but a tampered or
+///   externally-edited DB should still load instead of refusing every
+///   subsequent migration.
+///
+/// SQLite cannot add a CHECK to an existing column in place. The migration
+/// follows the documented "12-step" recreate pattern: build a new table
+/// with the constraint, copy every row, drop the old table, rename the
+/// new table, and reinstate every index from `V2_INITIAL_SCHEMA` (the
+/// `idx_runs_lease` partial index in particular is load-bearing for
+/// `RunRepository::find_expired_leases`). `PRAGMA defer_foreign_keys = ON`
+/// is set inside the migration so inbound FKs from `handoffs`,
+/// `qa_verdicts`, `events`, `integration_records`, and
+/// `pull_request_records` survive the table swap and are re-checked at
+/// COMMIT.
+const V2_RUNS_STATUS_CHECK: Migration = Migration {
+    version: 2_026_050_805,
+    name: "v2_runs_status_check",
+    sql: r#"
+        PRAGMA defer_foreign_keys = ON;
+
+        UPDATE runs SET status = 'completed' WHERE status = 'succeeded';
+        UPDATE runs SET status = 'failed'
+            WHERE status NOT IN
+                ('queued', 'running', 'completed', 'failed',
+                 'cancelled', 'cancel_requested');
+
+        CREATE TABLE runs_new (
+            id                   INTEGER PRIMARY KEY,
+            work_item_id         INTEGER NOT NULL
+                REFERENCES work_items(id) ON DELETE CASCADE,
+            role                 TEXT    NOT NULL,
+            agent                TEXT    NOT NULL,
+            status               TEXT    NOT NULL
+                CHECK (status IN
+                    ('queued', 'running', 'completed', 'failed',
+                     'cancelled', 'cancel_requested')),
+            workspace_claim_id   INTEGER
+                REFERENCES workspace_claims(id) ON DELETE SET NULL,
+            lease_owner          TEXT,
+            lease_expires_at     TEXT,
+            started_at           TEXT,
+            ended_at             TEXT,
+            cost                 REAL,
+            tokens               INTEGER,
+            result_summary       TEXT,
+            error                TEXT,
+            created_at           TEXT    NOT NULL
+        );
+
+        INSERT INTO runs_new
+            (id, work_item_id, role, agent, status, workspace_claim_id,
+             lease_owner, lease_expires_at, started_at, ended_at,
+             cost, tokens, result_summary, error, created_at)
+        SELECT
+            id, work_item_id, role, agent, status, workspace_claim_id,
+            lease_owner, lease_expires_at, started_at, ended_at,
+            cost, tokens, result_summary, error, created_at
+        FROM runs;
+
+        DROP TABLE runs;
+        ALTER TABLE runs_new RENAME TO runs;
+
+        CREATE INDEX idx_runs_work_item
+            ON runs(work_item_id);
+        CREATE INDEX idx_runs_status
+            ON runs(status);
+        CREATE INDEX idx_runs_lease
+            ON runs(lease_expires_at)
+            WHERE lease_expires_at IS NOT NULL;
+    "#,
+};
+
+const MIGRATIONS: [Migration; 5] = [
     V2_INITIAL_SCHEMA,
     V2_INTEGRATION_RECORDS,
     V2_PULL_REQUEST_RECORDS,
     V2_QA_VERDICT_AUTHORSHIP,
+    V2_RUNS_STATUS_CHECK,
 ];
 
 #[cfg(test)]
@@ -462,7 +545,13 @@ mod tests {
         let db = open_migrated();
         assert_eq!(
             db.applied_versions().unwrap(),
-            vec![2_026_050_801, 2_026_050_802, 2_026_050_803, 2_026_050_804,]
+            vec![
+                2_026_050_801,
+                2_026_050_802,
+                2_026_050_803,
+                2_026_050_804,
+                2_026_050_805,
+            ]
         );
     }
 
@@ -473,13 +562,25 @@ mod tests {
         let second = db.migrate(migrations()).expect("second apply");
         assert_eq!(
             first.applied,
-            vec![2_026_050_801, 2_026_050_802, 2_026_050_803, 2_026_050_804,]
+            vec![
+                2_026_050_801,
+                2_026_050_802,
+                2_026_050_803,
+                2_026_050_804,
+                2_026_050_805,
+            ]
         );
         assert!(first.skipped.is_empty());
         assert!(second.applied.is_empty());
         assert_eq!(
             second.skipped,
-            vec![2_026_050_801, 2_026_050_802, 2_026_050_803, 2_026_050_804,]
+            vec![
+                2_026_050_801,
+                2_026_050_802,
+                2_026_050_803,
+                2_026_050_804,
+                2_026_050_805,
+            ]
         );
     }
 
@@ -825,5 +926,178 @@ mod tests {
             params![wi],
         );
         assert!(err.is_err(), "CHECK should reject unknown budget status");
+    }
+
+    /// Apply only the schemas that predate `V2_RUNS_STATUS_CHECK` so tests
+    /// can stage rows under the legacy (no-CHECK) `runs.status` shape and
+    /// then run the new migration on top.
+    fn open_pre_runs_status_check() -> StateDb {
+        let mut db = StateDb::open_in_memory().expect("open in-memory db");
+        db.migrate(&[
+            V2_INITIAL_SCHEMA,
+            V2_INTEGRATION_RECORDS,
+            V2_PULL_REQUEST_RECORDS,
+            V2_QA_VERDICT_AUTHORSHIP,
+        ])
+        .expect("apply pre-CHECK migrations");
+        db
+    }
+
+    fn run_status(db: &StateDb, run_id: i64) -> String {
+        db.conn()
+            .query_row(
+                "SELECT status FROM runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .expect("read runs.status")
+    }
+
+    #[test]
+    fn runs_status_check_accepts_every_spec_label() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        for (idx, label) in [
+            "queued",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "cancel_requested",
+        ]
+        .iter()
+        .enumerate()
+        {
+            db.conn()
+                .execute(
+                    "INSERT INTO runs
+                        (id, work_item_id, role, agent, status, created_at)
+                     VALUES (?1, ?2, 'specialist', 'codex', ?3,
+                             '2026-05-08T00:00:00Z')",
+                    params![idx as i64 + 1, wi, label],
+                )
+                .unwrap_or_else(|err| panic!("CHECK should accept run status `{label}`: {err}"));
+        }
+    }
+
+    #[test]
+    fn runs_status_check_rejects_unknown_label() {
+        let db = open_migrated();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        let err = db.conn().execute(
+            "INSERT INTO runs
+                (work_item_id, role, agent, status, created_at)
+             VALUES (?1, 'specialist', 'codex', 'succeeded',
+                     '2026-05-08T00:00:00Z')",
+            params![wi],
+        );
+        assert!(
+            err.is_err(),
+            "CHECK should reject the legacy `succeeded` label after migration"
+        );
+    }
+
+    #[test]
+    fn runs_status_check_backfills_legacy_succeeded_to_completed() {
+        let mut db = open_pre_runs_status_check();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO runs
+                    (id, work_item_id, role, agent, status,
+                     lease_owner, lease_expires_at, created_at)
+                 VALUES (1, ?1, 'specialist', 'codex', 'succeeded',
+                         'host/sched/0', '2026-05-08T00:01:00Z',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("seed legacy succeeded run");
+
+        db.migrate(&[V2_RUNS_STATUS_CHECK])
+            .expect("apply runs status CHECK migration");
+
+        assert_eq!(run_status(&db, 1), "completed");
+        let (work_item_id, role, agent, lease_owner, lease_expires_at): (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = db
+            .conn()
+            .query_row(
+                "SELECT work_item_id, role, agent, lease_owner, lease_expires_at
+                   FROM runs WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read back row");
+        assert_eq!(work_item_id, wi);
+        assert_eq!(role, "specialist");
+        assert_eq!(agent, "codex");
+        assert_eq!(lease_owner.as_deref(), Some("host/sched/0"));
+        assert_eq!(lease_expires_at.as_deref(), Some("2026-05-08T00:01:00Z"));
+    }
+
+    #[test]
+    fn runs_status_check_backfills_unknown_label_to_failed() {
+        let mut db = open_pre_runs_status_check();
+        let wi = insert_work_item(&db, "ISSUE-1");
+        db.conn()
+            .execute(
+                "INSERT INTO runs
+                    (id, work_item_id, role, agent, status, created_at)
+                 VALUES (1, ?1, 'specialist', 'codex', 'mystery',
+                         '2026-05-08T00:00:00Z')",
+                params![wi],
+            )
+            .expect("seed legacy unknown run");
+
+        db.migrate(&[V2_RUNS_STATUS_CHECK])
+            .expect("apply runs status CHECK migration");
+
+        assert_eq!(run_status(&db, 1), "failed");
+    }
+
+    #[test]
+    fn runs_status_check_is_idempotent_on_clean_db() {
+        let mut db = open_migrated();
+        let report = db
+            .migrate(&[V2_RUNS_STATUS_CHECK])
+            .expect("re-applying recorded migration is a no-op");
+        assert!(report.applied.is_empty());
+        assert_eq!(report.skipped, vec![2_026_050_805]);
+    }
+
+    #[test]
+    fn runs_indexes_survive_runs_status_check_recreate() {
+        let db = open_migrated();
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                  WHERE type='index' AND tbl_name='runs' \
+                  ORDER BY name",
+            )
+            .expect("prepare index lookup");
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query indexes")
+            .map(|r| r.expect("row"))
+            .collect();
+        for expected in ["idx_runs_lease", "idx_runs_status", "idx_runs_work_item"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing index `{expected}` after recreate; got {names:?}"
+            );
+        }
     }
 }
