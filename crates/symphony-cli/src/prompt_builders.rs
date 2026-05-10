@@ -7,8 +7,9 @@ use symphony_config::{InstructionPackBundle, RoleCatalogBuilder, WorkflowConfig}
 use symphony_core::handoff::Handoff;
 use symphony_core::integration_request::IntegrationRunRequest;
 use symphony_core::prompt::{
-    PromptAssembly, PromptContext, PromptSection, PromptSectionKind, PromptSectionProvenance,
-    default_handoff_output_schema, render as render_prompt,
+    PromptAssembly, PromptBlocker, PromptContext, PromptParent, PromptSection, PromptSectionKind,
+    PromptSectionProvenance, PromptWorkspace, default_handoff_output_schema,
+    render as render_prompt,
 };
 use symphony_core::tracker::Issue;
 
@@ -130,6 +131,107 @@ pub(crate) fn build_integration_owner_prompt(
             default_handoff_output_schema(),
         ),
     ]))
+}
+
+pub(crate) fn build_specialist_prompt(
+    workflow_prompt: &str,
+    instruction_packs: &InstructionPackBundle,
+    role_name: &str,
+    parent: Option<PromptParent>,
+    current_issue: &Issue,
+    workspace: Option<PromptWorkspace>,
+    blockers: Vec<PromptBlocker>,
+    acceptance_criteria: Vec<String>,
+) -> Result<PromptAssembly> {
+    let mut ctx = PromptContext::for_issue(current_issue)
+        .with_blockers(blockers.clone())
+        .with_acceptance_criteria(acceptance_criteria.clone())
+        .with_output_schema(default_handoff_output_schema());
+    if let Some(parent) = parent.clone() {
+        ctx = ctx.with_parent(parent);
+    }
+    if let Some(workspace) = workspace.clone() {
+        ctx = ctx.with_workspace(workspace);
+    }
+    let global = render_prompt(workflow_prompt, &ctx).context("render workflow prompt")?;
+
+    let mut sections = vec![PromptSection::new(
+        PromptSectionKind::GlobalWorkflowInstructions,
+        global,
+    )];
+    if let Some(pack) = instruction_packs.roles.get(role_name) {
+        if let Some(role_prompt) = &pack.role_prompt {
+            sections.push(
+                PromptSection::new(PromptSectionKind::RolePrompt, role_prompt.content.clone())
+                    .with_provenance(PromptSectionProvenance {
+                        source: role_prompt.source.path.display().to_string(),
+                        content_hash: Some(role_prompt.source.content_hash.clone()),
+                    }),
+            );
+        }
+        if let Some(soul) = &pack.soul {
+            sections.push(
+                PromptSection::new(PromptSectionKind::RoleSoul, soul.content.clone())
+                    .with_provenance(PromptSectionProvenance {
+                        source: soul.source.path.display().to_string(),
+                        content_hash: Some(soul.source.content_hash.clone()),
+                    }),
+            );
+        }
+    }
+
+    sections.extend([
+        PromptSection::new(
+            PromptSectionKind::IssueContext,
+            issue_context(current_issue),
+        ),
+        PromptSection::new(
+            PromptSectionKind::ParentChildGraph,
+            parent
+                .map(|p| format!("parent: {} - {}", p.identifier, p.title))
+                .unwrap_or_else(|| "parent: none".into()),
+        ),
+        PromptSection::new(
+            PromptSectionKind::Blockers,
+            if blockers.is_empty() {
+                "none".into()
+            } else {
+                blockers
+                    .iter()
+                    .map(|b| format!("- [{}] {}", b.severity, b.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        ),
+        PromptSection::new(
+            PromptSectionKind::WorkspaceBranch,
+            workspace
+                .map(|w| {
+                    format!(
+                        "path: {}\nstrategy: {}\nbranch: {}\nbase_ref: {}",
+                        w.path.display(),
+                        w.strategy,
+                        w.branch.as_deref().unwrap_or(""),
+                        w.base_ref.as_deref().unwrap_or("")
+                    )
+                })
+                .unwrap_or_else(|| "workspace: unclaimed".into()),
+        ),
+        PromptSection::new(
+            PromptSectionKind::AcceptanceCriteria,
+            acceptance_criteria
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        PromptSection::new(
+            PromptSectionKind::OutputSchema,
+            default_handoff_output_schema(),
+        ),
+    ]);
+
+    Ok(PromptAssembly::new(sections))
 }
 
 fn issue_context(issue: &Issue) -> String {
@@ -267,6 +369,33 @@ followups:
         packs
     }
 
+    fn specialist_pack(role: &str, prompt: &str, soul: &str) -> LoadedRoleInstructionPack {
+        LoadedRoleInstructionPack {
+            role_prompt: Some(LoadedRoleInstruction {
+                source: InstructionSource {
+                    role: role.into(),
+                    kind: InstructionKind::RolePrompt,
+                    path: format!(".symphony/roles/{role}/AGENTS.md").into(),
+                    content_hash: format!("{role}-prompt"),
+                    modified_unix_ms: Some(1),
+                    loaded_at_unix_ms: 2,
+                },
+                content: prompt.into(),
+            }),
+            soul: Some(LoadedRoleInstruction {
+                source: InstructionSource {
+                    role: role.into(),
+                    kind: InstructionKind::Soul,
+                    path: format!(".symphony/roles/{role}/SOUL.md").into(),
+                    content_hash: format!("{role}-soul"),
+                    modified_unix_ms: Some(1),
+                    loaded_at_unix_ms: 2,
+                },
+                content: soul.into(),
+            }),
+        }
+    }
+
     #[test]
     fn decomposition_prompt_includes_catalog_and_excludes_qa_child_role() {
         let mut issue = Issue::minimal("p", "ENG-1", "Broad work", "Todo");
@@ -361,5 +490,80 @@ followups:
         assert!(prompt.contains("ready_for: integration"));
         assert!(prompt.contains("ENG-3: Frontend"));
         assert!(prompt.contains("latest_handoff: none"));
+    }
+
+    #[test]
+    fn specialist_prompt_includes_only_current_role_doctrine() {
+        let mut packs = InstructionPackBundle::default();
+        packs.roles.insert(
+            "backend".into(),
+            specialist_pack("backend", "Backend role prompt", "Backend soul"),
+        );
+        packs.roles.insert(
+            "frontend".into(),
+            specialist_pack("frontend", "Frontend role prompt", "Frontend soul"),
+        );
+        let mut issue = Issue::minimal("c", "ENG-2", "Backend child", "Todo");
+        issue.labels = vec!["backend".into()];
+        let prompt = build_specialist_prompt(
+            "Global {{identifier}}",
+            &packs,
+            "backend",
+            Some(PromptParent {
+                identifier: "ENG-1".into(),
+                title: "Parent".into(),
+                url: None,
+            }),
+            &issue,
+            Some(PromptWorkspace {
+                path: PathBuf::from("/tmp/backend"),
+                strategy: "git_worktree".into(),
+                branch: Some("feat/backend".into()),
+                base_ref: Some("main".into()),
+            }),
+            Vec::new(),
+            vec!["API works".into()],
+        )
+        .unwrap()
+        .render();
+
+        assert!(prompt.contains("Backend role prompt"));
+        assert!(prompt.contains("Backend soul"));
+        assert!(!prompt.contains("Frontend role prompt"));
+        assert!(!prompt.contains("Frontend soul"));
+        assert!(prompt.contains("parent: ENG-1 - Parent"));
+        assert!(prompt.contains("branch: feat/backend"));
+        assert!(prompt.contains("- API works"));
+        assert!(prompt.contains("\"ready_for\""));
+    }
+
+    #[test]
+    fn blocked_specialist_prompt_surfaces_dependency_reason() {
+        let mut packs = InstructionPackBundle::default();
+        packs.roles.insert(
+            "backend".into(),
+            specialist_pack("backend", "Backend role prompt", "Backend soul"),
+        );
+        let issue = Issue::minimal("c", "ENG-2", "Backend child", "Todo");
+        let prompt = build_specialist_prompt(
+            "Global",
+            &packs,
+            "backend",
+            None,
+            &issue,
+            None,
+            vec![PromptBlocker {
+                id: None,
+                blocking_id: Some(WorkItemId::new(1)),
+                reason: "waiting for schema child".into(),
+                severity: symphony_core::BlockerSeverity::High,
+            }],
+            Vec::new(),
+        )
+        .unwrap()
+        .render();
+
+        assert!(prompt.contains("waiting for schema child"));
+        assert!(prompt.contains("[high]"));
     }
 }

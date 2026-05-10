@@ -86,11 +86,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 7 — Specialist Prompts
 
-- [ ] Add specialist prompt assembly that includes only the current specialist role's full `role_prompt` and `soul`.
-- [ ] Include parent issue context, current child issue context, dependency/blocker context, workspace/branch claim, acceptance criteria, and handoff output schema.
-- [ ] Ensure specialist prompts do not include other specialists' full SOUL files.
-- [ ] Add tests proving backend specialist receives backend doctrine and not frontend doctrine.
-- [ ] Add tests proving blocked specialist runs include visible blocker/dependency reason when dispatched for repair/rework.
+- [x] Add specialist prompt assembly that includes only the current specialist role's full `role_prompt` and `soul`.
+- [x] Include parent issue context, current child issue context, dependency/blocker context, workspace/branch claim, acceptance criteria, and handoff output schema.
+- [x] Ensure specialist prompts do not include other specialists' full SOUL files.
+- [x] Add tests proving backend specialist receives backend doctrine and not frontend doctrine.
+- [x] Add tests proving blocked specialist runs include visible blocker/dependency reason when dispatched for repair/rework.
 
 ## Phase 8 — QA Prompts
 
