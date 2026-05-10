@@ -135,7 +135,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 12 — Observability and Operator Surfaces
 
-- [ ] Add the specific `OrchestratorEvent` variants required to make Phase 13's deterministic scenarios pass. Drive the variant set from test consumers, not from an enumeration of categories.
+- [x] Add the specific `OrchestratorEvent` variants required to make Phase 13's deterministic scenarios pass. Drive the variant set from test consumers, not from an enumeration of categories.
 - [ ] Persist every event before broadcasting.
 - [ ] Update `symphony status` to read durable state, not only tracker snapshot.
 - [ ] Add `symphony issue graph <id>` for parent/child/blocker graph.

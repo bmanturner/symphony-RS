@@ -64,6 +64,7 @@ use crate::concurrency_gate::ScopeKind;
 use crate::retry::RetryReason;
 use crate::state_machine::{ClaimState, ReleaseReason};
 use crate::tracker::{IssueId, IssueState};
+use crate::work_item::{WorkItemId, WorkItemStatusClass};
 
 /// A single observable inflection point in the orchestrator's lifecycle.
 ///
@@ -315,6 +316,53 @@ pub enum OrchestratorEvent {
     /// cascade from a parent work item may not. The `subject` field
     /// preserves whether the cancel originated at the run level or
     /// cascaded from a work-item-level request.
+    /// A v2 work item moved between [`WorkItemStatusClass`] values.
+    ///
+    /// This is the **spine event** for Phase 13 scenario consumers:
+    /// every deterministic v2 scenario asserts that a work item moved
+    /// through a specific status sequence (e.g. `intake → integration →
+    /// qa → done` for the happy path, or `qa → rework → qa → done` for
+    /// the QA-blocker rework path). Test consumers filter on
+    /// `kind() == "work_item_status_changed"` and pattern-match on the
+    /// `previous` / `current` pair to drive their assertions, rather
+    /// than polling the durable `work_items` table.
+    ///
+    /// Distinct from [`OrchestratorEvent::StateChanged`]: that variant
+    /// carries [`ClaimState`] (in-flight claim ledger transitions for the
+    /// v1 poll loop). This variant carries the *normalized* v2 work-item
+    /// status class derived from tracker state per workflow config.
+    /// Both can fire for the same wall-clock event when a v2 work item
+    /// is also represented as a v1 claim — they observe different
+    /// projections of the same underlying lifecycle.
+    ///
+    /// `previous` is `None` for the initial observation of a work item
+    /// (e.g. when intake first imports it from the tracker). The
+    /// `identifier` is best-effort — it is `Some` whenever the kernel
+    /// has a tracker-facing id snapshot, and `None` for synthetic work
+    /// items that exist only in durable state.
+    ///
+    /// `raw_state` is the tracker's untranslated status string (e.g.
+    /// `"In Progress"`, `"Ready For Review"`). It is preserved on the
+    /// wire so a status surface can render the operator-facing label
+    /// without round-tripping back through workflow config.
+    WorkItemStatusChanged {
+        /// Durable work-item row id whose status class changed.
+        work_item_id: WorkItemId,
+        /// Tracker-facing identifier snapshot, when known.
+        #[serde(default)]
+        identifier: Option<String>,
+        /// Status class immediately before the transition; `None` for
+        /// the very first observation of a work item.
+        #[serde(default)]
+        previous: Option<WorkItemStatusClass>,
+        /// Status class immediately after the transition.
+        current: WorkItemStatusClass,
+        /// Raw tracker state string the `current` class was derived
+        /// from, when known.
+        #[serde(default)]
+        raw_state: Option<String>,
+    },
+
     RunCancelled {
         /// Durable run row that cancelled.
         run_id: i64,
@@ -361,7 +409,8 @@ impl OrchestratorEvent {
             OrchestratorEvent::Reconciled { .. }
             | OrchestratorEvent::ScopeCapReached { .. }
             | OrchestratorEvent::BudgetExceeded { .. }
-            | OrchestratorEvent::RunCancelled { .. } => None,
+            | OrchestratorEvent::RunCancelled { .. }
+            | OrchestratorEvent::WorkItemStatusChanged { .. } => None,
         }
     }
 
@@ -381,6 +430,21 @@ impl OrchestratorEvent {
             OrchestratorEvent::ScopeCapReached { .. } => "scope_cap_reached",
             OrchestratorEvent::BudgetExceeded { .. } => "budget_exceeded",
             OrchestratorEvent::RunCancelled { .. } => "run_cancelled",
+            OrchestratorEvent::WorkItemStatusChanged { .. } => "work_item_status_changed",
+        }
+    }
+
+    /// Borrow the durable [`WorkItemId`] for variants that carry one.
+    ///
+    /// Used by test consumers (Phase 13) to route observed events into
+    /// per-work-item assertion lists without inspecting nested fields.
+    /// Returns `None` for variants that pertain to a v1 claim, a run,
+    /// or a multi-issue summary.
+    #[must_use]
+    pub fn work_item_id(&self) -> Option<WorkItemId> {
+        match self {
+            OrchestratorEvent::WorkItemStatusChanged { work_item_id, .. } => Some(*work_item_id),
+            _ => None,
         }
     }
 }
@@ -628,6 +692,20 @@ mod tests {
                 observed: 12.5,
                 cap: 10.0,
             },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: WorkItemId::new(8),
+                identifier: Some("ENG-8".into()),
+                previous: Some(WorkItemStatusClass::Qa),
+                current: WorkItemStatusClass::Rework,
+                raw_state: Some("Rework".into()),
+            },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: WorkItemId::new(9),
+                identifier: None,
+                previous: None,
+                current: WorkItemStatusClass::Intake,
+                raw_state: None,
+            },
         ];
         for ev in cases {
             let s = serde_json::to_string(&ev).unwrap();
@@ -737,6 +815,194 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn work_item_status_changed_serialises_with_type_tag_and_snake_case_classes() {
+        let ev = OrchestratorEvent::WorkItemStatusChanged {
+            work_item_id: WorkItemId::new(42),
+            identifier: Some("ENG-42".into()),
+            previous: Some(WorkItemStatusClass::Intake),
+            current: WorkItemStatusClass::Integration,
+            raw_state: Some("Ready for Review".into()),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "work_item_status_changed");
+        assert_eq!(v["work_item_id"], 42);
+        assert_eq!(v["identifier"], "ENG-42");
+        assert_eq!(v["previous"], "intake");
+        assert_eq!(v["current"], "integration");
+        assert_eq!(v["raw_state"], "Ready for Review");
+        assert!(ev.issue().is_none());
+        assert_eq!(ev.work_item_id(), Some(WorkItemId::new(42)));
+        assert_eq!(ev.kind(), "work_item_status_changed");
+    }
+
+    #[test]
+    fn work_item_status_changed_initial_observation_has_null_previous() {
+        // First observation of a work item (intake import): no
+        // previous status class to compare against.
+        let ev = OrchestratorEvent::WorkItemStatusChanged {
+            work_item_id: WorkItemId::new(7),
+            identifier: None,
+            previous: None,
+            current: WorkItemStatusClass::Intake,
+            raw_state: None,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(v["previous"].is_null());
+        assert!(v["identifier"].is_null());
+        assert!(v["raw_state"].is_null());
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: OrchestratorEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn work_item_status_changed_deserialises_with_default_optional_fields() {
+        // Future emitters may omit identifier/previous/raw_state. The
+        // serde defaults must accept that without breaking decode.
+        let raw = r#"{"type":"work_item_status_changed","work_item_id":11,"current":"qa"}"#;
+        let ev: OrchestratorEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id,
+                identifier,
+                previous,
+                current,
+                raw_state,
+            } => {
+                assert_eq!(work_item_id, WorkItemId::new(11));
+                assert!(identifier.is_none());
+                assert!(previous.is_none());
+                assert_eq!(current, WorkItemStatusClass::Qa);
+                assert!(raw_state.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn work_item_status_changed_test_consumer_filters_per_item_transition_sequence() {
+        // Demonstrates the Phase 13 "test consumer" pattern: a
+        // deterministic scenario emits a stream of events; the consumer
+        // filters by kind, joins by work_item_id(), and asserts the
+        // transition sequence for each work item independently. The
+        // variant exists *to make this assertion pattern feasible*;
+        // pinning the pattern here keeps it from drifting when Phase 13
+        // wires real scenarios.
+        let parent = WorkItemId::new(100);
+        let child_a = WorkItemId::new(101);
+        let child_b = WorkItemId::new(102);
+
+        let stream = vec![
+            // Intake imports the parent.
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: parent,
+                identifier: Some("ENG-100".into()),
+                previous: None,
+                current: WorkItemStatusClass::Intake,
+                raw_state: Some("Triage".into()),
+            },
+            // Integration owner decomposes; children created at intake.
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: child_a,
+                identifier: Some("ENG-101".into()),
+                previous: None,
+                current: WorkItemStatusClass::Ready,
+                raw_state: Some("Ready".into()),
+            },
+            // An unrelated event we expect the consumer to ignore.
+            OrchestratorEvent::Reconciled { dropped: vec![] },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: child_b,
+                identifier: Some("ENG-102".into()),
+                previous: None,
+                current: WorkItemStatusClass::Ready,
+                raw_state: Some("Ready".into()),
+            },
+            // Children complete; parent reaches integration → qa → done.
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: child_a,
+                identifier: Some("ENG-101".into()),
+                previous: Some(WorkItemStatusClass::Ready),
+                current: WorkItemStatusClass::Done,
+                raw_state: Some("Done".into()),
+            },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: child_b,
+                identifier: Some("ENG-102".into()),
+                previous: Some(WorkItemStatusClass::Ready),
+                current: WorkItemStatusClass::Done,
+                raw_state: Some("Done".into()),
+            },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: parent,
+                identifier: Some("ENG-100".into()),
+                previous: Some(WorkItemStatusClass::Intake),
+                current: WorkItemStatusClass::Integration,
+                raw_state: Some("Integrating".into()),
+            },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: parent,
+                identifier: Some("ENG-100".into()),
+                previous: Some(WorkItemStatusClass::Integration),
+                current: WorkItemStatusClass::Qa,
+                raw_state: Some("In QA".into()),
+            },
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id: parent,
+                identifier: Some("ENG-100".into()),
+                previous: Some(WorkItemStatusClass::Qa),
+                current: WorkItemStatusClass::Done,
+                raw_state: Some("Done".into()),
+            },
+        ];
+
+        let transitions_for =
+            |id: WorkItemId| -> Vec<(Option<WorkItemStatusClass>, WorkItemStatusClass)> {
+                stream
+                    .iter()
+                    .filter(|ev| ev.kind() == "work_item_status_changed")
+                    .filter(|ev| ev.work_item_id() == Some(id))
+                    .map(|ev| match ev {
+                        OrchestratorEvent::WorkItemStatusChanged {
+                            previous, current, ..
+                        } => (*previous, *current),
+                        _ => unreachable!(),
+                    })
+                    .collect()
+            };
+
+        assert_eq!(
+            transitions_for(parent),
+            vec![
+                (None, WorkItemStatusClass::Intake),
+                (
+                    Some(WorkItemStatusClass::Intake),
+                    WorkItemStatusClass::Integration
+                ),
+                (
+                    Some(WorkItemStatusClass::Integration),
+                    WorkItemStatusClass::Qa
+                ),
+                (Some(WorkItemStatusClass::Qa), WorkItemStatusClass::Done),
+            ]
+        );
+        assert_eq!(
+            transitions_for(child_a),
+            vec![
+                (None, WorkItemStatusClass::Ready),
+                (Some(WorkItemStatusClass::Ready), WorkItemStatusClass::Done),
+            ]
+        );
+        assert_eq!(
+            transitions_for(child_b),
+            vec![
+                (None, WorkItemStatusClass::Ready),
+                (Some(WorkItemStatusClass::Ready), WorkItemStatusClass::Done),
+            ]
+        );
     }
 
     #[test]

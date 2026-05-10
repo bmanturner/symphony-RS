@@ -681,6 +681,22 @@ impl AppState {
                     identifier.clone(),
                 );
             }
+            OrchestratorEvent::WorkItemStatusChanged {
+                work_item_id,
+                identifier,
+                previous,
+                current,
+                ..
+            } => {
+                let label = identifier
+                    .clone()
+                    .unwrap_or_else(|| format!("work_item#{work_item_id}"));
+                let summary = match previous {
+                    Some(p) => format!("{label} {p} → {current}"),
+                    None => format!("{label} → {current}"),
+                };
+                self.push_recent("work_item_status_changed", summary, identifier.clone());
+            }
         }
     }
 
