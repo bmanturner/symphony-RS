@@ -14,6 +14,7 @@
 
 pub mod cancel_requests;
 pub mod decomposition_apply;
+pub mod dependency_reconciliation;
 pub mod edges;
 pub mod events;
 pub mod handoffs;
