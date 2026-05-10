@@ -672,7 +672,6 @@ fn build_backend_agent_runner(
             Arc::new(ClaudeRunner::new(claude_runner_config_for_profile(profile)))
         }
         AgentBackend::Mock => Arc::new(MockAgentRunner::new(MockAgentConfig::default())),
-        AgentBackend::Hermes => anyhow::bail!("Hermes agent profiles are deprecated in v5 scope"),
     };
     let metadata = AgentRunnerDebugMetadata {
         role: role_name.to_string(),
@@ -759,7 +758,6 @@ fn redacted_effective_argv(profile: &AgentBackendProfile) -> Vec<String> {
         .unwrap_or_else(|| match profile.backend {
             AgentBackend::Codex => "codex app-server".to_string(),
             AgentBackend::Claude => "claude".to_string(),
-            AgentBackend::Hermes => "hermes".to_string(),
             AgentBackend::Mock => "mock".to_string(),
         });
     let mut argv = vec![command];

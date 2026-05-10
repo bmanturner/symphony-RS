@@ -58,13 +58,13 @@ agents:
     mode: draft_review
 ```
 
-Keep product backend classes limited to `codex`, `claude`, and `hermes`. Tandem orchestration composes those profiles; it does not create a fourth production backend class.
+Keep product backend classes limited to `codex` and `claude`. Tandem orchestration composes those profiles; it does not create a third production backend class. Hermes was removed in SPEC v5.
 
 ## Keep Mocks Test-Only
 
 `mock` tracker and agent profiles exist to make fixtures, conformance tests, and deterministic end-to-end scenarios reproducible without live credentials or local agent binaries. They are allowed in `tests/fixtures/` and test code, but should not be documented as an operator-facing production adapter.
 
-For real workflows, configure a GitHub or Linear tracker and a Codex, Claude, Hermes, or composite agent profile.
+For real workflows, configure a GitHub or Linear tracker and a Codex, Claude, or composite agent profile.
 
 ## Retire Dangling Checklist Items
 

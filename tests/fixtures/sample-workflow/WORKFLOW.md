@@ -147,10 +147,6 @@ agents:
     backend: claude
     command: claude
     tools: [git, github, tracker]
-  hermes_agent:
-    backend: hermes
-    command: hermes chat --query-file - --source symphony
-    tools: [git, github, tracker]
   lead_pair:
     strategy: tandem
     lead: lead_agent

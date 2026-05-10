@@ -1,9 +1,8 @@
 //! Product adapter scope manifest (SPEC v2 §7, §3 Non-Goals).
 //!
-//! SPEC v2 §7 explicitly limits the supported adapter set to:
-//! `git`, `github`, `linear`, `codex`, `claude`, and `hermes`.
-//! SPEC v2 §3 Non-Goals further forbids "adapters beyond git, GitHub,
-//! Linear, Codex, Claude, and Hermes".
+//! SPEC v5 limits the supported adapter set to `git`, `github`,
+//! `linear`, `codex`, and `claude`. Hermes was removed from the
+//! product backend surface in SPEC v5 §10.
 //!
 //! The product engages with two adapter axes that are surfaced through
 //! configuration enums and therefore reachable from a workflow file:
@@ -20,7 +19,7 @@
 //! This module exists so that any future contributor adding a new
 //! variant to either enum is forced to update the supported-adapter
 //! lists *and* the exhaustive `match` in the tests below. Reviewers can
-//! then reject the change unless SPEC v2 §7 is amended first.
+//! then reject the change unless the active SPEC is amended first.
 
 use crate::config::{AgentBackend, TrackerKind};
 
@@ -36,11 +35,8 @@ pub const SUPPORTED_PRODUCT_TRACKERS: &[TrackerKind] = &[TrackerKind::Github, Tr
 ///
 /// `Mock` is intentionally absent — same rationale as
 /// [`SUPPORTED_PRODUCT_TRACKERS`].
-pub const SUPPORTED_PRODUCT_AGENT_BACKENDS: &[AgentBackend] = &[
-    AgentBackend::Codex,
-    AgentBackend::Claude,
-    AgentBackend::Hermes,
-];
+pub const SUPPORTED_PRODUCT_AGENT_BACKENDS: &[AgentBackend] =
+    &[AgentBackend::Codex, AgentBackend::Claude];
 
 /// The single supported source-control adapter name. There is no enum
 /// to lock this against today; if a second SCM is ever added, the
@@ -59,10 +55,7 @@ pub const fn is_product_tracker(kind: TrackerKind) -> bool {
 /// configuration. Test-only fakes (e.g. [`AgentBackend::Mock`]) return
 /// `false`.
 pub const fn is_product_agent_backend(backend: AgentBackend) -> bool {
-    matches!(
-        backend,
-        AgentBackend::Codex | AgentBackend::Claude | AgentBackend::Hermes
-    )
+    matches!(backend, AgentBackend::Codex | AgentBackend::Claude)
 }
 
 #[cfg(test)]
@@ -96,11 +89,10 @@ mod tests {
         for backend in [
             AgentBackend::Codex,
             AgentBackend::Claude,
-            AgentBackend::Hermes,
             AgentBackend::Mock,
         ] {
             let classified = match backend {
-                AgentBackend::Codex | AgentBackend::Claude | AgentBackend::Hermes => true,
+                AgentBackend::Codex | AgentBackend::Claude => true,
                 AgentBackend::Mock => false,
             };
             assert_eq!(

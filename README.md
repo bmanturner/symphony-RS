@@ -14,13 +14,13 @@ The product center is deliberately small:
   closeout; `qa_gate` can reject, file blockers, create follow-ups, and
   force rework.
 - **Limited adapters** — production backends are GitHub/Linear trackers,
-  git workspaces, and Codex/Claude/Hermes agents. Test-only mock
+  git workspaces, and Codex/Claude agents. Test-only mock
   adapters keep fixtures and deterministic scenarios reproducible.
 
 ## Quickstart
 
 This walkthrough takes a clean checkout through the v2 workflow shape
-without needing a Linear/GitHub credential or a local Codex/Claude/Hermes
+without needing a Linear/GitHub credential or a local Codex/Claude
 binary. It uses the in-repo test fixture at
 [`tests/fixtures/quickstart-workflow/`](./tests/fixtures/quickstart-workflow/).
 
@@ -119,7 +119,6 @@ replace the test-only adapters:
 - `tracker.kind: github` — set `GITHUB_TOKEN` and `tracker.repository`.
 - agent `backend: codex` — requires `codex` on `PATH`.
 - agent `backend: claude` — requires `claude` on `PATH`.
-- agent `backend: hermes` — requires `hermes` on `PATH`.
 - composite `strategy: tandem` — wraps two configured agent profiles for
   review or split-implementation workflows.
 

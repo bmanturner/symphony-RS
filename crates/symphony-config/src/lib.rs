@@ -30,14 +30,13 @@ pub use config::{
     AgentProfileConfig, AgentStrategy, BlockerPolicy, BranchPolicyConfig, ChildIssuePolicy,
     CodexConfig, ConfigValidationError, ConfigValidationWarning, ConflictPolicy, DashboardConfig,
     DecompositionConfig, DecompositionTriggers, DependencyPolicy, DependencyTrackerSyncPolicy,
-    FollowupConfig, HermesAgentConfig, HooksConfig, IntegrationConfig, IntegrationRequirement,
-    LeaseConfig, LogFormat, LogsConfig, MergeStrategy, ObservabilityConfig, PollingConfig,
-    PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider, PullRequestConfig, QaConfig,
-    QaEvidenceRequired, RoleAssignmentMetadata, RoleConfig, RoleInstructionConfig, RoleKind,
-    RoleRoutingHints, RoutingConfig, RoutingMatch, RoutingMatchMode, RoutingRule,
-    SUPPORTED_SCHEMA_VERSION, SseConfig, TandemMode, TrackerConfig, TrackerKind, TuiConfig,
-    WorkflowConfig, WorkspaceCleanupPolicy, WorkspacePolicyConfig, WorkspaceStrategyConfig,
-    WorkspaceStrategyKind,
+    FollowupConfig, HooksConfig, IntegrationConfig, IntegrationRequirement, LeaseConfig, LogFormat,
+    LogsConfig, MergeStrategy, ObservabilityConfig, PollingConfig, PrInitialState,
+    PrMarkReadyStage, PrOpenStage, PrProvider, PullRequestConfig, QaConfig, QaEvidenceRequired,
+    RoleAssignmentMetadata, RoleConfig, RoleInstructionConfig, RoleKind, RoleRoutingHints,
+    RoutingConfig, RoutingMatch, RoutingMatchMode, RoutingRule, SUPPORTED_SCHEMA_VERSION,
+    SseConfig, TandemMode, TrackerConfig, TrackerKind, TuiConfig, WorkflowConfig,
+    WorkspaceCleanupPolicy, WorkspacePolicyConfig, WorkspaceStrategyConfig, WorkspaceStrategyKind,
 };
 pub use layered::{LayeredLoadError, LayeredLoader};
 pub use loader::{

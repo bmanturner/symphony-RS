@@ -121,10 +121,6 @@ agents:
     command: claude
     tools: [git, github, tracker]
     max_turns: 6
-  hermes_agent:
-    backend: hermes
-    command: hermes chat --query-file - --source symphony
-    tools: [git, github, tracker]
   lead_pair:
     strategy: tandem
     lead: lead_agent
@@ -323,7 +319,7 @@ fails fast, before any workspace claim or agent launch. `AGENTS.md`
 should hold role-specific operating instructions; `SOUL.md` should
 hold the stable quality bar and judgment doctrine for that role.
 
-`agents` defines backend profiles independent from role names. Product backends are `codex`, `claude`, and `hermes`; `mock` is for tests and fixtures. Composite `strategy: tandem` profiles wrap two concrete profiles and can run `draft_review`, `split_implement`, or `consensus`.
+`agents` defines backend profiles independent from role names. Product backends are `codex` and `claude`; `mock` is for tests and fixtures. Composite `strategy: tandem` profiles wrap two concrete profiles and can run `draft_review`, `split_implement`, or `consensus`.
 
 Use `command` for the executable or shell entrypoint, `args` for
 structured base arguments, and `extra_args` for profile-specific

@@ -572,7 +572,7 @@ mod tests {
             run_origin(),
             BlockerOrigin::Agent {
                 role: RoleName::new("recovery"),
-                agent_profile: Some("hermes".into()),
+                agent_profile: Some("claude_fast".into()),
             },
             BlockerOrigin::Human {
                 actor: "alice".into(),

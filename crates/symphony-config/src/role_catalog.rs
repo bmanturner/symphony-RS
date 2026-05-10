@@ -352,7 +352,6 @@ fn agent_backend_label(backend: AgentBackend) -> &'static str {
     match backend {
         AgentBackend::Codex => "codex",
         AgentBackend::Claude => "claude",
-        AgentBackend::Hermes => "hermes",
         AgentBackend::Mock => "mock",
     }
 }

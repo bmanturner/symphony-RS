@@ -97,16 +97,6 @@ pub struct WorkflowConfig {
     #[serde(default)]
     pub codex: CodexConfig,
 
-    /// Hermes Agent CLI defaults. SPEC v2 §5.5.
-    ///
-    /// Mirrors [`CodexConfig`] for the Hermes backend: the global block
-    /// carries the default command, source tag, and timeout knobs that a
-    /// per-profile [`AgentBackendProfile`] inherits. Fields beyond the
-    /// CLI command are kept narrow because Hermes' policy surface lives
-    /// inside its own configuration, not ours.
-    #[serde(default)]
-    pub hermes: HermesAgentConfig,
-
     /// Operator-facing observability surfaces. SPEC v2 §5.14. Wraps
     /// the structured-logs format, the in-process event bus toggle,
     /// the Server-Sent Events (SSE) HTTP feed (formerly the top-level
@@ -232,7 +222,6 @@ impl Default for WorkflowConfig {
             hooks: HooksConfig::default(),
             agent: AgentConfig::default(),
             codex: CodexConfig::default(),
-            hermes: HermesAgentConfig::default(),
             observability: ObservabilityConfig::default(),
             roles: BTreeMap::new(),
             agents: BTreeMap::new(),
@@ -1059,85 +1048,6 @@ fn default_codex_stall_timeout_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// hermes (SPEC v2 §5.5)
-// ---------------------------------------------------------------------------
-
-/// Hermes Agent CLI pass-through config (SPEC v2 §5.5).
-///
-/// Shape mirrors [`CodexConfig`] so an operator who knows the Codex block
-/// can read this one. Hermes is invoked in non-interactive mode with the
-/// rendered prompt streamed through stdin or a temporary file (`--query-file
-/// -`) and a stable source tag for telemetry/audit. The remaining policy
-/// (model, approvals, sandbox) lives inside Hermes' own configuration —
-/// we only carry what the orchestrator needs to spawn the process.
-///
-/// If Hermes later exposes a stable ACP/server protocol the adapter may
-/// switch to it behind the same `backend: hermes` contract; this config
-/// shape stays the same because operators continue to declare just the
-/// process-launch knobs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HermesAgentConfig {
-    /// Shell command launched via `bash -lc` from the workspace root.
-    /// Defaults to the SPEC §5.5 example so a fresh `WORKFLOW.md` runs
-    /// without an explicit override.
-    #[serde(default = "default_hermes_command")]
-    pub command: String,
-
-    /// Source tag passed to Hermes for telemetry/audit. Defaults to
-    /// `symphony` so multiple deployments are distinguishable in Hermes'
-    /// own logs without per-workflow customisation.
-    #[serde(default = "default_hermes_source")]
-    pub source: String,
-
-    /// Per-turn timeout in milliseconds. SPEC default: 1 hour, matching
-    /// Codex so workflows don't need to special-case the backend.
-    #[serde(default = "default_hermes_turn_timeout_ms")]
-    pub turn_timeout_ms: u64,
-
-    /// Idle-read timeout in milliseconds. SPEC default: 5 seconds.
-    #[serde(default = "default_hermes_read_timeout_ms")]
-    pub read_timeout_ms: u64,
-
-    /// Stall-detection window. `0` disables stall detection. SPEC
-    /// default: 5 minutes.
-    #[serde(default = "default_hermes_stall_timeout_ms")]
-    pub stall_timeout_ms: u64,
-}
-
-impl Default for HermesAgentConfig {
-    fn default() -> Self {
-        Self {
-            command: default_hermes_command(),
-            source: default_hermes_source(),
-            turn_timeout_ms: default_hermes_turn_timeout_ms(),
-            read_timeout_ms: default_hermes_read_timeout_ms(),
-            stall_timeout_ms: default_hermes_stall_timeout_ms(),
-        }
-    }
-}
-
-fn default_hermes_command() -> String {
-    "hermes chat --query-file - --source symphony".to_string()
-}
-
-fn default_hermes_source() -> String {
-    "symphony".to_string()
-}
-
-fn default_hermes_turn_timeout_ms() -> u64 {
-    3_600_000
-}
-
-fn default_hermes_read_timeout_ms() -> u64 {
-    5_000
-}
-
-fn default_hermes_stall_timeout_ms() -> u64 {
-    300_000
-}
-
-// ---------------------------------------------------------------------------
 // observability (SPEC v2 §5.14)
 // ---------------------------------------------------------------------------
 
@@ -1521,34 +1431,64 @@ impl RoleRoutingHints {
 // agents (SPEC v2 §4.5 / §5.5)
 // ---------------------------------------------------------------------------
 
-/// Backend class for an [`AgentBackendProfile`]. SPEC v2 §5.5 limits
-/// product backends to `codex`, `claude`, and `hermes`; the test-only
-/// `mock` variant is preserved here so quickstart fixtures and unit
-/// tests can declare profiles without an external binary.
+/// Backend class for an [`AgentBackendProfile`]. SPEC v5 removes the
+/// former Hermes backend; product backends are `codex` and `claude`.
+/// The test-only `mock` variant is preserved here so quickstart
+/// fixtures and unit tests can declare profiles without an external
+/// binary.
 ///
 /// Composite/tandem behaviour is *not* a backend — SPEC §5.5 defines it
 /// as an `agents:` *strategy* that composes other profiles, modelled
 /// here as [`AgentCompositeProfile`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentBackend {
     /// `codex app-server` over JSONL stdio.
     Codex,
     /// `claude -p --output-format stream-json` over stdio.
     Claude,
-    /// Hermes Agent CLI in non-interactive mode. The orchestrator
-    /// composes [`HermesAgentConfig`] defaults under per-profile
-    /// overrides at dispatch time.
-    Hermes,
     /// In-process scripted runner. Test/fixture only — not advertised
     /// as a production backend.
     Mock,
 }
 
+impl Serialize for AgentBackend {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            AgentBackend::Codex => "codex",
+            AgentBackend::Claude => "claude",
+            AgentBackend::Mock => "mock",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "codex" => Ok(AgentBackend::Codex),
+            "claude" => Ok(AgentBackend::Claude),
+            "mock" => Ok(AgentBackend::Mock),
+            "hermes" => Err(serde::de::Error::custom(
+                "backend `hermes` is no longer supported; see SPEC_v5.md §10",
+            )),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["codex", "claude", "mock"],
+            )),
+        }
+    }
+}
+
 /// One entry in the `agents` map (SPEC v2 §5.5).
 ///
 /// A profile is either a concrete [`AgentBackendProfile`] (`backend:
-/// codex|claude|hermes|mock`) or an [`AgentCompositeProfile`] that
+/// codex|claude|mock`) or an [`AgentCompositeProfile`] that
 /// composes other profiles via a strategy (`strategy: tandem`).
 /// Discriminated by the field name `backend` vs `strategy`; serde tries
 /// the backend variant first.
@@ -1557,18 +1497,53 @@ pub enum AgentBackend {
 /// [`RoleConfig::agent`] (and from `lead`/`follower` inside a composite
 /// profile), so the same profile can be reused across roles and a role
 /// can be re-pointed at a different profile without renaming.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum AgentProfileConfig {
-    /// Concrete backend profile (`codex`, `claude`, `hermes`, or `mock`).
+    /// Concrete backend profile (`codex`, `claude`, or `mock`).
     /// Boxed so the enum size is dominated by the smaller composite
     /// variant rather than the policy-heavy backend struct.
     Backend(Box<AgentBackendProfile>),
     /// Composite agent that wraps two configured profiles in a strategy
     /// (today: `tandem`). Repackages the existing tandem runner as an
     /// `agents:` entry so it composes any combination of `codex`,
-    /// `claude`, or `hermes` lead/follower seats.
+    /// `claude`, or `mock` lead/follower seats.
     Composite(AgentCompositeProfile),
+}
+
+impl<'de> Deserialize<'de> for AgentProfileConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let Some(map) = value.as_mapping() else {
+            return Err(serde::de::Error::custom(
+                "agent profile must be a mapping with either `backend` or `strategy`",
+            ));
+        };
+        let backend_key = serde_yaml::Value::String("backend".into());
+        let strategy_key = serde_yaml::Value::String("strategy".into());
+        let has_backend = map.contains_key(&backend_key);
+        let has_strategy = map.contains_key(&strategy_key);
+        match (has_backend, has_strategy) {
+            (true, false) => {
+                let profile: AgentBackendProfile =
+                    serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(AgentProfileConfig::Backend(Box::new(profile)))
+            }
+            (false, true) => {
+                let profile: AgentCompositeProfile =
+                    serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(AgentProfileConfig::Composite(profile))
+            }
+            (true, true) => Err(serde::de::Error::custom(
+                "agent profile must declare only one of `backend` or `strategy`",
+            )),
+            (false, false) => Err(serde::de::Error::custom(
+                "agent profile must declare either `backend` or `strategy`",
+            )),
+        }
+    }
 }
 
 impl AgentProfileConfig {
@@ -1662,8 +1637,8 @@ pub struct AgentCompositeProfile {
 /// A profile bundles a backend with the runtime policy that should be
 /// applied when launching it. Most policy fields are `Option`-typed and
 /// default to "inherit": the kernel composes a profile-level value over
-/// the global [`AgentConfig`]/[`CodexConfig`]/[`HermesAgentConfig`]
-/// defaults at dispatch time. This keeps profiles small and lets
+/// the global [`AgentConfig`]/[`CodexConfig`] defaults at dispatch time.
+/// This keeps profiles small and lets
 /// operators declare just the deltas they care about.
 ///
 /// Fields that mirror the upstream Codex/Claude schema (`approval_policy`,
@@ -3509,9 +3484,7 @@ impl WorkflowConfig {
         // composite.lead/follower must resolve to concrete backend profiles.
         for (profile_name, profile) in &self.agents {
             if let AgentProfileConfig::Backend(backend) = profile {
-                if backend.model.is_some()
-                    && matches!(backend.backend, AgentBackend::Hermes | AgentBackend::Mock)
-                {
+                if backend.model.is_some() && matches!(backend.backend, AgentBackend::Mock) {
                     return Err(ConfigValidationError::UnsupportedAgentProfileModel {
                         profile: profile_name.clone(),
                         backend: backend.backend,
@@ -4531,13 +4504,11 @@ agents:
     backend: claude
     command: claude -p --output-format stream-json
     tools: [git, github]
-  hermes_agent:
-    backend: hermes
   fixture_agent:
     backend: mock
 "#;
         let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
-        assert_eq!(parsed.agents.len(), 4);
+        assert_eq!(parsed.agents.len(), 3);
 
         let lead = parsed
             .agents
@@ -4562,10 +4533,6 @@ agents:
             Some(AgentBackend::Claude)
         );
         assert_eq!(
-            parsed.agents.get("hermes_agent").and_then(|a| a.backend()),
-            Some(AgentBackend::Hermes)
-        );
-        assert_eq!(
             parsed.agents.get("fixture_agent").and_then(|a| a.backend()),
             Some(AgentBackend::Mock)
         );
@@ -4576,7 +4543,6 @@ agents:
         for (variant, literal) in [
             (AgentBackend::Codex, "codex"),
             (AgentBackend::Claude, "claude"),
-            (AgentBackend::Hermes, "hermes"),
             (AgentBackend::Mock, "mock"),
         ] {
             let yaml = serde_yaml::to_string(&variant).expect("serialises");
@@ -4604,6 +4570,22 @@ agents:
 "#;
         serde_yaml::from_str::<WorkflowConfig>(yaml)
             .expect_err("unknown backend value must be rejected");
+    }
+
+    #[test]
+    fn agent_backend_rejects_hermes_with_v5_guidance() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+agents:
+  old:
+    backend: hermes
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hermes"), "{msg}");
+        assert!(msg.contains("SPEC_v5.md"), "{msg}");
+        assert!(msg.contains("§10"), "{msg}");
     }
 
     #[test]
@@ -4749,58 +4731,6 @@ roles:
         let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
         assert_eq!(parsed, reparsed);
         assert_eq!(parsed.roles.len(), 2);
-    }
-
-    // -----------------------------------------------------------------
-    // hermes (SPEC v2 §5.5)
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn hermes_defaults_match_spec_example() {
-        let cfg = WorkflowConfig::default();
-        assert_eq!(
-            cfg.hermes.command,
-            "hermes chat --query-file - --source symphony"
-        );
-        assert_eq!(cfg.hermes.source, "symphony");
-        assert_eq!(cfg.hermes.turn_timeout_ms, 3_600_000);
-        assert_eq!(cfg.hermes.read_timeout_ms, 5_000);
-        assert_eq!(cfg.hermes.stall_timeout_ms, 300_000);
-    }
-
-    #[test]
-    fn hermes_yaml_block_overrides_defaults() {
-        let yaml = r#"
-tracker:
-  project_slug: ENG
-hermes:
-  command: hermes chat --source ci
-  source: ci
-  turn_timeout_ms: 600000
-  read_timeout_ms: 1000
-  stall_timeout_ms: 0
-"#;
-        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
-        assert_eq!(parsed.hermes.command, "hermes chat --source ci");
-        assert_eq!(parsed.hermes.source, "ci");
-        assert_eq!(parsed.hermes.turn_timeout_ms, 600_000);
-        assert_eq!(parsed.hermes.read_timeout_ms, 1_000);
-        assert_eq!(parsed.hermes.stall_timeout_ms, 0);
-    }
-
-    #[test]
-    fn hermes_unknown_field_is_rejected() {
-        let yaml = r#"
-tracker:
-  project_slug: ENG
-hermes:
-  comand: typo
-"#;
-        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("comand") || err.to_string().contains("unknown field"),
-            "expected unknown-field error, got: {err}"
-        );
     }
 
     // -----------------------------------------------------------------
