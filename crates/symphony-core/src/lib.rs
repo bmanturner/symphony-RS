@@ -56,6 +56,7 @@ pub mod role;
 pub mod routing;
 pub mod run_lease;
 pub mod scheduler_v2;
+pub mod scope_contention_log;
 pub mod specialist_runner;
 pub mod specialist_tick;
 pub mod state_machine;
@@ -201,6 +202,7 @@ pub use run_lease::{
     InMemoryRunLeaseStore, LeaseAcquireOutcome, RunLeaseError, RunLeaseGuard, RunLeaseStore,
 };
 pub use scheduler_v2::{SchedulerTickReport, SchedulerV2, SchedulerV2Config};
+pub use scope_contention_log::{ContentionObservation, ContentionSubject, ScopeContentionEventLog};
 pub use specialist_runner::{SpecialistDispatchOutcome, SpecialistRunReport, SpecialistRunner};
 pub use specialist_tick::{
     RoleKindLookup, SpecialistDispatchQueue, SpecialistDispatchRequest, SpecialistQueueTick,

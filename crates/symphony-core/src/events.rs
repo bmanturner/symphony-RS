@@ -60,6 +60,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentEvent, SessionId};
+use crate::concurrency_gate::ScopeKind;
 use crate::retry::RetryReason;
 use crate::state_machine::{ClaimState, ReleaseReason};
 use crate::tracker::{IssueId, IssueState};
@@ -212,6 +213,45 @@ pub enum OrchestratorEvent {
         /// (i.e. [`ReleaseReason::Missing`]).
         final_state: Option<IssueState>,
     },
+
+    /// A dispatch could not run because at least one
+    /// [`crate::concurrency_gate::ConcurrencyGate`] scope was at cap.
+    ///
+    /// Emitted exactly once per *contention episode* — defined as the
+    /// span over which a given dispatch keeps re-deferring against the
+    /// same `(scope_kind, scope_key)` tuple. A request that contends on
+    /// the same scope across ten consecutive scheduler ticks emits one
+    /// `ScopeCapReached`, not ten. When the request finally dispatches
+    /// (or the scope key changes) the episode ends; a fresh contention
+    /// against the same scope after the episode ends is a new episode
+    /// and emits again.
+    ///
+    /// Persisted by the orchestrator alongside broadcast so an operator
+    /// can answer "why is this issue not running" from event history.
+    /// The dedup primitive lives in
+    /// [`crate::scope_contention_log::ScopeContentionEventLog`].
+    ScopeCapReached {
+        /// Durable run row the contended dispatch is associated with,
+        /// when the runner has reserved one. `None` for runners whose
+        /// dispatch identity is not a `runs.id` (today: follow-up
+        /// approval, budget pause).
+        #[serde(default)]
+        run_id: Option<i64>,
+        /// Tracker-facing identifier of the parked dispatch, when the
+        /// runner carries one. `None` when the runner identifies
+        /// dispatches purely by an internal id (e.g. `FollowupId`).
+        #[serde(default)]
+        identifier: Option<String>,
+        /// Which scope kind hit cap.
+        scope_kind: ScopeKind,
+        /// Key of the contended scope (role / agent profile / repo
+        /// slug, or `""` for [`ScopeKind::Global`]).
+        scope_key: String,
+        /// In-flight permits on the contended scope at rejection.
+        in_flight: u32,
+        /// Configured cap on the contended scope.
+        cap: u32,
+    },
 }
 
 impl OrchestratorEvent {
@@ -230,7 +270,9 @@ impl OrchestratorEvent {
             | OrchestratorEvent::Agent { issue, .. }
             | OrchestratorEvent::RetryScheduled { issue, .. }
             | OrchestratorEvent::Released { issue, .. } => Some(issue),
-            OrchestratorEvent::Reconciled { .. } => None,
+            OrchestratorEvent::Reconciled { .. } | OrchestratorEvent::ScopeCapReached { .. } => {
+                None
+            }
         }
     }
 
@@ -247,6 +289,7 @@ impl OrchestratorEvent {
             OrchestratorEvent::RetryScheduled { .. } => "retry_scheduled",
             OrchestratorEvent::Reconciled { .. } => "reconciled",
             OrchestratorEvent::Released { .. } => "released",
+            OrchestratorEvent::ScopeCapReached { .. } => "scope_cap_reached",
         }
     }
 }
@@ -381,6 +424,71 @@ mod tests {
     }
 
     #[test]
+    fn scope_cap_reached_serialises_with_type_tag_and_snake_case_kind() {
+        let ev = OrchestratorEvent::ScopeCapReached {
+            run_id: Some(42),
+            identifier: Some("ENG-9".into()),
+            scope_kind: ScopeKind::AgentProfile,
+            scope_key: "claude-default".into(),
+            in_flight: 3,
+            cap: 3,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "scope_cap_reached");
+        assert_eq!(v["run_id"], 42);
+        assert_eq!(v["identifier"], "ENG-9");
+        assert_eq!(v["scope_kind"], "agent_profile");
+        assert_eq!(v["scope_key"], "claude-default");
+        assert_eq!(v["in_flight"], 3);
+        assert_eq!(v["cap"], 3);
+        assert!(ev.issue().is_none());
+        assert_eq!(ev.kind(), "scope_cap_reached");
+    }
+
+    #[test]
+    fn scope_cap_reached_carries_optional_run_id_and_identifier() {
+        // Followup-approval / budget-pause runners don't carry a
+        // run_id+identifier pair; the wire format must accept absences.
+        let ev = OrchestratorEvent::ScopeCapReached {
+            run_id: None,
+            identifier: None,
+            scope_kind: ScopeKind::Global,
+            scope_key: "".into(),
+            in_flight: 5,
+            cap: 5,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: OrchestratorEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn scope_cap_reached_deserialises_with_default_optional_fields() {
+        // Future emitters may omit run_id / identifier entirely. The
+        // serde defaults must accept that without breaking decode.
+        let raw = r#"{"type":"scope_cap_reached","scope_kind":"role","scope_key":"qa","in_flight":2,"cap":2}"#;
+        let ev: OrchestratorEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            OrchestratorEvent::ScopeCapReached {
+                run_id,
+                identifier,
+                scope_kind,
+                scope_key,
+                in_flight,
+                cap,
+            } => {
+                assert!(run_id.is_none());
+                assert!(identifier.is_none());
+                assert_eq!(scope_kind, ScopeKind::Role);
+                assert_eq!(scope_key, "qa");
+                assert_eq!(in_flight, 2);
+                assert_eq!(cap, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn round_trip_preserves_all_variants() {
         let cases = vec![
             OrchestratorEvent::StateChanged {
@@ -406,6 +514,14 @@ mod tests {
             },
             OrchestratorEvent::Reconciled {
                 dropped: vec![issue("ENG-4")],
+            },
+            OrchestratorEvent::ScopeCapReached {
+                run_id: Some(7),
+                identifier: Some("ENG-5".into()),
+                scope_kind: ScopeKind::Repository,
+                scope_key: "foglet/symphony".into(),
+                in_flight: 1,
+                cap: 1,
             },
         ];
         for ev in cases {

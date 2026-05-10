@@ -622,6 +622,29 @@ impl AppState {
                     None,
                 );
             }
+            OrchestratorEvent::ScopeCapReached {
+                run_id,
+                identifier,
+                scope_kind,
+                scope_key,
+                in_flight,
+                cap,
+            } => {
+                let label = identifier
+                    .clone()
+                    .or_else(|| run_id.map(|id| format!("run#{id}")))
+                    .unwrap_or_else(|| "<unknown>".into());
+                let scope_label = if scope_key.is_empty() {
+                    format!("{scope_kind:?}")
+                } else {
+                    format!("{scope_kind:?}({scope_key})")
+                };
+                self.push_recent(
+                    "scope_cap_reached",
+                    format!("{label} blocked on {scope_label} {in_flight}/{cap}"),
+                    identifier.clone(),
+                );
+            }
         }
     }
 

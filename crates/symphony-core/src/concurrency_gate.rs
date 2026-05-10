@@ -25,11 +25,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 /// The kind of scope a permit is held against.
 ///
 /// Mirrors the four cap surfaces in
-/// `symphony_config::ConcurrencyConfig`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// `symphony_config::ConcurrencyConfig`. Serialised as a snake_case
+/// string so downstream wire formats (e.g.
+/// [`crate::events::OrchestratorEvent::ScopeCapReached`]) can include it
+/// without bespoke encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
     /// Single global bucket. Always keyed by [`Scope::GLOBAL_KEY`].
     Global,
