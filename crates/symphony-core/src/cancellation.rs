@@ -22,10 +22,13 @@
 //!   method that consumes a run-keyed entry without disturbing
 //!   work-item-keyed entries.
 //!
-//! Persistence is a separate checklist subtask (`cancel_requests` table
-//! + repository + startup hydration) — this primitive is the in-memory
-//!   seam runners depend on. The composition root will write through to
-//!   the repository on `enqueue` and `drain_for_run` calls.
+//! Persistence lives in `symphony-state::cancel_requests`: the
+//! repository mirrors every `enqueue` / `drain_*` call into the
+//! `cancel_requests` table, and [`CancellationQueue::from_pending`]
+//! rebuilds this in-memory primitive at startup from
+//! `CancelRequestRepository::list_pending_cancel_requests`. Together
+//! they guarantee that an operator-issued cancel survives a scheduler
+//! crash and is still observable to runners after recovery.
 //!
 //! Note: work-item cancellation cascading to in-flight child runs is the
 //! responsibility of a separate `CancellationPropagator` (also a later
@@ -153,6 +156,21 @@ impl CancellationQueue {
     /// Construct an empty queue.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Reconstruct a queue from a set of already-pending cancel
+    /// requests — typically rows the persistence layer hydrated at
+    /// startup. Last-write-wins on duplicate subjects, matching
+    /// [`Self::enqueue`]'s replace semantics; the durable layer's
+    /// partial unique index makes that case unreachable in practice,
+    /// but the constructor stays defensive so a tampered DB cannot
+    /// produce two pending entries for the same subject in memory.
+    pub fn from_pending(requests: impl IntoIterator<Item = CancelRequest>) -> Self {
+        let mut queue = Self::new();
+        for request in requests {
+            queue.enqueue(request);
+        }
+        queue
     }
 
     /// Insert (or replace) a pending request keyed on its subject.
@@ -366,6 +384,36 @@ mod tests {
         let json = serde_json::to_string(&wi_req).expect("serialize");
         let back: CancelRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, wi_req);
+    }
+
+    #[test]
+    fn from_pending_seeds_both_keyspaces_and_preserves_order_independence() {
+        let queue = CancellationQueue::from_pending([
+            req_for_run(1, "run-cancel"),
+            req_for_work_item(1, "wi-cancel"),
+        ]);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue.pending_for_run(RunRef::new(1)).map(|r| &r.reason),
+            Some(&"run-cancel".to_string()),
+        );
+        assert_eq!(
+            queue
+                .pending_for_work_item(WorkItemId::new(1))
+                .map(|r| &r.reason),
+            Some(&"wi-cancel".to_string()),
+        );
+    }
+
+    #[test]
+    fn from_pending_is_idempotent_and_last_write_wins_on_duplicate_subject() {
+        let queue =
+            CancellationQueue::from_pending([req_for_run(1, "first"), req_for_run(1, "second")]);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.pending_for_run(RunRef::new(1)).map(|r| &r.reason),
+            Some(&"second".to_string()),
+        );
     }
 
     #[test]

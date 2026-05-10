@@ -489,12 +489,63 @@ const V2_RUNS_STATUS_CHECK: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 5] = [
+/// Adds the `cancel_requests` table backing the durable side of the
+/// cooperative-cancellation primitive (SPEC v2 §4.5 / Phase 11.5).
+///
+/// Each row is one operator-issued (or cascade-issued) cancel intent
+/// against a [`symphony_core::cancellation::CancelSubject`]. Subjects
+/// live in two disjoint keyspaces — runs and work items — so the
+/// `subject_kind` discriminator is part of every uniqueness check. The
+/// in-memory [`symphony_core::cancellation::CancellationQueue`] enforces
+/// "at most one pending request per subject"; the durable table mirrors
+/// that invariant via a partial unique index on
+/// `(subject_kind, subject_id) WHERE state = 'pending'` so the two
+/// layers cannot disagree about pending count after a restart.
+///
+/// `state = 'pending'` is the live entry consulted by runners pre-lease;
+/// `state = 'drained'` is the audit row left behind once a runner has
+/// observed the cancel and transitioned the run/work item to its
+/// terminal state. Drained rows survive for replay/observability —
+/// purging is a later operability concern.
+///
+/// FK choice: `subject_id` is *not* a foreign key because work items
+/// and runs share the same column. Surface integrity is enforced at
+/// write time by the kernel, which only enqueues against ids it
+/// already knows.
+const V2_CANCEL_REQUESTS: Migration = Migration {
+    version: 2_026_050_806,
+    name: "v2_cancel_requests",
+    sql: r#"
+        CREATE TABLE cancel_requests (
+            id             INTEGER PRIMARY KEY,
+            subject_kind   TEXT    NOT NULL
+                CHECK (subject_kind IN ('run', 'work_item')),
+            subject_id     INTEGER NOT NULL,
+            reason         TEXT    NOT NULL,
+            requested_by   TEXT    NOT NULL,
+            requested_at   TEXT    NOT NULL,
+            state          TEXT    NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'drained')),
+            created_at     TEXT    NOT NULL,
+            drained_at     TEXT
+        );
+
+        CREATE UNIQUE INDEX idx_cancel_requests_pending_subject
+            ON cancel_requests(subject_kind, subject_id)
+            WHERE state = 'pending';
+
+        CREATE INDEX idx_cancel_requests_state
+            ON cancel_requests(state);
+    "#,
+};
+
+const MIGRATIONS: [Migration; 6] = [
     V2_INITIAL_SCHEMA,
     V2_INTEGRATION_RECORDS,
     V2_PULL_REQUEST_RECORDS,
     V2_QA_VERDICT_AUTHORSHIP,
     V2_RUNS_STATUS_CHECK,
+    V2_CANCEL_REQUESTS,
 ];
 
 #[cfg(test)]
@@ -535,6 +586,7 @@ mod tests {
             "pending_tracker_syncs",
             "budget_pauses",
             "integration_records",
+            "cancel_requests",
         ] {
             assert!(table_exists(&db, table), "missing table `{table}`");
         }
@@ -551,6 +603,7 @@ mod tests {
                 2_026_050_803,
                 2_026_050_804,
                 2_026_050_805,
+                2_026_050_806,
             ]
         );
     }
@@ -568,6 +621,7 @@ mod tests {
                 2_026_050_803,
                 2_026_050_804,
                 2_026_050_805,
+                2_026_050_806,
             ]
         );
         assert!(first.skipped.is_empty());
@@ -580,6 +634,7 @@ mod tests {
                 2_026_050_803,
                 2_026_050_804,
                 2_026_050_805,
+                2_026_050_806,
             ]
         );
     }
