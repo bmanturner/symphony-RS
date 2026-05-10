@@ -263,7 +263,7 @@ impl IntegrationQueueRepository for StateDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+    use crate::edges::{EdgeSource, EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
     use crate::migrations::migrations;
     use crate::repository::{NewWorkItem, WorkItemRepository};
 
@@ -304,6 +304,7 @@ mod tests {
             edge_type: EdgeType::ParentChild,
             reason: None,
             status: "linked",
+            source: EdgeSource::Unknown,
             now: "2026-05-08T00:00:00Z",
         })
         .expect("link parent_child");
@@ -316,6 +317,7 @@ mod tests {
             edge_type: EdgeType::Blocks,
             reason: Some("test"),
             status: "open",
+            source: EdgeSource::Unknown,
             now: "2026-05-08T00:00:00Z",
         })
         .expect("open blocker");
@@ -409,6 +411,7 @@ mod tests {
                 edge_type: EdgeType::Blocks,
                 reason: Some("test"),
                 status: "open",
+                source: EdgeSource::Unknown,
                 now: "2026-05-08T00:00:00Z",
             })
             .unwrap();

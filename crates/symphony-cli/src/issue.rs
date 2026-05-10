@@ -338,7 +338,7 @@ fn section(title: &str, edges: &[EdgeWithPeer], dir: ArrowDir) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use symphony_state::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+    use symphony_state::edges::{EdgeSource, EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
     use symphony_state::migrations::migrations;
     use symphony_state::repository::{NewWorkItem, WorkItemRepository};
 
@@ -383,6 +383,7 @@ mod tests {
             edge_type: kind,
             reason,
             status,
+            source: EdgeSource::Unknown,
             now: "2026-05-08T00:00:00Z",
         })
         .unwrap();

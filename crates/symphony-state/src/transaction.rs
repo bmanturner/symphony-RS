@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn parent_child_edges_and_blocker_propagation_are_atomic() {
-        use crate::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+        use crate::edges::{EdgeSource, EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
 
         let mut db = open();
         let now = "2026-05-08T00:00:00Z";
@@ -385,6 +385,7 @@ mod tests {
                     edge_type: EdgeType::ParentChild,
                     reason: Some("decomposition"),
                     status: "linked",
+                    source: EdgeSource::Decomposition,
                     now,
                 })?;
                 let blocker_edge = tx.create_edge(NewWorkItemEdge {
@@ -393,6 +394,7 @@ mod tests {
                     edge_type: EdgeType::Blocks,
                     reason: Some("needs schema"),
                     status: "open",
+                    source: EdgeSource::Qa,
                     now,
                 })?;
 

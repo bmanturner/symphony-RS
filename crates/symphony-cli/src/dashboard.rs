@@ -879,7 +879,7 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use symphony_state::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+    use symphony_state::edges::{EdgeSource, EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
     use symphony_state::migrations::migrations;
     use symphony_state::repository::{NewRun, NewWorkItem, RunRepository, WorkItemRepository};
 
@@ -998,6 +998,7 @@ mod tests {
             edge_type: EdgeType::Blocks,
             reason: Some("smoke test failed"),
             status: "open",
+            source: EdgeSource::Unknown,
             now: "2026-01-01T00:00:00Z",
         })
         .expect("edge");
@@ -1077,6 +1078,7 @@ mod tests {
                 edge_type: EdgeType::Blocks,
                 reason: Some("ci red".into()),
                 status: "open".into(),
+                source: EdgeSource::Unknown,
                 created_at: "2026-01-01T00:00:00Z".into(),
             },
         });

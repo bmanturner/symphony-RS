@@ -17,7 +17,7 @@ use symphony_core::recovery_tick::{
     RecoveryDispatchQueue, RecoveryDispatchRequest, RecoveryQueueSource, RecoveryQueueTick,
     RecoveryRunId,
 };
-use symphony_state::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+use symphony_state::edges::{EdgeSource, EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
 use symphony_state::events::{EventRepository, NewEvent};
 use symphony_state::integration_queue::IntegrationQueueRepository;
 use symphony_state::migrations::migrations;
@@ -393,6 +393,7 @@ async fn queued_running_and_blocked_work_recover_after_restart() {
             edge_type: EdgeType::ParentChild,
             reason: Some("decomposed child"),
             status: "linked",
+            source: EdgeSource::Unknown,
             now: NOW,
         })
         .expect("parent child edge");
@@ -402,6 +403,7 @@ async fn queued_running_and_blocked_work_recover_after_restart() {
             edge_type: EdgeType::Blocks,
             reason: Some("QA rejected restart recovery evidence"),
             status: "open",
+            source: EdgeSource::Qa,
             now: NOW,
         })
         .expect("blocker edge");

@@ -377,7 +377,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use symphony_state::cancel_requests::CancelRequestState;
-    use symphony_state::edges::{EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
+    use symphony_state::edges::{EdgeSource, EdgeType, NewWorkItemEdge, WorkItemEdgeRepository};
     use symphony_state::migrations::migrations;
     use symphony_state::repository::{NewRun, NewWorkItem, WorkItemRepository};
 
@@ -502,6 +502,7 @@ mod tests {
             edge_type: EdgeType::ParentChild,
             reason: None,
             status: "linked",
+            source: EdgeSource::Unknown,
             now,
         })
         .unwrap();
@@ -511,6 +512,7 @@ mod tests {
             edge_type: EdgeType::ParentChild,
             reason: None,
             status: "linked",
+            source: EdgeSource::Unknown,
             now,
         })
         .unwrap();
@@ -520,6 +522,7 @@ mod tests {
             edge_type: EdgeType::ParentChild,
             reason: None,
             status: "linked",
+            source: EdgeSource::Unknown,
             now,
         })
         .unwrap();

@@ -539,13 +539,25 @@ const V2_CANCEL_REQUESTS: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 6] = [
+const V3_EDGE_PROVENANCE: Migration = Migration {
+    version: 2_026_051_001,
+    name: "v3_edge_provenance",
+    sql: r#"
+        ALTER TABLE work_item_edges
+            ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'
+                CHECK (source IN
+                    ('unknown', 'decomposition', 'qa', 'followup', 'human'));
+    "#,
+};
+
+const MIGRATIONS: [Migration; 7] = [
     V2_INITIAL_SCHEMA,
     V2_INTEGRATION_RECORDS,
     V2_PULL_REQUEST_RECORDS,
     V2_QA_VERDICT_AUTHORSHIP,
     V2_RUNS_STATUS_CHECK,
     V2_CANCEL_REQUESTS,
+    V3_EDGE_PROVENANCE,
 ];
 
 #[cfg(test)]
@@ -604,6 +616,7 @@ mod tests {
                 2_026_050_804,
                 2_026_050_805,
                 2_026_050_806,
+                2_026_051_001,
             ]
         );
     }
@@ -622,6 +635,7 @@ mod tests {
                 2_026_050_804,
                 2_026_050_805,
                 2_026_050_806,
+                2_026_051_001,
             ]
         );
         assert!(first.skipped.is_empty());
@@ -635,6 +649,7 @@ mod tests {
                 2_026_050_804,
                 2_026_050_805,
                 2_026_050_806,
+                2_026_051_001,
             ]
         );
     }

@@ -46,6 +46,51 @@ pub enum EdgeType {
     FollowupOf,
 }
 
+/// Provenance for a relationship row.
+///
+/// v3 dependency orchestration needs to distinguish decomposition-created
+/// sequencing blockers from QA, follow-up, or human blockers because only
+/// decomposition blockers are eligible for automatic resolution when their
+/// prerequisite child reaches a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EdgeSource {
+    /// Source predates provenance tracking or is not yet classified.
+    Unknown,
+    /// Created from `ChildProposal.depends_on` during decomposition apply.
+    Decomposition,
+    /// Created by a QA gate verdict or QA blocker request.
+    Qa,
+    /// Created by follow-up issue policy.
+    Followup,
+    /// Created by a human/operator action.
+    Human,
+}
+
+impl EdgeSource {
+    /// Stable lowercase identifier used in SQL and JSON payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Decomposition => "decomposition",
+            Self::Qa => "qa",
+            Self::Followup => "followup",
+            Self::Human => "human",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`].
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "unknown" => Self::Unknown,
+            "decomposition" => Self::Decomposition,
+            "qa" => Self::Qa,
+            "followup" => Self::Followup,
+            "human" => Self::Human,
+            _ => return None,
+        })
+    }
+}
+
 impl EdgeType {
     /// Stable lowercase identifier used in SQL and JSON payloads.
     pub fn as_str(self) -> &'static str {
@@ -91,6 +136,9 @@ pub struct WorkItemEdgeRecord {
     /// Lifecycle status. The propagation query treats `"open"` as
     /// blocking and everything else as terminal.
     pub status: String,
+    /// Provenance for this edge. Gates can use this to decide whether
+    /// automatic resolution is safe.
+    pub source: EdgeSource,
     /// RFC3339 row creation timestamp.
     pub created_at: String,
 }
@@ -110,6 +158,8 @@ pub struct NewWorkItemEdge<'a> {
     /// gate progress; use whatever the workflow records for non-blocking
     /// links (typical convention: `"linked"`).
     pub status: &'a str,
+    /// Provenance for this edge.
+    pub source: EdgeSource,
     /// RFC3339 row creation timestamp.
     pub now: &'a str,
 }
@@ -177,7 +227,7 @@ pub trait WorkItemEdgeRepository {
     fn list_descendants_via_parent_child(&self, root: WorkItemId) -> StateResult<Vec<WorkItemId>>;
 }
 
-const EDGE_COLUMNS: &str = "id, parent_id, child_id, edge_type, reason, status, created_at";
+const EDGE_COLUMNS: &str = "id, parent_id, child_id, edge_type, reason, status, source, created_at";
 
 fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemEdgeRecord> {
     let raw_kind: String = row.get(3)?;
@@ -195,7 +245,17 @@ fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkItemEdgeRecord> {
         edge_type,
         reason: row.get(4)?,
         status: row.get(5)?,
-        created_at: row.get(6)?,
+        source: {
+            let raw_source: String = row.get(6)?;
+            EdgeSource::parse(&raw_source).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    format!("unknown edge source `{raw_source}`").into(),
+                )
+            })?
+        },
+        created_at: row.get(7)?,
     })
 }
 
@@ -205,14 +265,15 @@ pub(crate) fn create_edge_in(
 ) -> StateResult<WorkItemEdgeRecord> {
     conn.execute(
         "INSERT INTO work_item_edges \
-            (parent_id, child_id, edge_type, reason, status, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (parent_id, child_id, edge_type, reason, status, source, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             new.parent_id.0,
             new.child_id.0,
             new.edge_type.as_str(),
             new.reason,
             new.status,
+            new.source.as_str(),
             new.now,
         ],
     )?;
@@ -415,6 +476,7 @@ mod tests {
             edge_type: kind,
             reason,
             status,
+            source: EdgeSource::Unknown,
             now: "2026-05-08T00:00:00Z",
         }
     }
@@ -452,6 +514,42 @@ mod tests {
         assert_eq!(fetched.edge_type, EdgeType::ParentChild);
         assert_eq!(fetched.reason.as_deref(), Some("decomposition step 1"));
         assert_eq!(fetched.status, "linked");
+        assert_eq!(fetched.source, EdgeSource::Unknown);
+    }
+
+    #[test]
+    fn edge_source_round_trips_through_as_str_and_parse() {
+        for source in [
+            EdgeSource::Unknown,
+            EdgeSource::Decomposition,
+            EdgeSource::Qa,
+            EdgeSource::Followup,
+            EdgeSource::Human,
+        ] {
+            assert_eq!(EdgeSource::parse(source.as_str()), Some(source));
+        }
+        assert!(EdgeSource::parse("from_the_future").is_none());
+    }
+
+    #[test]
+    fn create_edge_persists_source_provenance() {
+        let mut db = open();
+        let blocker = seed_item(&mut db, "ENG-1");
+        let blocked = seed_item(&mut db, "ENG-2");
+        let edge = db
+            .create_edge(NewWorkItemEdge {
+                parent_id: blocker,
+                child_id: blocked,
+                edge_type: EdgeType::Blocks,
+                reason: Some("api depends on schema"),
+                status: "open",
+                source: EdgeSource::Decomposition,
+                now: "2026-05-08T00:00:00Z",
+            })
+            .expect("create decomposition blocker");
+
+        let fetched = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(fetched.source, EdgeSource::Decomposition);
     }
 
     #[test]
