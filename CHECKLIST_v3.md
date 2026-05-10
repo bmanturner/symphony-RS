@@ -72,11 +72,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 7 — Integration and QA Gate Interactions
 
-- [ ] Ensure integration queue still requires required children terminal and no open blockers before platform-lead integration.
-- [ ] Ensure QA gate remains a post-integration verdict over the integrated branch/draft PR, not a normal child issue by default.
-- [ ] Ensure QA-created blockers and decomposition dependency blockers coexist without collapsing provenance.
-- [ ] Add tests proving parent integration is blocked while any required sequential child remains blocked/non-terminal.
-- [ ] Add tests proving QA blocker failures do not auto-resolve merely because a decomposition dependency resolved.
+- [x] Ensure integration queue still requires required children terminal and no open blockers before platform-lead integration.
+- [x] Ensure QA gate remains a post-integration verdict over the integrated branch/draft PR, not a normal child issue by default.
+- [x] Ensure QA-created blockers and decomposition dependency blockers coexist without collapsing provenance.
+- [x] Add tests proving parent integration is blocked while any required sequential child remains blocked/non-terminal.
+- [x] Add tests proving QA blocker failures do not auto-resolve merely because a decomposition dependency resolved.
 
 ## Phase 8 — Observability and Operator Surface
 

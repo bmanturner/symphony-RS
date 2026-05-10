@@ -400,6 +400,31 @@ mod tests {
     }
 
     #[test]
+    fn decomposition_dependency_blocker_excludes_parent_integration() {
+        let mut db = open();
+        let parent = seed_item(&mut db, "ENG-1", "running", "2026-05-08T00:00:00Z");
+        let a = seed_item(&mut db, "ENG-2", "done", "2026-05-08T00:00:01Z");
+        let b = seed_item(&mut db, "ENG-3", "blocked", "2026-05-08T00:00:02Z");
+        link_parent_child(&mut db, parent, a);
+        link_parent_child(&mut db, parent, b);
+        db.create_edge(NewWorkItemEdge {
+            parent_id: a,
+            child_id: b,
+            edge_type: EdgeType::Blocks,
+            reason: Some("B depends on A"),
+            status: "open",
+            source: EdgeSource::Decomposition,
+            now: "2026-05-08T00:00:03Z",
+        })
+        .expect("decomposition dependency blocker");
+
+        assert!(
+            db.list_ready_for_integration().unwrap().is_empty(),
+            "parent integration must wait while a required sequential child is blocked/non-terminal"
+        );
+    }
+
+    #[test]
     fn resolved_blocker_does_not_exclude_parent() {
         let mut db = open();
         let parent = seed_item(&mut db, "ENG-1", "integration", "2026-05-08T00:00:00Z");

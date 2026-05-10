@@ -389,6 +389,24 @@ mod tests {
     }
 
     #[test]
+    fn qa_queue_is_post_integration_gate_not_child_issue_by_default() {
+        let mut db = open();
+        let parent = seed_item(&mut db, "ENG-1", "integration", "2026-05-08T00:00:00Z");
+        let run = seed_run(&mut db, parent, "2026-05-08T00:01:00Z");
+        seed_succeeded_integration(&mut db, parent, run, "2026-05-08T00:02:00Z");
+
+        let queue = db.list_ready_for_qa().unwrap();
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id(), parent);
+        assert_eq!(queue[0].cause, QaQueueCause::IntegrationConsolidated);
+        assert!(
+            db.list_children(parent).unwrap().is_empty(),
+            "QA readiness is derived from integration records, not a synthetic QA child issue"
+        );
+    }
+
+    #[test]
     fn direct_cause_takes_precedence_over_integration_consolidated() {
         let mut db = open();
         // Parent already promoted to `qa` AND has a successful integration.
