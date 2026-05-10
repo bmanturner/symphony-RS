@@ -751,6 +751,20 @@ impl WorkspaceClaim {
         self.verification.record(check);
         passed
     }
+
+    /// Run the full mutation-capable pre-launch gate sequence for this
+    /// claim: cwd containment, branch/ref match, then clean-tree policy.
+    ///
+    /// Returns `true` only when every required launch gate passes. The
+    /// checks intentionally continue after the first failure so the
+    /// resulting [`VerificationReport`] is useful evidence for operators
+    /// and QA, not only a boolean denial.
+    pub async fn verify_pre_launch(&mut self, cwd: &Path, require_clean_tree: bool) -> bool {
+        let cwd_ok = self.verify_cwd(cwd);
+        let branch_ok = self.verify_branch().await;
+        let clean_ok = self.verify_clean_tree(require_clean_tree).await;
+        cwd_ok && branch_ok && clean_ok
+    }
 }
 
 /// Abstract per-issue workspace lifecycle.
