@@ -43,7 +43,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [x] Add orchestration path that calls `TrackerMutations::add_blocker` for each decomposition dependency edge when capability and policy allow.
 - [x] Persist returned tracker edge IDs where adapters provide them.
-- [ ] Implement `tracker_sync: required` behavior: keep affected children blocked when tracker blocker mutation fails.
+- [x] Implement `tracker_sync: required` behavior: keep affected children blocked when tracker blocker mutation fails.
 - [ ] Implement `tracker_sync: best_effort` behavior: local gating remains authoritative while failed tracker sync is visible/retryable.
 - [ ] Implement `tracker_sync: local_only` behavior: skip tracker blocker mutation and optionally render advisory comments/text.
 - [ ] Add Linear mutation tests proving `issueRelationCreate(type: "blocks")` is called with `issue_id = blocker` and `related_issue_id = blocked`.

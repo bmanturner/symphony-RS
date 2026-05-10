@@ -205,6 +205,18 @@ pub struct TrackerEdgeSyncSuccess<'a> {
     pub attempted_at: &'a str,
 }
 
+/// Failed tracker mirror metadata for an existing dependency edge.
+#[derive(Debug, Clone)]
+pub struct TrackerEdgeSyncFailure<'a> {
+    /// Local `work_item_edges` row whose tracker mirror failed.
+    pub edge_id: EdgeId,
+    /// Operator-facing tracker error. Stored durably for retry and
+    /// status surfaces.
+    pub error: &'a str,
+    /// RFC3339 timestamp for this sync attempt.
+    pub attempted_at: &'a str,
+}
+
 /// CRUD over `work_item_edges`.
 pub trait WorkItemEdgeRepository {
     /// Insert a new edge and return its persisted form.
@@ -241,6 +253,13 @@ pub trait WorkItemEdgeRepository {
     fn record_tracker_edge_sync_success(
         &mut self,
         success: TrackerEdgeSyncSuccess<'_>,
+    ) -> StateResult<bool>;
+
+    /// Record that a local dependency edge failed to mirror to the
+    /// tracker. Returns `Ok(false)` when the row does not exist.
+    fn record_tracker_edge_sync_failure(
+        &mut self,
+        failure: TrackerEdgeSyncFailure<'_>,
     ) -> StateResult<bool>;
 
     /// List edges where `parent_id = source` and `edge_type = kind`,
@@ -435,6 +454,22 @@ pub(crate) fn record_tracker_edge_sync_success_in(
     Ok(updated == 1)
 }
 
+pub(crate) fn record_tracker_edge_sync_failure_in(
+    conn: &Connection,
+    failure: TrackerEdgeSyncFailure<'_>,
+) -> StateResult<bool> {
+    let updated = conn.execute(
+        "UPDATE work_item_edges
+            SET tracker_sync_status = 'failed',
+                tracker_sync_last_error = ?2,
+                tracker_sync_attempts = tracker_sync_attempts + 1,
+                tracker_sync_last_attempt_at = ?3
+          WHERE id = ?1",
+        params![failure.edge_id.0, failure.error, failure.attempted_at],
+    )?;
+    Ok(updated == 1)
+}
+
 pub(crate) fn list_outgoing_in(
     conn: &Connection,
     source: WorkItemId,
@@ -566,6 +601,13 @@ impl WorkItemEdgeRepository for StateDb {
         success: TrackerEdgeSyncSuccess<'_>,
     ) -> StateResult<bool> {
         record_tracker_edge_sync_success_in(self.conn(), success)
+    }
+
+    fn record_tracker_edge_sync_failure(
+        &mut self,
+        failure: TrackerEdgeSyncFailure<'_>,
+    ) -> StateResult<bool> {
+        record_tracker_edge_sync_failure_in(self.conn(), failure)
     }
 
     fn list_outgoing(
@@ -1008,6 +1050,46 @@ mod tests {
         assert_eq!(fetched.tracker_edge_id, None);
         assert_eq!(fetched.tracker_sync_status.as_deref(), Some("synced"));
         assert_eq!(fetched.tracker_sync_attempts, 1);
+    }
+
+    #[test]
+    fn record_tracker_edge_sync_failure_persists_retry_metadata_without_closing_edge() {
+        let mut db = open();
+        let blocker = seed_item(&mut db, "ENG-1");
+        let blocked = seed_item(&mut db, "ENG-2");
+        let edge = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: blocker,
+                blocked_id: blocked,
+                reason: "blocked depends on blocker",
+                now: "2026-05-08T00:00:00Z",
+            }])
+            .expect("create dependency blocker")
+            .pop()
+            .expect("edge should be returned");
+
+        assert!(
+            db.record_tracker_edge_sync_failure(TrackerEdgeSyncFailure {
+                edge_id: edge.id,
+                error: "Linear timeout",
+                attempted_at: "2026-05-08T00:02:00Z",
+            })
+            .expect("record tracker sync failure")
+        );
+
+        let fetched = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(fetched.status, "open");
+        assert_eq!(fetched.tracker_edge_id, None);
+        assert_eq!(fetched.tracker_sync_status.as_deref(), Some("failed"));
+        assert_eq!(
+            fetched.tracker_sync_last_error.as_deref(),
+            Some("Linear timeout")
+        );
+        assert_eq!(fetched.tracker_sync_attempts, 1);
+        assert_eq!(
+            fetched.tracker_sync_last_attempt_at.as_deref(),
+            Some("2026-05-08T00:02:00Z")
+        );
     }
 
     #[test]

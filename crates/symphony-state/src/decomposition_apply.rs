@@ -15,8 +15,8 @@ use symphony_core::decomposition_applier::{AppliedChild, AppliedDecomposition};
 use symphony_core::work_item::WorkItemStatusClass;
 
 use crate::edges::{
-    EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge, WorkItemEdgeRecord,
-    WorkItemEdgeRepository,
+    EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge, TrackerEdgeSyncFailure,
+    WorkItemEdgeRecord, WorkItemEdgeRepository,
 };
 use crate::repository::{NewWorkItem, WorkItemId, WorkItemRecord};
 use crate::{StateDb, StateError};
@@ -109,6 +109,37 @@ pub enum PersistAppliedDecompositionError {
 /// Result alias for [`persist_applied_decomposition`].
 pub type PersistAppliedDecompositionResult =
     Result<PersistedAppliedDecomposition, PersistAppliedDecompositionError>;
+
+/// Record a required tracker blocker-sync failure and park the blocked
+/// child.
+///
+/// `tracker_sync: required` means the local edge may exist, but the
+/// downstream child must not be treated as dispatchable until the
+/// structural tracker mutation succeeds or policy explicitly changes.
+/// This helper keeps those two facts atomic: the edge receives durable
+/// failure metadata, and the edge's `child_id` work item returns to the
+/// `blocked` status class for specialist gating and operator status.
+pub fn record_required_dependency_sync_failure(
+    db: &mut StateDb,
+    edge: &WorkItemEdgeRecord,
+    error: &str,
+    now: &str,
+) -> crate::StateResult<()> {
+    db.transaction(|tx| {
+        tx.record_tracker_edge_sync_failure(TrackerEdgeSyncFailure {
+            edge_id: edge.id,
+            error,
+            attempted_at: now,
+        })?;
+        tx.update_work_item_status(
+            edge.child_id,
+            WorkItemStatusClass::Blocked.as_str(),
+            "blocked",
+            now,
+        )?;
+        Ok(())
+    })
+}
 
 /// Persist tracker-created decomposition children and their local graph.
 ///
@@ -573,5 +604,52 @@ mod tests {
         for child_id in child_ids {
             assert!(db.list_incoming_open_blockers(child_id).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn required_tracker_sync_failure_keeps_blocked_child_parked() {
+        let mut db = open();
+        let parent = seed_parent(&mut db);
+        let proposal = proposal(parent);
+        let persisted =
+            persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
+                .expect("dependencies materialize");
+        let edge = persisted
+            .dependency_edges
+            .iter()
+            .find(|edge| edge.reason.as_deref() == Some("B depends on A"))
+            .expect("B is blocked by A")
+            .clone();
+
+        let blocked_child_before = db.get_work_item(edge.child_id).unwrap().unwrap();
+        assert_eq!(
+            blocked_child_before.status_class,
+            WorkItemStatusClass::Ready.as_str()
+        );
+
+        record_required_dependency_sync_failure(
+            &mut db,
+            &edge,
+            "Linear issueRelationCreate failed",
+            "2026-05-10T00:01:00Z",
+        )
+        .expect("record required sync failure");
+
+        let failed_edge = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(failed_edge.status, "open");
+        assert_eq!(failed_edge.tracker_sync_status.as_deref(), Some("failed"));
+        assert_eq!(
+            failed_edge.tracker_sync_last_error.as_deref(),
+            Some("Linear issueRelationCreate failed")
+        );
+        assert_eq!(failed_edge.tracker_sync_attempts, 1);
+
+        let blocked_child_after = db.get_work_item(edge.child_id).unwrap().unwrap();
+        assert_eq!(
+            blocked_child_after.status_class,
+            WorkItemStatusClass::Blocked.as_str()
+        );
+        assert_eq!(blocked_child_after.tracker_status, "blocked");
+        assert_eq!(blocked_child_after.updated_at, "2026-05-10T00:01:00Z");
     }
 }
