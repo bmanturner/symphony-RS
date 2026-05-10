@@ -43,8 +43,8 @@ mock agent.
 ## Phase 3 — Read Tools
 
 - [x] Extend `TrackerRead` (in `crates/symphony-core/src/tracker_trait.rs`) with `list_comments` and `get_related` default-implemented methods returning `TrackerError::Unsupported`.
-- [ ] Implement `list_comments` on the Linear and GitHub adapters.
-- [ ] Implement `get_related` on the Linear and GitHub adapters.
+- [x] Implement `list_comments` on the Linear and GitHub adapters.
+- [x] Implement `get_related` on the Linear and GitHub adapters.
 - [x] Add the `IssueComment` typed shape (author, body, created_at, id) and the `RelatedIssues` typed shape (parent, children, blockers) to `symphony-core::tracker`.
 - [x] Implement `get_issue_details` MCP handler — pure pass-through to `TrackerRead::get_issue`.
 - [x] Implement `list_comments` MCP handler.

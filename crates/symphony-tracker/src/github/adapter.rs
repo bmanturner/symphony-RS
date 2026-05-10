@@ -53,7 +53,7 @@ use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::TrackerRead;
-use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
+use symphony_core::tracker::{BlockerRef, Issue, IssueComment, IssueId, IssueState, RelatedIssues};
 use symphony_core::tracker_trait::{
     AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse, ArtifactKind,
     AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
@@ -236,6 +236,18 @@ impl GitHubTracker {
             config,
         })
     }
+
+    async fn get_issue_by_number(&self, number: u64) -> TrackerResult<Issue> {
+        let gh = self
+            .client
+            .issues(&self.config.owner, &self.config.repo)
+            .get(number)
+            .await
+            .map_err(map_octocrab_error)?;
+        let mut issue = gh_to_issue(gh, &self.config.status_label_prefix);
+        issue.branch_name = self.derive_branch_name(number).await?;
+        Ok(issue)
+    }
 }
 
 #[async_trait]
@@ -376,6 +388,61 @@ impl TrackerRead for GitHubTracker {
             }
         }
         Ok(out)
+    }
+
+    async fn get_issue(&self, id_or_identifier: &str) -> TrackerResult<Issue> {
+        let number = parse_issue_selector(id_or_identifier)?;
+        self.get_issue_by_number(number).await
+    }
+
+    async fn list_comments(&self, id_or_identifier: &str) -> TrackerResult<Vec<IssueComment>> {
+        let number = parse_issue_selector(id_or_identifier)?;
+        let first = self
+            .client
+            .issues(&self.config.owner, &self.config.repo)
+            .list_comments(number)
+            .per_page(100u8)
+            .send()
+            .await
+            .map_err(map_octocrab_error)?;
+        let raw = self
+            .client
+            .all_pages(first)
+            .await
+            .map_err(map_octocrab_error)?;
+        Ok(raw
+            .into_iter()
+            .map(|comment| IssueComment {
+                id: comment.id.to_string(),
+                author: comment.user.name.unwrap_or(comment.user.login),
+                body: comment.body.unwrap_or_default(),
+                created_at: Some(comment.created_at.to_rfc3339()),
+            })
+            .collect())
+    }
+
+    async fn get_related(&self, id_or_identifier: &str) -> TrackerResult<RelatedIssues> {
+        let issue = self.get_issue(id_or_identifier).await?;
+        let parent =
+            parse_parent_ref(issue.description.as_deref()).map(|n| self.get_issue_by_number(n));
+        let parent = match parent {
+            Some(fut) => Some(fut.await?),
+            None => None,
+        };
+        let mut blockers = Vec::new();
+        for blocker in &issue.blocked_by {
+            if let Some(identifier) = blocker.identifier.as_deref()
+                && let Ok(number) = parse_issue_selector(identifier)
+            {
+                blockers.push(self.get_issue_by_number(number).await?);
+            }
+        }
+        Ok(RelatedIssues {
+            parent,
+            // GitHub has no stable structural child edge in this adapter.
+            children: Vec::new(),
+            blockers,
+        })
     }
 
     /// Capability bag for the GitHub adapter (SPEC v2 §7.2).
@@ -825,6 +892,40 @@ fn parse_issue_number(id: &IssueId) -> TrackerResult<u64> {
     })
 }
 
+fn parse_issue_selector(value: &str) -> TrackerResult<u64> {
+    value
+        .trim()
+        .trim_start_matches('#')
+        .parse::<u64>()
+        .map_err(|e| {
+            TrackerError::Misconfigured(format!(
+                "GitHub issue identifiers are positive integers or #N; got {value:?}: {e}"
+            ))
+        })
+}
+
+fn parse_parent_ref(body: Option<&str>) -> Option<u64> {
+    let body = body?;
+    for line in body.lines() {
+        let trimmed = line.trim_start_matches('>').trim();
+        let lc = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lc.strip_prefix("parent:") {
+            let offset = trimmed.len() - rest.len();
+            let original_rest = &trimmed[offset..];
+            if let Some(after_hash) = original_rest.trim().strip_prefix('#') {
+                let digits: String = after_hash
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(number) = digits.parse::<u64>() {
+                    return Some(number);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// True when the mapped error represents an HTTP 404 from GitHub. Used by
 /// [`TrackerMutations::update_issue`] to swallow "label was not attached"
 /// responses on `remove_label` per SPEC v2 §7.2.
@@ -975,6 +1076,20 @@ mod tests {
         // And: digits without a `#` are not blockers — that would over-
         // match unrelated numbers in prose.
         assert!(parse_blocked_by(Some("depends on 42 things")).is_empty());
+    }
+
+    #[test]
+    fn parse_issue_selector_accepts_hash_or_plain_numbers() {
+        assert_eq!(parse_issue_selector("#42").unwrap(), 42);
+        assert_eq!(parse_issue_selector("42").unwrap(), 42);
+        assert!(parse_issue_selector("ENG-42").is_err());
+    }
+
+    #[test]
+    fn parse_parent_ref_reads_visible_parent_footer() {
+        let body = "Implementation details.\n\n> Parent: #100";
+        assert_eq!(parse_parent_ref(Some(body)), Some(100));
+        assert_eq!(parse_parent_ref(Some("Parent: none")), None);
     }
 
     #[tokio::test]

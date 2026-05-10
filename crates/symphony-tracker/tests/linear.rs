@@ -196,10 +196,80 @@ impl Respond for ScenarioResponder {
                     "data": { "issues": { "nodes": nodes } }
                 }))
             }
+            "IssueRead" => {
+                let requested = body
+                    .pointer("/variables/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let issue = self.find_issue(requested).map(fixture_issue_to_node);
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "issue": issue }
+                }))
+            }
+            "IssueCommentsRead" => {
+                let requested = body
+                    .pointer("/variables/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let issue = self.find_issue(requested).map(|_| {
+                    json!({
+                        "comments": {
+                            "nodes": [{
+                                "id": "comment-1",
+                                "body": "Ready for review.",
+                                "createdAt": "2026-05-10T00:00:00Z",
+                                "user": { "name": "Alice", "displayName": "Alice A." }
+                            }]
+                        }
+                    })
+                });
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "issue": issue }
+                }))
+            }
+            "IssueRelatedRead" => {
+                let requested = body
+                    .pointer("/variables/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let issue = self.find_issue(requested).map(|issue| {
+                    let blockers: Vec<Value> = issue
+                        .blocked_by
+                        .iter()
+                        .filter_map(|blocker| {
+                            blocker
+                                .id
+                                .as_ref()
+                                .and_then(|id| self.find_issue(id.as_str()))
+                        })
+                        .map(|blocker| json!({ "type": "blocks", "issue": fixture_issue_to_node(blocker) }))
+                        .collect();
+                    json!({
+                        "parent": null,
+                        "children": { "nodes": [] },
+                        "inverseRelations": { "nodes": blockers },
+                    })
+                });
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "issue": issue }
+                }))
+            }
             other => {
                 ResponseTemplate::new(400).set_body_string(format!("unexpected operation: {other}"))
             }
         }
+    }
+}
+
+impl ScenarioResponder {
+    fn find_issue(&self, id_or_identifier: &str) -> Option<&Issue> {
+        self.scenario
+            .active_issues
+            .iter()
+            .chain(self.scenario.terminal_issues.iter())
+            .find(|issue| {
+                issue.id.as_str() == id_or_identifier || issue.identifier == id_or_identifier
+            })
     }
 }
 
@@ -272,6 +342,29 @@ async fn fetch_active_round_trips_priority_and_blockers_through_the_wire() {
     let conf_3 = by_id.get(&IssueId::new("conf-3")).unwrap();
     assert_eq!(conf_3.blocked_by.len(), 1);
     assert_eq!(conf_3.blocked_by[0].identifier.as_deref(), Some("ABC-1"));
+}
+
+#[tokio::test]
+async fn read_tools_return_issue_comments_and_related_issues() {
+    let scenario = canonical_scenario();
+    let (_server, tracker) = linear_against(scenario).await;
+
+    let issue = tracker.get_issue("conf-3").await.expect("get_issue");
+    assert_eq!(issue.identifier, "ABC-3");
+
+    let comments = tracker
+        .list_comments("conf-3")
+        .await
+        .expect("list_comments");
+    assert_eq!(comments[0].id, "comment-1");
+    assert_eq!(comments[0].author, "Alice A.");
+    assert_eq!(comments[0].body, "Ready for review.");
+
+    let related = tracker.get_related("conf-3").await.expect("get_related");
+    assert!(related.parent.is_none());
+    assert!(related.children.is_empty());
+    assert_eq!(related.blockers.len(), 1);
+    assert_eq!(related.blockers[0].identifier, "ABC-1");
 }
 
 #[tokio::test]

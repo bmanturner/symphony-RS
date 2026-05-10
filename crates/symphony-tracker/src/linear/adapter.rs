@@ -44,13 +44,14 @@ use async_trait::async_trait;
 use graphql_client::{GraphQLQuery, Response};
 use reqwest::{Client, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::TrackerRead;
-use symphony_core::tracker::{BlockerRef, Issue, IssueId, IssueState};
+use symphony_core::tracker::{BlockerRef, Issue, IssueComment, IssueId, IssueState, RelatedIssues};
 use symphony_core::tracker_trait::{
     AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse, ArtifactKind,
     AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
@@ -256,6 +257,62 @@ impl LinearTracker {
         })
     }
 
+    async fn execute_raw(
+        &self,
+        op_name: &'static str,
+        query: &'static str,
+        variables: Value,
+    ) -> TrackerResult<Value> {
+        let body = json!({
+            "operationName": op_name,
+            "query": query,
+            "variables": variables,
+        });
+
+        let response = self
+            .client
+            .post(self.config.endpoint.clone())
+            .header("Authorization", self.config.api_key.expose_secret())
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| TrackerError::Transport(format!("{op_name}: {e}")))?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| TrackerError::Transport(format!("{op_name}: read body: {e}")))?;
+
+        if !status.is_success() {
+            return Err(map_http_status(op_name, status, &bytes));
+        }
+
+        let envelope: Response<Value> = serde_json::from_slice(&bytes).map_err(|e| {
+            TrackerError::Malformed(format!(
+                "{op_name}: response did not match schema: {e}; raw={}",
+                truncate_for_log(&bytes)
+            ))
+        })?;
+
+        if let Some(errors) = envelope.errors.filter(|e| !e.is_empty()) {
+            let joined = errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            warn!(operation = op_name, errors = %joined, "linear graphql returned errors");
+            return Err(TrackerError::Transport(format!(
+                "{op_name}: graphql errors: {joined}"
+            )));
+        }
+
+        envelope.data.ok_or_else(|| {
+            TrackerError::Malformed(format!("{op_name}: graphql response missing data block"))
+        })
+    }
+
     /// Walk Relay-style pagination over [`CandidateIssues`].
     ///
     /// Linear caps `first` at 250 and SPEC §11.2 sets our default at 50,
@@ -372,6 +429,98 @@ impl TrackerRead for LinearTracker {
             .map(|s| s.as_str().to_string())
             .collect();
         self.paginate_terminal(names).await
+    }
+
+    async fn get_issue(&self, id_or_identifier: &str) -> TrackerResult<Issue> {
+        let data = self
+            .execute_raw(
+                "IssueRead",
+                LINEAR_ISSUE_READ_QUERY,
+                json!({ "id": id_or_identifier }),
+            )
+            .await?;
+        let payload: LinearIssueReadData = serde_json::from_value(data).map_err(|e| {
+            TrackerError::Malformed(format!("IssueRead: response did not match read shape: {e}"))
+        })?;
+        payload
+            .issue
+            .map(linear_read_issue_to_issue)
+            .ok_or_else(|| {
+                TrackerError::Misconfigured(format!(
+                    "IssueRead: issue `{id_or_identifier}` not found"
+                ))
+            })
+    }
+
+    async fn list_comments(&self, id_or_identifier: &str) -> TrackerResult<Vec<IssueComment>> {
+        let data = self
+            .execute_raw(
+                "IssueCommentsRead",
+                LINEAR_ISSUE_COMMENTS_QUERY,
+                json!({ "id": id_or_identifier }),
+            )
+            .await?;
+        let payload: LinearIssueCommentsData = serde_json::from_value(data).map_err(|e| {
+            TrackerError::Malformed(format!(
+                "IssueCommentsRead: response did not match comment shape: {e}"
+            ))
+        })?;
+        let issue = payload.issue.ok_or_else(|| {
+            TrackerError::Misconfigured(format!(
+                "IssueCommentsRead: issue `{id_or_identifier}` not found"
+            ))
+        })?;
+        Ok(issue
+            .comments
+            .nodes
+            .into_iter()
+            .map(|comment| IssueComment {
+                id: comment.id,
+                author: comment
+                    .user
+                    .display_name
+                    .or(comment.user.name)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                body: comment.body,
+                created_at: comment.created_at,
+            })
+            .collect())
+    }
+
+    async fn get_related(&self, id_or_identifier: &str) -> TrackerResult<RelatedIssues> {
+        let data = self
+            .execute_raw(
+                "IssueRelatedRead",
+                LINEAR_ISSUE_RELATED_QUERY,
+                json!({ "id": id_or_identifier }),
+            )
+            .await?;
+        let payload: LinearIssueRelatedData = serde_json::from_value(data).map_err(|e| {
+            TrackerError::Malformed(format!(
+                "IssueRelatedRead: response did not match related shape: {e}"
+            ))
+        })?;
+        let issue = payload.issue.ok_or_else(|| {
+            TrackerError::Misconfigured(format!(
+                "IssueRelatedRead: issue `{id_or_identifier}` not found"
+            ))
+        })?;
+        Ok(RelatedIssues {
+            parent: issue.parent.map(linear_read_issue_to_issue),
+            children: issue
+                .children
+                .nodes
+                .into_iter()
+                .map(linear_read_issue_to_issue)
+                .collect(),
+            blockers: issue
+                .inverse_relations
+                .nodes
+                .into_iter()
+                .filter(|relation| relation.type_ == "blocks")
+                .map(|relation| linear_read_issue_to_issue(relation.issue))
+                .collect(),
+        })
     }
 
     fn capabilities(&self) -> TrackerCapabilities {
@@ -778,6 +927,276 @@ fn state_only_node_to_issue(node: issue_states_by_ids::IssueStatesByIdsIssuesNod
         blocked_by: Vec::new(),
         created_at: None,
         updated_at: None,
+    }
+}
+
+const LINEAR_ISSUE_READ_QUERY: &str = r#"
+query IssueRead($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    description
+    priority
+    branchName
+    url
+    createdAt
+    updatedAt
+    state { id name }
+    labels(first: 50) { nodes { name } }
+    inverseRelations(first: 50) {
+      nodes {
+        type
+        issue { id identifier state { name } }
+      }
+    }
+  }
+}
+"#;
+
+const LINEAR_ISSUE_COMMENTS_QUERY: &str = r#"
+query IssueCommentsRead($id: String!) {
+  issue(id: $id) {
+    comments(first: 100) {
+      nodes {
+        id
+        body
+        createdAt
+        user { name displayName }
+      }
+    }
+  }
+}
+"#;
+
+const LINEAR_ISSUE_RELATED_QUERY: &str = r#"
+query IssueRelatedRead($id: String!) {
+  issue(id: $id) {
+    parent {
+      id
+      identifier
+      title
+      description
+      priority
+      branchName
+      url
+      createdAt
+      updatedAt
+      state { id name }
+      labels(first: 50) { nodes { name } }
+      inverseRelations(first: 50) {
+        nodes {
+          type
+          issue { id identifier state { name } }
+        }
+      }
+    }
+    children(first: 50) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        branchName
+        url
+        createdAt
+        updatedAt
+        state { id name }
+        labels(first: 50) { nodes { name } }
+        inverseRelations(first: 50) {
+          nodes {
+            type
+            issue { id identifier state { name } }
+          }
+        }
+      }
+    }
+    inverseRelations(first: 50) {
+      nodes {
+        type
+        issue {
+          id
+          identifier
+          title
+          description
+          priority
+          branchName
+          url
+          createdAt
+          updatedAt
+          state { id name }
+          labels(first: 50) { nodes { name } }
+          inverseRelations(first: 50) {
+            nodes {
+              type
+              issue { id identifier state { name } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearIssueReadData {
+    issue: Option<LinearReadIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearIssueCommentsData {
+    issue: Option<LinearCommentsIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearIssueRelatedData {
+    issue: Option<LinearRelatedIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearReadIssue {
+    id: String,
+    identifier: String,
+    title: String,
+    description: Option<String>,
+    priority: Option<f64>,
+    branch_name: Option<String>,
+    url: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    state: LinearState,
+    labels: LinearLabelConnection,
+    inverse_relations: LinearRelationConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearState {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearLabelConnection {
+    nodes: Vec<LinearLabel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearLabel {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearRelationConnection {
+    nodes: Vec<LinearRelation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearRelation {
+    #[serde(rename = "type")]
+    type_: String,
+    issue: LinearRelationIssue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearRelationIssue {
+    id: String,
+    identifier: String,
+    state: LinearState,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearCommentsIssue {
+    comments: LinearCommentConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearCommentConnection {
+    nodes: Vec<LinearComment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearComment {
+    id: String,
+    body: String,
+    created_at: Option<String>,
+    user: LinearCommentUser,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearCommentUser {
+    name: Option<String>,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearRelatedIssue {
+    parent: Option<LinearReadIssue>,
+    children: LinearRelatedIssueConnection,
+    inverse_relations: LinearRelatedRelationConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearRelatedIssueConnection {
+    nodes: Vec<LinearReadIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LinearRelatedRelationConnection {
+    nodes: Vec<LinearRelatedRelation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinearRelatedRelation {
+    #[serde(rename = "type")]
+    type_: String,
+    issue: LinearReadIssue,
+}
+
+fn linear_relation_to_blocker(relation: LinearRelationIssue) -> BlockerRef {
+    BlockerRef {
+        id: Some(IssueId::new(relation.id)),
+        identifier: Some(relation.identifier),
+        state: Some(IssueState::new(relation.state.name)),
+    }
+}
+
+fn linear_read_issue_to_issue(node: LinearReadIssue) -> Issue {
+    Issue {
+        id: IssueId::new(node.id),
+        identifier: node.identifier,
+        title: node.title,
+        description: node.description,
+        priority: linear_priority_to_int(node.priority),
+        state: IssueState::new(node.state.name),
+        branch_name: node.branch_name,
+        url: node.url,
+        labels: node
+            .labels
+            .nodes
+            .into_iter()
+            .map(|label| label.name.to_ascii_lowercase())
+            .collect(),
+        blocked_by: node
+            .inverse_relations
+            .nodes
+            .into_iter()
+            .filter(|relation| relation.type_ == "blocks")
+            .map(|relation| linear_relation_to_blocker(relation.issue))
+            .collect(),
+        created_at: node.created_at,
+        updated_at: node.updated_at,
     }
 }
 

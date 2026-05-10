@@ -982,6 +982,80 @@ async fn capabilities_advertise_create_update_comment_attach_but_not_blocker_or_
 }
 
 #[tokio::test]
+async fn read_tools_return_issue_comments_and_advisory_related_issues() {
+    let server = MockServer::start().await;
+    for n in [1u64, 10, 100] {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/robot/issues/{n}/timeline")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            10,
+            "API child",
+            Some("Blocked by #1.\n\n> Parent: #100"),
+            "open",
+            &["status:todo"],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            1,
+            "Schema child",
+            None,
+            "open",
+            &["status:todo"],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            100,
+            "Parent",
+            None,
+            "open",
+            &["status:todo"],
+            false,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/robot/issues/10/comments"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!([gh_comment_json(
+                900,
+                10,
+                "First comment"
+            )])),
+        )
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+
+    let issue = tracker.get_issue("#10").await.expect("get_issue");
+    assert_eq!(issue.identifier, "#10");
+    assert_eq!(issue.blocked_by[0].identifier.as_deref(), Some("#1"));
+
+    let comments = tracker.list_comments("10").await.expect("list_comments");
+    assert_eq!(comments[0].id, "900");
+    assert_eq!(comments[0].author, "octobot");
+    assert_eq!(comments[0].body, "First comment");
+
+    let related = tracker.get_related("#10").await.expect("get_related");
+    assert_eq!(related.parent.unwrap().identifier, "#100");
+    assert!(related.children.is_empty());
+    assert_eq!(related.blockers[0].identifier, "#1");
+}
+
+#[tokio::test]
 async fn create_issue_posts_title_body_labels_assignees_and_returns_normalized_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
