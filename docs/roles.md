@@ -4,6 +4,10 @@ Roles are the workflow-owned capability profiles that decide who may do what. A 
 
 For example, a workflow can call its integration owner `platform_lead`, `release_captain`, or `maintainer`. Symphony-RS cares that the role has `kind: integration_owner`. The same rule applies to QA: the default role name is usually `qa`, but the gate is identified by `kind: qa_gate`.
 
+`SPEC_v4.md` extends this model with file-backed role instruction packs
+and generated platform-lead assignment catalogs. It does not redefine
+the v2 role kinds or the v3 dependency sequencing rules.
+
 ## Role Example
 
 The example between the markers is loaded by the test suite.
@@ -74,6 +78,23 @@ Follow-up creation is deliberately broad. Any role may surface follow-up work by
 Routing maps work items to role names. The role name selects the configured agent profile, concurrency cap, description, and semantic kind. The router does not hardcode an org chart; it only sees the roles declared by the workflow.
 
 Use route rules for ownership, not for gate bypass. A broad issue should route to an `integration_owner`; QA-labeled or QA-queued work should route to a `qa_gate`; scoped implementation should route to specialists or other workflow-defined roles.
+
+## Instruction Packs
+
+v4 role doctrine lives in repo-owned files, conventionally
+`.symphony/roles/<role>/AGENTS.md` for operating instructions and
+`.symphony/roles/<role>/SOUL.md` for stable quality bar / judgment
+doctrine. Prompt assembly order is deterministic:
+
+1. Global workflow prompt from `WORKFLOW.md`.
+2. Current role `AGENTS.md` instructions.
+3. Current role `SOUL.md` doctrine.
+4. Agent profile system prompt.
+5. Run context: issue, parent/child graph, dependency blockers, workspace/branch, acceptance criteria, and output schema.
+
+The platform lead's assignment catalog is generated from `WORKFLOW.md`
+role metadata, agent profiles, routing rules, and role-local assignment
+hints. Normal workflows do not need per-role `ASSIGNMENT.md` files.
 
 ## Done
 

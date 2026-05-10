@@ -4,10 +4,10 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 0 — v4 Grounding
 
-- [ ] Add `SPEC_v4.md` to product docs/references and link it from role/workflow docs without redefining v2 roles or v3 dependency behavior.
-- [ ] Add a sample `.symphony/roles/` directory to fixtures with `AGENTS.md` and `SOUL.md` for platform lead, QA, and at least two specialist roles.
-- [ ] Define the canonical prompt assembly order in docs: global workflow prompt, role instructions, role SOUL, agent profile system prompt, run context, graph/blockers, output schema.
-- [ ] Explicitly document that the platform-lead assignment catalog is generated from `WORKFLOW.md`, not from per-role `ASSIGNMENT.md` files.
+- [x] Add `SPEC_v4.md` to product docs/references and link it from role/workflow docs without redefining v2 roles or v3 dependency behavior.
+- [x] Add a sample `.symphony/roles/` directory to fixtures with `AGENTS.md` and `SOUL.md` for platform lead, QA, and at least two specialist roles.
+- [x] Define the canonical prompt assembly order in docs: global workflow prompt, role instructions, role SOUL, agent profile system prompt, run context, graph/blockers, output schema.
+- [x] Explicitly document that the platform-lead assignment catalog is generated from `WORKFLOW.md`, not from per-role `ASSIGNMENT.md` files.
 
 ## Phase 1 — Workflow Config Schema
 
@@ -52,29 +52,37 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Add tests proving prompt assembly order is deterministic.
 - [ ] Add tests proving agent profile `system_prompt` is included but does not replace role instructions or SOUL.
 - [ ] Add tests proving prompt section provenance is included in run metadata.
+- [ ] Extend `PromptIssue` with the SPEC v4 §5.1 required fields: `labels`, `priority`, `created_at`, `updated_at`, and a `blocked_by` summary (count + identifiers). Surface them in every prompt that includes an `IssueContext` section.
+- [ ] Add tests proving `labels` reaches the platform-lead prompt so the agent can see what triggered decomposition (`DecompositionTriggers.labels_any`).
+- [ ] Add tests proving `blocked_by` summary appears in `IssueContext` and is distinct from kernel-tracked `PromptBlocker[]` entries.
+- [ ] Document the deferred-context contract: comments, assignee/reporter, attachments, and other tracker fields beyond §5.1 are NOT in the prompt and will be fetched on-demand via the `SPEC_v5.md` MCP read tools.
 
 ## Phase 5 — Role-Scoped Runtime Profile Resolution
 
 - [ ] Replace the single global `build_agent_runner(cfg.agent.kind)` production path with role-aware runner resolution: run/work item role → `roles.<role>.agent` → `agents.<profile>` → concrete backend/composite runner.
 - [ ] Extend `AgentBackendProfile` with structured `args: Vec<String>` and `extra_args: Vec<String>` fields; keep `command` as executable/shell entrypoint, not a raw concatenated command line.
 - [ ] Preserve compatibility for existing `command: codex app-server` fixtures via migration/defaulting or fixture updates, but make the canonical v4 examples use `command: codex` + `args: [app-server]`.
-- [ ] Honor `AgentBackendProfile.model` in every concrete backend adapter: Claude via model flag, Codex via app-server conversation/session config, Hermes via supported Hermes non-interactive model/provider interface.
+- [ ] Honor `AgentBackendProfile.model` in every concrete backend adapter: Claude via model flag, Codex via app-server conversation/session config. (Hermes is deprecated — see `CHECKLIST_v5.md` Phase 0 for code removal.)
 - [ ] Wire per-profile runtime overrides into composite/tandem profiles so lead and follower can use different models, args, tools, and budgets.
 - [ ] Add validation for missing role agent, dangling agent profile, unsupported model override for backend, unsupported args ordering, and non-runnable composite profiles.
 - [ ] Add tests proving two roles using the same backend can launch with different models and extra args.
 - [ ] Add tests proving effective argv/debug metadata is emitted with secrets redacted.
-- [ ] Add operator docs showing model/args/extra_args examples for Claude, Codex, and Hermes.
+- [ ] Add operator docs showing model/args/extra_args examples for Claude and Codex.
 
-## Phase 6 — Platform Lead Decomposition Prompts
+## Phase 6 — Platform Lead Decomposition and Integration Prompts
 
-- [ ] Add a decomposition-specific prompt builder for integration-owner/platform-lead runs.
-- [ ] Include global workflow prompt, platform-lead `role_prompt`, platform-lead `soul`, parent issue/repo context, decomposition policy, role catalog, dependency/blocker rules, and decomposition output schema.
+- [ ] Add a decomposition-specific prompt builder for platform-lead decomposition runs.
+- [ ] Include global workflow prompt, platform-lead `role_prompt`, platform-lead `soul`, parent issue/repo context, decomposition policy, role catalog, dependency/blocker rules, and decomposition output schema. (The `decomposition output schema` section reduces to a brief prose pointer once the `propose_decomposition` MCP tool lands in `CHECKLIST_v5.md`; for v4 it remains an inlined schema so the live decomposition path has a working surface either way.)
 - [ ] Include the generated role catalog for every eligible child-owning role.
 - [ ] Exclude full specialist SOUL files from platform-lead prompts; include role assignment metadata and concise instruction-pack summaries only.
 - [ ] Include global routing rules and role-local routing hints so the platform lead can assign child issues deterministically.
 - [ ] Add tests proving decomposition prompts include catalog entries for backend/frontend/operator/reviewer roles when eligible.
 - [ ] Add tests proving QA is not listed as a normal implementation child role unless workflow explicitly allows manual QA task issues.
 - [ ] Add tests proving platform lead has enough prompt context to emit `assigned_role` for each child without guessing from terse descriptions.
+- [ ] Add an integration-owner prompt builder (SPEC v4 §5 integration block) for the consolidation/PR phase, distinct from the decomposition phase.
+- [ ] Surface latest `Handoff` per child (SPEC v4 §5.2) in the integration-owner prompt: `summary`, `changed_files`, `tests_run`, `verification_evidence`, `known_risks`, `branch_or_workspace`, `ready_for`. Read from `HandoffRepository::latest_handoff` via `IntegrationChild.latest_handoff`.
+- [ ] Add tests proving the integration-owner prompt includes each child's latest handoff fields and not just bare `identifier`/`title`/`status`.
+- [ ] Add tests proving the integration-owner prompt distinguishes children that produced no handoff (e.g. waived) from children with handoffs.
 
 ## Phase 7 — Specialist Prompts
 
@@ -90,6 +98,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Ensure QA prompt construction treats QA as a gate over integrated output, not a normal implementation child by default.
 - [ ] Add tests proving QA verdict schema and evidence requirements are present.
 - [ ] Add tests proving QA can see child handoffs and integration summary.
+- [ ] Read child handoffs from `HandoffRepository::latest_handoff` (same source as Phase 6 integration-owner prompt) and include the SPEC v4 §5.2 fields. Both Phase 6 and Phase 8 must agree on the rendering format so a child handoff reads identically downstream.
 
 ## Phase 9 — Fixtures and Examples
 
@@ -122,3 +131,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [ ] Document recommended `.symphony/roles/<role>/AGENTS.md` and `SOUL.md` conventions.
 - [ ] Document why `ASSIGNMENT.md` is not required: assignment guidance is structured in `WORKFLOW.md` and rendered automatically.
 - [ ] Document prompt preview/debug commands.
+
+## Phase 13 — Forward Reference
+
+- [ ] Cross-link `CHECKLIST_v5.md` from the Phase 0 grounding and from the integration / QA prompt phases. v4 closes the prompt-side gaps; v5 closes the agent ↔ kernel communication gaps. The product is not end-to-end runnable on a live agent until both are complete.

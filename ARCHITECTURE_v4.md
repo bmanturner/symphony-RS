@@ -357,7 +357,56 @@ inside each section's content. The new fail-loud rule is enforced at
 the assembler boundary: an unknown placeholder is `AssemblyError`, not
 a silently retained literal.
 
-#### 4.2.4 Run metadata
+#### 4.2.4 `PromptIssue` field expansion (SPEC v4 §5.1)
+
+`prompt::PromptIssue` today carries six fields (`identifier`, `title`,
+`description`, `state`, `branch_name`, `url`) projected from the
+richer `tracker::Issue`. v4 adds:
+
+```rust
+pub struct PromptIssue {
+    // existing v1 fields ...
+    pub identifier: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub state: String,
+    pub branch_name: Option<String>,
+    pub url: Option<String>,
+
+    // new in v4
+    pub labels: Vec<String>,                // lowercase-normalized, may be empty
+    pub priority: Option<i32>,              // None when tracker has no numeric priority
+    pub created_at: Option<String>,         // ISO-8601 verbatim
+    pub updated_at: Option<String>,         // ISO-8601 verbatim
+    pub blocked_by: Vec<TrackerBlockerSummary>, // count + identifier list, kernel-distinct
+}
+
+pub struct TrackerBlockerSummary {
+    pub identifier: String,                 // tracker-side blocker identifier
+    pub state: Option<String>,              // when the tracker exposes it
+}
+```
+
+Two distinctions matter:
+
+1. `blocked_by` here is the **tracker-side** view, sourced from
+   `Issue::blocked_by` on the wire layer. It is intentionally separate
+   from `PromptContext::blockers: Vec<PromptBlocker>`, which is the
+   **kernel-tracked** view. A real run may have entries in either or
+   both; the prompt MUST surface both with clear section labels so the
+   agent can tell why something is blocked.
+2. Comments, assignee, reporter, and other tracker fields not listed
+   above are deliberately **not** added to `PromptIssue`. Inlining them
+   would push every prompt past useful budget. They are fetched on
+   demand via the agent ↔ kernel surface defined in `SPEC_v5.md`
+   / `ARCHITECTURE_v5.md` (`mcp.list_comments`,
+   `mcp.get_issue_details`, etc.).
+
+The dispatcher's projection from `Issue` to `PromptIssue` is the only
+write site for the new fields; renderer changes are local to
+`PromptSection::IssueContext`.
+
+#### 4.2.5 Run metadata
 
 `Run` (or its successor record) gains an `instruction_provenance:
 Vec<PromptSource>` field stored as JSON on the `runs` row (existing
@@ -490,7 +539,37 @@ specialists' SOUL files. Each catalog entry carries a concise
 instruction-pack summary plus the structured assignment metadata; that
 is the entire peer-doctrine surface.
 
-### 6.3 QA run (SPEC v4 §5)
+### 6.3 Integration-owner run (SPEC v4 §5 integration block)
+
+```text
+section 1  GlobalWorkflow
+section 2  RolePrompt            (integration owner)
+section 3  RoleSoul              (integration owner)
+section 4  IssueContext          (parent issue, including labels/priority/blocked_by per §5.1)
+section 5  Workspace             (integration branch / base ref)
+section 6  ChildHandoffs         (per-child latest Handoff, see §5.2)
+section 7  Blockers              (open blockers gating the parent)
+section 8  AcceptanceCriteria
+section 9  OutputSchema          (integration handoff envelope)
+```
+
+`ChildHandoffs` is a new prompt section (variant of
+`PromptSection::ParentChildGraph` or a sibling, depending on
+implementation taste — both are acceptable as long as the rendering is
+deterministic and the test in `CHECKLIST_v4.md` Phase 6 asserts the
+required fields appear). The data is sourced from
+`HandoffRepository::latest_handoff` per child via
+`IntegrationChild.latest_handoff`. Children that produced no handoff
+(waived, skipped) MUST appear with an explicit "no handoff" marker so
+the integration owner cannot mistake an absent handoff for a
+zero-content one.
+
+This is the prompt that drives the integration-owner agent's
+consolidate / merge / draft-PR pass. Without it, the integration
+owner is operating from `identifier`/`title`/`status` triples and is
+blind to what each specialist actually shipped.
+
+### 6.4 QA run (SPEC v4 §5)
 
 ```text
 section 1  GlobalWorkflow
@@ -498,15 +577,20 @@ section 2  RolePrompt            (qa)
 section 3  RoleSoul              (qa)
 section 4  IssueContext          (integrated branch / draft PR context)
 section 5  AcceptanceCriteria    (acceptance trace)
-section 6  ParentChildGraph      (child handoffs + known blockers)
-section 7  CiContext             (build/check status, when available)
-section 8  OutputSchema          (qa verdict schema)
+section 6  ChildHandoffs         (per-child latest Handoff, same shape as §6.3)
+section 7  Blockers              (known blockers)
+section 8  CiContext             (build/check status, when available)
+section 9  OutputSchema          (qa verdict schema)
 ```
 
 QA is treated as a gate over integrated output, not as a normal child
 implementer. The QA prompt assembler refuses to run for an issue that
 has not produced an integration record (matching the existing v2 QA
 gate semantics in `crates/symphony-core/src/qa.rs`).
+
+Phase 6 (integration prompt) and Phase 8 (QA prompt) MUST share the
+same `ChildHandoffs` rendering helper so a handoff reads identically
+in both surfaces.
 
 ## 7. Loading Lifecycle
 
@@ -667,6 +751,49 @@ under `#[deprecated]` for the v1-substitution tests only.
 Consequence: misspelled placeholders fail at build time, not at agent
 runtime. A future cleanup deletes the deprecated function once the
 legacy tests are migrated.
+
+### 2026-05-10 — v4 owns the prompt-side gaps; v5 owns the agent ↔ kernel surface
+
+Context: a kernel/agent-seam audit surfaced a cohort of gaps that all
+share one architectural theme — the kernel half of every workflow is
+implemented and well-tested while the agent-facing wiring is unbuilt
+(no translator from agent output to `DecompositionDraft`/`Handoff`, no
+MCP tool surface, no comment writes from the kernel, no live-agent
+end-to-end test). Two natural homes existed: stretch v4's scope, or
+introduce a v5.
+
+Decision: split.
+
+- **v4** absorbs the gaps that are pure prompt-assembly concerns and
+  unambiguously inside its existing scope: `PromptIssue` field
+  expansion (§4.2.4), integration-owner prompt assembly (§6.3),
+  child-handoffs in receiving prompts (§6.3, §6.4), and the role
+  catalog work already in flight (§4.2.2).
+- **v5** is a new milestone (`SPEC_v5.md`,
+  `ARCHITECTURE_v5.md`, `CHECKLIST_v5.md`) titled *Agent ↔ Kernel
+  Integration via Internal MCP Server*. It owns the in-process MCP
+  server, the `propose_decomposition` / `submit_handoff` /
+  `record_qa_verdict` / `add_issue_comment` write tools, the
+  `get_issue_details` / `list_comments` / `list_available_roles` read
+  tools, the kernel-driven workflow comment wiring, the
+  text-extraction translator for handoffs, and the deprecation /
+  removal of the Hermes backend.
+
+Consequence: v4 ships the bigger prompt-context that a real agent
+needs to make decisions; v5 ships the channel through which the
+agent's decisions become kernel state. Either milestone alone leaves
+the live-agent path non-functional. Both are required for the
+end-to-end `PLAN_v2.md` claim to hold against a real LLM rather than
+just the mock agent. Cross-references in both directions
+(`SPEC_v4.md` §11, `CHECKLIST_v4.md` Phase 13, and the v5 docs'
+backward references) make the dependency explicit.
+
+The decomposition output schema (`CHECKLIST_v4.md` Phase 6) is the one
+item with overlap: v4 inlines a schema in the decomposition prompt so
+that the path is testable even before MCP lands; v5 promotes the
+schema into the `propose_decomposition` MCP tool definition and the
+prompt collapses to a brief prose pointer. This redundancy is
+intentional — it prevents v4 from being unship-shippable on its own.
 
 ### 2026-05-09 — Provenance lives on `runs`, not in a new table
 

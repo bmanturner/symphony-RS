@@ -25,6 +25,10 @@ For tracker-backed child dependency orchestration, see the v3 addendum in
 `SPEC_v3.md`. v3 extends `decomposition` with dependency policy and durable
 `blocks` edges; it does not replace the v2 workflow schema or gate semantics.
 
+For role instruction packs and generated platform-lead assignment
+catalogs, see `SPEC_v4.md`. v4 adds prompt-side role doctrine and
+catalog rendering without redefining v2 roles or v3 dependency behavior.
+
 ## Minimal Valid Shape
 
 A useful workflow normally declares roles, agents, routing, workspace policy, integration, QA, and follow-up policy. For validation only, a minimal Linear workflow can be as small as:
@@ -303,6 +307,12 @@ Work from the structured run context. Specialists own scoped child work, the int
 `agents` defines backend profiles independent from role names. Product backends are `codex`, `claude`, and `hermes`; `mock` is for tests and fixtures. Composite `strategy: tandem` profiles wrap two concrete profiles and can run `draft_review`, `split_implement`, or `consensus`.
 
 `routing` maps normalized work items to roles. `first_match` uses file order. `priority` chooses the matching rule with the highest `priority`.
+
+The platform-lead assignment catalog is generated from `WORKFLOW.md`
+roles, agents, global `routing.rules`, and role-local assignment
+metadata. Do not create parallel per-role `ASSIGNMENT.md` files for
+normal operation; they drift from the routing contract and are not the
+catalog source of truth.
 
 `decomposition` controls when broad issues become child issues. The `owner_role` must be an `integration_owner` when decomposition is enabled. `child_issue_policy` is either `create_directly` or `propose_for_approval`.
 

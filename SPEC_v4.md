@@ -131,7 +131,7 @@ For specialist runs:
 2. Current role `role_prompt`.
 3. Current role `soul`.
 4. Agent profile `system_prompt`, if configured.
-5. Issue context.
+5. Issue context (see §5.1).
 6. Parent/child/dependency/blocker context.
 7. Workspace/branch context.
 8. Acceptance criteria.
@@ -142,21 +142,85 @@ For platform-lead decomposition runs:
 1. Global workflow prompt.
 2. Platform lead `role_prompt`.
 3. Platform lead `soul`.
-4. Parent issue/repo context.
+4. Parent issue/repo context (see §5.1).
 5. Decomposition policy.
 6. Full eligible-role assignment catalog.
 7. Existing dependency graph/blocker rules.
 8. Required decomposition output schema.
+
+For integration-owner runs (consolidating completed children, opening the draft PR):
+
+1. Global workflow prompt.
+2. Integration-owner `role_prompt`.
+3. Integration-owner `soul`.
+4. Parent issue context (see §5.1).
+5. Workspace / integration branch context.
+6. Child summary including the latest structured handoff per child (see §5.2).
+7. Open dependency / blocker context for the parent.
+8. Acceptance criteria.
+9. Required integration output schema (handoff envelope).
 
 For QA runs:
 
 1. Global workflow prompt.
 2. QA `role_prompt`.
 3. QA `soul`.
-4. Integrated branch / draft PR context.
+4. Integrated branch / draft PR context (see §5.1).
 5. Acceptance trace.
-6. Child handoffs and known blockers.
+6. Child handoffs and known blockers (see §5.2).
 7. Required QA verdict schema.
+
+### 5.1 Issue Context Required Fields
+
+The `IssueContext` section MUST surface the tracker fields that the
+kernel already fetches and that materially change agent decisions. The
+implementation contract is `crates/symphony-core/src/prompt.rs::PromptIssue`.
+
+Required (always present when the source field is non-empty):
+
+- `identifier`, `title`, `description`, `state`, `branch_name`, `url` (already required pre-v4);
+- `labels` — lowercase-normalized list; the platform lead's eligibility
+  evaluation (`DecompositionTriggers.labels_any`) reads these and the
+  agent receiving the prompt MUST be able to see what triggered it;
+- `priority` when the tracker exposed a numeric priority;
+- `created_at`, `updated_at` ISO-8601 strings;
+- `blocked_by` summary — at minimum the count and identifiers; full
+  detail is a follow-up read (see §11).
+
+Out of scope for the prompt itself (fetched lazily via the agent ↔
+kernel surface defined in `SPEC_v5.md`): comments, assignee, reporter,
+attachments, and any other tracker field not listed above. Inlining
+those into every prompt would bloat the context window without earning
+its keep — the prompt MUST stay small and the agent MUST be able to
+fetch deeper detail on demand.
+
+### 5.2 Child Handoffs in Receiving Prompts
+
+When a run is dispatched against a parent or integrated work item whose
+children have produced structured handoffs, the assembler MUST surface
+those handoffs in the prompt — not merely the children's bare
+`identifier`/`title`/`status`.
+
+Per child, the prompt MUST include the latest `Handoff` (SPEC v2 §4.7):
+
+- `summary`;
+- `changed_files`;
+- `tests_run`;
+- `verification_evidence`;
+- `known_risks`;
+- `branch_or_workspace` (branch + base_ref);
+- `ready_for` (the consequence the prior agent requested).
+
+This applies to integration-owner runs (§5 integration block) and QA
+runs (§5 QA block). Specialists do not normally receive sibling
+handoffs; rework dispatch MAY include the child's own prior handoff so
+the specialist can see what was rejected.
+
+The kernel data path is already in place
+(`HandoffRepository::latest_handoff` in `crates/symphony-state/src/handoffs.rs`,
+`IntegrationChild.latest_handoff` in
+`crates/symphony-core/src/integration_request.rs`). v4 closes the
+prompt-rendering gap so the receiving agent actually sees this data.
 
 ## 6. Role Catalog Requirements
 
@@ -197,7 +261,8 @@ Prompt assembly alone is not enough. Symphony MUST also resolve the runtime back
 
 - Claude: pass the configured model as the backend's model flag/field (`--model <model>` for Claude Code today).
 - Codex: pass the configured model through the app-server conversation/session configuration, not by inventing an unsupported shell flag.
-- Hermes: pass the configured model through Hermes' supported non-interactive model/provider interface, or fail validation if the installed Hermes command cannot express the requested model.
+
+(The Hermes backend is deprecated. See `SPEC_v5.md` §10 for removal scope.)
 
 `AgentBackendProfile` MUST support structured command arguments rather than shell-string appending:
 
@@ -216,13 +281,6 @@ agents:
     args: [app-server]
     model: gpt-5-codex
     extra_args: [--profile, fast]
-
-  hermes_operator:
-    backend: hermes
-    command: hermes
-    args: [chat, --query-file, -, --source, symphony]
-    model: anthropic/claude-sonnet-4
-    extra_args: [--provider, openrouter]
 ```
 
 Launch semantics:
@@ -285,3 +343,24 @@ This addendum does not require:
 - inventing new agent backends;
 - replacing `WORKFLOW.md` as the global workflow contract;
 - treating QA as a normal implementation child by default.
+
+## 11. Forward Reference: Agent ↔ Kernel Communication (SPEC v5)
+
+v4 closes the *prompt-side* gaps: a real agent sees role doctrine, a
+generated peer catalog, a richer issue context (§5.1), and prior child
+handoffs (§5.2). It does **not** close the gap between agent output and
+kernel state. Specifically, v4 does not specify:
+
+- how a live LLM session's output becomes a `DecompositionDraft`,
+  `Handoff`, `QaVerdict`, or follow-up proposal;
+- how an agent fetches additional tracker context on demand
+  (comments, full `blocked_by` chains, the live role catalog);
+- how an agent posts a comment back to the tracker;
+- how kernel-side workflow transitions surface to humans watching the
+  tracker (paused-on-review, run-failed, QA reasoning).
+
+These are the subject of `SPEC_v5.md` ("Agent ↔ Kernel Integration via
+Internal MCP Server"). v4 and v5 must both ship before the headline
+end-to-end claim of `PLAN_v2.md` ("broad issue → decomposition → child
+execution → integration → draft PR → QA → ready") is true with a live
+agent rather than only with the mock agent.
