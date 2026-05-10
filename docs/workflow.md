@@ -100,23 +100,25 @@ roles:
 agents:
   lead_agent:
     backend: codex
-    command: codex app-server
+    command: codex
+    args: [app-server]
     tools: [git, github, tracker]
     memory: persistent
     max_turns: 12
   qa_agent:
     backend: claude
-    command: claude -p --output-format stream-json --permission-mode bypassPermissions
+    command: claude
     tools: [git, github, tracker]
     max_turns: 8
   codex_fast:
     backend: codex
-    command: codex app-server
+    command: codex
+    args: [app-server]
     tools: [git, github, tracker]
     max_turns: 6
   claude_fast:
     backend: claude
-    command: claude -p --output-format stream-json --permission-mode bypassPermissions
+    command: claude
     tools: [git, github, tracker]
     max_turns: 6
   hermes_agent:
@@ -305,6 +307,15 @@ Work from the structured run context. Specialists own scoped child work, the int
 `roles` is the workflow org chart. Role names are configurable, but two semantic kinds matter to the kernel: `integration_owner` and `qa_gate`. Other supported kinds are `specialist`, `reviewer`, `operator`, and `custom`.
 
 `agents` defines backend profiles independent from role names. Product backends are `codex`, `claude`, and `hermes`; `mock` is for tests and fixtures. Composite `strategy: tandem` profiles wrap two concrete profiles and can run `draft_review`, `split_implement`, or `consensus`.
+
+Use `command` for the executable or shell entrypoint, `args` for
+structured base arguments, and `extra_args` for profile-specific
+backend flags. For example, Codex app-server profiles should prefer
+`command: codex` with `args: [app-server]`; Claude profiles should
+prefer `command: claude`, `model: claude-sonnet-4-5`, and
+`extra_args: [--mcp-config, .symphony/mcp/platform-lead.json]` when a
+role needs additional Claude CLI flags. Legacy `command: codex
+app-server` still loads for compatibility.
 
 `routing` maps normalized work items to roles. `first_match` uses file order. `priority` chooses the matching rule with the highest `priority`.
 

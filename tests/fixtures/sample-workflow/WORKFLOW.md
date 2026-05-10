@@ -71,21 +71,23 @@ roles:
 agents:
   lead_agent:
     backend: codex
-    command: codex app-server
+    command: codex
+    args: [app-server]
     tools: [git, github, tracker]
     memory: persistent
     approval_policy: workflow-default
   qa_agent:
     backend: claude
-    command: claude -p --output-format stream-json --permission-mode bypassPermissions
+    command: claude
     tools: [git, github, tracker]
   codex_fast:
     backend: codex
-    command: codex app-server
+    command: codex
+    args: [app-server]
     tools: [git, github, tracker]
   claude_fast:
     backend: claude
-    command: claude -p --output-format stream-json --permission-mode bypassPermissions
+    command: claude
     tools: [git, github, tracker]
   hermes_agent:
     backend: hermes

@@ -1681,10 +1681,19 @@ pub struct AgentBackendProfile {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// Shell command launched via `bash -lc`. `None` defers to the
-    /// backend's default command (e.g. `codex app-server`).
+    /// Executable or shell entrypoint. `None` defers to the backend's
+    /// default command (e.g. `codex app-server` for legacy fixtures).
     #[serde(default)]
     pub command: Option<String>,
+
+    /// Structured base arguments for the backend command.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Operator-supplied arguments appended after Symphony-required
+    /// protocol flags when backend ordering requires that.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 
     /// Model identifier passed through to the backend. `None` uses the
     /// backend's configured default.
@@ -2896,6 +2905,30 @@ pub enum ConfigValidationError {
         target: String,
     },
 
+    /// A backend profile configured a model for a backend that does not
+    /// support model override wiring.
+    #[error(
+        "agent profile `{profile}` uses backend {backend:?}, which does not support `model` overrides"
+    )]
+    UnsupportedAgentProfileModel {
+        /// Profile name.
+        profile: String,
+        /// Backend that cannot accept model overrides.
+        backend: AgentBackend,
+    },
+
+    /// A profile mixed legacy whitespace command strings with
+    /// structured args.
+    #[error(
+        "agent profile `{profile}` sets structured args but command `{command}` contains whitespace; use command as executable and move arguments into args/extra_args"
+    )]
+    UnsupportedAgentArgsOrdering {
+        /// Profile name.
+        profile: String,
+        /// Configured command.
+        command: String,
+    },
+
     /// `workspace.default_strategy` references a strategy that is not
     /// defined in `workspace.strategies`. SPEC v2 §5.8.
     #[error("workspace.default_strategy `{0}` is not defined under workspace.strategies")]
@@ -3475,6 +3508,27 @@ impl WorkflowConfig {
 
         // composite.lead/follower must resolve to concrete backend profiles.
         for (profile_name, profile) in &self.agents {
+            if let AgentProfileConfig::Backend(backend) = profile {
+                if backend.model.is_some()
+                    && matches!(backend.backend, AgentBackend::Hermes | AgentBackend::Mock)
+                {
+                    return Err(ConfigValidationError::UnsupportedAgentProfileModel {
+                        profile: profile_name.clone(),
+                        backend: backend.backend,
+                    });
+                }
+                if backend
+                    .command
+                    .as_deref()
+                    .is_some_and(|c| c.contains(char::is_whitespace))
+                    && (!backend.args.is_empty() || !backend.extra_args.is_empty())
+                {
+                    return Err(ConfigValidationError::UnsupportedAgentArgsOrdering {
+                        profile: profile_name.clone(),
+                        command: backend.command.clone().unwrap_or_default(),
+                    });
+                }
+            }
             if let AgentProfileConfig::Composite(c) = profile {
                 for (seat, target) in [("lead", &c.lead), ("follower", &c.follower)] {
                     match self.agents.get(target) {
@@ -4461,7 +4515,9 @@ agents:
   lead_agent:
     backend: codex
     description: Integration owner backend.
-    command: codex app-server
+    command: codex
+    args: [app-server]
+    extra_args: [--profile, fast]
     model: o4
     tools: [git, github, tracker]
     memory: persistent
@@ -4489,7 +4545,9 @@ agents:
             .and_then(|a| a.as_backend())
             .expect("lead_agent is a backend profile");
         assert_eq!(lead.backend, AgentBackend::Codex);
-        assert_eq!(lead.command.as_deref(), Some("codex app-server"));
+        assert_eq!(lead.command.as_deref(), Some("codex"));
+        assert_eq!(lead.args, vec!["app-server"]);
+        assert_eq!(lead.extra_args, vec!["--profile", "fast"]);
         assert_eq!(lead.model.as_deref(), Some("o4"));
         assert_eq!(lead.tools, vec!["git", "github", "tracker"]);
         assert_eq!(lead.memory.as_deref(), Some("persistent"));
@@ -7034,6 +7092,8 @@ decomposition:
                 backend: AgentBackend::Mock,
                 description: None,
                 command: None,
+                args: Vec::new(),
+                extra_args: Vec::new(),
                 model: None,
                 system_prompt: None,
                 tools: Vec::new(),
@@ -7069,6 +7129,8 @@ decomposition:
             backend: AgentBackend::Mock,
             description: None,
             command: None,
+            args: Vec::new(),
+            extra_args: Vec::new(),
             model: None,
             system_prompt: None,
             tools: Vec::new(),
@@ -7116,6 +7178,74 @@ decomposition:
     }
 
     #[test]
+    fn validate_rejects_unsupported_model_override_for_backend() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.agents.insert(
+            "mock_model".into(),
+            AgentProfileConfig::Backend(Box::new(AgentBackendProfile {
+                backend: AgentBackend::Mock,
+                description: None,
+                command: None,
+                args: Vec::new(),
+                extra_args: Vec::new(),
+                model: Some("pretend-model".into()),
+                system_prompt: None,
+                tools: Vec::new(),
+                env: BTreeMap::new(),
+                memory: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                max_turns: None,
+                turn_timeout_ms: None,
+                stall_timeout_ms: None,
+                token_budget: None,
+                cost_budget_usd: None,
+            })),
+        );
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnsupportedAgentProfileModel {
+                profile: "mock_model".into(),
+                backend: AgentBackend::Mock,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_structured_args_on_legacy_whitespace_command() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.agents.insert(
+            "bad_codex".into(),
+            AgentProfileConfig::Backend(Box::new(AgentBackendProfile {
+                backend: AgentBackend::Codex,
+                description: None,
+                command: Some("codex app-server".into()),
+                args: vec!["--profile".into(), "fast".into()],
+                extra_args: Vec::new(),
+                model: None,
+                system_prompt: None,
+                tools: Vec::new(),
+                env: BTreeMap::new(),
+                memory: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                max_turns: None,
+                turn_timeout_ms: None,
+                stall_timeout_ms: None,
+                token_budget: None,
+                cost_budget_usd: None,
+            })),
+        );
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::UnsupportedAgentArgsOrdering {
+                profile: "bad_codex".into(),
+                command: "codex app-server".into(),
+            })
+        );
+    }
+
+    #[test]
     fn validate_accepts_full_v2_workflow_with_all_features() {
         // Smoke test: a workflow that turns on every feature at once
         // and wires every cross-reference correctly should validate
@@ -7144,6 +7274,8 @@ decomposition:
                 backend: AgentBackend::Mock,
                 description: None,
                 command: None,
+                args: Vec::new(),
+                extra_args: Vec::new(),
                 model: None,
                 system_prompt: None,
                 tools: Vec::new(),
@@ -7369,6 +7501,8 @@ agent:
             backend: AgentBackend::Mock,
             description: None,
             command: None,
+            args: Vec::new(),
+            extra_args: Vec::new(),
             model: None,
             system_prompt: None,
             tools: Vec::new(),

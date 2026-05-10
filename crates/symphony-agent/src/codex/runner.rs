@@ -75,6 +75,15 @@ pub struct CodexConfig {
     #[serde(default = "default_command")]
     pub command: String,
 
+    /// Structured base arguments appended to [`Self::command`] when
+    /// launching through the shell.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Operator-supplied arguments appended after [`Self::args`].
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+
     /// JSON-RPC method to call for the initial handshake.
     #[serde(default = "default_method_initialize")]
     pub method_initialize: String,
@@ -114,6 +123,25 @@ pub struct CodexConfig {
 fn default_command() -> String {
     DEFAULT_CODEX_COMMAND.to_string()
 }
+
+/// Command string passed to `bash -lc`, built from structured args.
+pub fn effective_shell_command(config: &CodexConfig) -> String {
+    let mut parts = vec![config.command.clone()];
+    parts.extend(config.args.iter().map(|arg| shell_quote(arg)));
+    parts.extend(config.extra_args.iter().map(|arg| shell_quote(arg)));
+    parts.join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn default_method_initialize() -> String {
     "initialize".to_string()
 }
@@ -131,6 +159,8 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             command: default_command(),
+            args: Vec::new(),
+            extra_args: Vec::new(),
             method_initialize: default_method_initialize(),
             method_new_conversation: default_method_new_conversation(),
             method_send_user_turn: default_method_send_user_turn(),
@@ -186,16 +216,17 @@ async fn spawn_session(
 ) -> AgentResult<AgentSession> {
     validate_workspace(&params.workspace)?;
 
+    let effective_command = effective_shell_command(config);
     let mut child = Command::new("bash")
         .arg("-lc")
-        .arg(&config.command)
+        .arg(&effective_command)
         .current_dir(&params.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| AgentError::Spawn(format!("spawn `{}`: {e}", config.command)))?;
+        .map_err(|e| AgentError::Spawn(format!("spawn `{effective_command}`: {e}")))?;
 
     let stdin = child
         .stdin
@@ -749,6 +780,21 @@ mod tests {
         assert_eq!(
             frame["params"]["turnSandboxPolicy"]["network"],
             json!(false)
+        );
+    }
+
+    #[test]
+    fn effective_shell_command_appends_structured_args_with_quoting() {
+        let cfg = CodexConfig {
+            command: "codex".into(),
+            args: vec!["app-server".into()],
+            extra_args: vec!["--profile".into(), "fast lane".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            effective_shell_command(&cfg),
+            "codex app-server --profile 'fast lane'"
         );
     }
 

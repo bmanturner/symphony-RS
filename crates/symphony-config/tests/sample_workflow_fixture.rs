@@ -92,7 +92,8 @@ fn sample_fixture_loads_and_validates() {
         .and_then(AgentProfileConfig::as_backend)
         .expect("lead_agent must parse as a backend profile");
     assert_eq!(lead_agent.backend, AgentBackend::Codex);
-    assert_eq!(lead_agent.command.as_deref(), Some("codex app-server"));
+    assert_eq!(lead_agent.command.as_deref(), Some("codex"));
+    assert_eq!(lead_agent.args, vec!["app-server"]);
 
     let lead_pair = cfg
         .agents

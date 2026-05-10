@@ -83,7 +83,10 @@ use symphony_agent::claude::{ClaudeConfig, ClaudeRunner};
 use symphony_agent::codex::{CodexConfig as RunnerCodexConfig, CodexRunner};
 use symphony_agent::mock::{MockAgentConfig, MockAgentRunner};
 use symphony_agent::tandem::{TandemRunner, TandemStrategy};
-use symphony_config::{AgentKind, LayeredLoader, TrackerKind, WorkflowConfig};
+use symphony_config::{
+    AgentBackend, AgentBackendProfile, AgentKind, AgentProfileConfig, LayeredLoader, TrackerKind,
+    WorkflowConfig,
+};
 use symphony_core::agent::{AgentEvent, AgentRunner, CompletionReason, StartSessionParams};
 use symphony_core::event_bus::EventBus;
 use symphony_core::poll_loop::Dispatcher;
@@ -563,6 +566,17 @@ fn build_workspace(cfg: &WorkflowConfig) -> Result<Arc<dyn WorkspaceManager>> {
 /// The defaults match the Phase 6 demos so an operator who flips
 /// `agent.kind: tandem` gets a working setup.
 fn build_agent_runner(cfg: &WorkflowConfig) -> Result<Arc<dyn AgentRunner>> {
+    if let Some(role) = cfg
+        .routing
+        .default_role
+        .as_deref()
+        .or(cfg.decomposition.owner_role.as_deref())
+    {
+        if let Ok((runner, _metadata)) = build_agent_runner_for_role(cfg, role) {
+            return Ok(runner);
+        }
+    }
+
     match cfg.agent.kind {
         AgentKind::Codex => Ok(Arc::new(CodexRunner::new(codex_runner_config(cfg)))),
         AgentKind::Claude => Ok(Arc::new(ClaudeRunner::new(ClaudeConfig::default()))),
@@ -578,6 +592,85 @@ fn build_agent_runner(cfg: &WorkflowConfig) -> Result<Arc<dyn AgentRunner>> {
         }
         AgentKind::Mock => Ok(Arc::new(MockAgentRunner::new(MockAgentConfig::default()))),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentRunnerDebugMetadata {
+    pub role: String,
+    pub profile: String,
+    pub backend: AgentBackend,
+    pub effective_argv: Vec<String>,
+}
+
+fn build_agent_runner_for_role(
+    cfg: &WorkflowConfig,
+    role_name: &str,
+) -> Result<(Arc<dyn AgentRunner>, AgentRunnerDebugMetadata)> {
+    let role = cfg
+        .roles
+        .get(role_name)
+        .with_context(|| format!("role `{role_name}` is not configured"))?;
+    let profile_name = role
+        .agent
+        .as_deref()
+        .with_context(|| format!("role `{role_name}` has no agent profile"))?;
+    build_agent_runner_for_profile(cfg, role_name, profile_name)
+}
+
+fn build_agent_runner_for_profile(
+    cfg: &WorkflowConfig,
+    role_name: &str,
+    profile_name: &str,
+) -> Result<(Arc<dyn AgentRunner>, AgentRunnerDebugMetadata)> {
+    let profile = cfg
+        .agents
+        .get(profile_name)
+        .with_context(|| format!("agent profile `{profile_name}` is not configured"))?;
+    match profile {
+        AgentProfileConfig::Backend(profile) => {
+            build_backend_agent_runner(cfg, role_name, profile_name, profile.as_ref())
+        }
+        AgentProfileConfig::Composite(composite) => {
+            let (lead, lead_meta) =
+                build_agent_runner_for_profile(cfg, role_name, &composite.lead)?;
+            let (follower, _follower_meta) =
+                build_agent_runner_for_profile(cfg, role_name, &composite.follower)?;
+            let strategy = match composite.mode {
+                symphony_config::TandemMode::DraftReview => TandemStrategy::DraftReview,
+                symphony_config::TandemMode::SplitImplement => TandemStrategy::SplitImplement,
+                symphony_config::TandemMode::Consensus => TandemStrategy::Consensus,
+            };
+            Ok((
+                Arc::new(TandemRunner::new(lead, follower, strategy)),
+                lead_meta,
+            ))
+        }
+    }
+}
+
+fn build_backend_agent_runner(
+    cfg: &WorkflowConfig,
+    role_name: &str,
+    profile_name: &str,
+    profile: &AgentBackendProfile,
+) -> Result<(Arc<dyn AgentRunner>, AgentRunnerDebugMetadata)> {
+    let runner: Arc<dyn AgentRunner> = match profile.backend {
+        AgentBackend::Codex => Arc::new(CodexRunner::new(codex_runner_config_for_profile(
+            cfg, profile,
+        ))),
+        AgentBackend::Claude => {
+            Arc::new(ClaudeRunner::new(claude_runner_config_for_profile(profile)))
+        }
+        AgentBackend::Mock => Arc::new(MockAgentRunner::new(MockAgentConfig::default())),
+        AgentBackend::Hermes => anyhow::bail!("Hermes agent profiles are deprecated in v5 scope"),
+    };
+    let metadata = AgentRunnerDebugMetadata {
+        role: role_name.to_string(),
+        profile: profile_name.to_string(),
+        backend: profile.backend,
+        effective_argv: redacted_effective_argv(profile),
+    };
+    Ok((runner, metadata))
 }
 
 /// Translate the [`WorkflowConfig`]'s loose `codex` block into the
@@ -603,6 +696,94 @@ fn codex_runner_config(cfg: &WorkflowConfig) -> RunnerCodexConfig {
         turn_sandbox_policy: yaml_to_json(cfg.codex.turn_sandbox_policy.as_ref()),
         ..RunnerCodexConfig::default()
     }
+}
+
+fn codex_runner_config_for_profile(
+    cfg: &WorkflowConfig,
+    profile: &AgentBackendProfile,
+) -> RunnerCodexConfig {
+    RunnerCodexConfig {
+        command: profile
+            .command
+            .clone()
+            .unwrap_or_else(|| cfg.codex.command.clone()),
+        args: profile.args.clone(),
+        extra_args: profile.extra_args.clone(),
+        model: profile.model.clone(),
+        approval_policy: profile
+            .approval_policy
+            .as_ref()
+            .and_then(|v| serde_json::to_value(v).ok())
+            .or_else(|| yaml_to_json(cfg.codex.approval_policy.as_ref())),
+        thread_sandbox: profile
+            .sandbox_policy
+            .as_ref()
+            .and_then(|v| serde_json::to_value(v).ok())
+            .or_else(|| yaml_to_json(cfg.codex.thread_sandbox.as_ref())),
+        turn_sandbox_policy: yaml_to_json(cfg.codex.turn_sandbox_policy.as_ref()),
+        ..RunnerCodexConfig::default()
+    }
+}
+
+fn claude_runner_config_for_profile(profile: &AgentBackendProfile) -> ClaudeConfig {
+    ClaudeConfig {
+        command: profile
+            .command
+            .clone()
+            .unwrap_or_else(|| ClaudeConfig::default().command),
+        model: profile.model.clone(),
+        extra_args: profile
+            .args
+            .iter()
+            .chain(profile.extra_args.iter())
+            .cloned()
+            .collect(),
+        ..ClaudeConfig::default()
+    }
+}
+
+fn redacted_effective_argv(profile: &AgentBackendProfile) -> Vec<String> {
+    let command = profile
+        .command
+        .clone()
+        .unwrap_or_else(|| match profile.backend {
+            AgentBackend::Codex => "codex app-server".to_string(),
+            AgentBackend::Claude => "claude".to_string(),
+            AgentBackend::Hermes => "hermes".to_string(),
+            AgentBackend::Mock => "mock".to_string(),
+        });
+    let mut argv = vec![command];
+    argv.extend(profile.args.iter().cloned());
+    if let Some(model) = &profile.model {
+        argv.push("--model".into());
+        argv.push(model.clone());
+    }
+    argv.extend(profile.extra_args.iter().cloned());
+    redact_argv(argv)
+}
+
+fn redact_argv(argv: Vec<String>) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(argv.len());
+    let mut redact_next = false;
+    for arg in argv {
+        let lower = arg.to_ascii_lowercase();
+        let secretish = lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("password")
+            || lower.contains("api-key")
+            || lower.contains("apikey");
+        if redact_next || secretish {
+            redacted.push("[REDACTED]".into());
+            redact_next = false;
+        } else {
+            redact_next = matches!(
+                lower.as_str(),
+                "--token" | "--secret" | "--password" | "--api-key" | "--apikey"
+            );
+            redacted.push(arg);
+        }
+    }
+    redacted
 }
 
 fn yaml_to_json(v: Option<&serde_yaml::Value>) -> Option<serde_json::Value> {
@@ -770,7 +951,7 @@ pub(crate) fn render_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use symphony_config::{AgentConfig, AgentKind, TrackerConfig, TrackerKind};
+    use symphony_config::{AgentConfig, AgentKind, RoleKind, TrackerConfig, TrackerKind};
 
     fn issue() -> Issue {
         let mut i = Issue::minimal("id-1", "ABC-7", "Add fizz to buzz", "Todo");
@@ -823,6 +1004,112 @@ mod tests {
         assert!(out.contains("labels=epic, backend"));
         assert!(out.contains("blocked=1 blocker(s): ABC-1"));
         assert!(out.contains("count=1"));
+    }
+
+    #[test]
+    fn role_scoped_runner_uses_role_profile_model_args_and_redacted_metadata() {
+        let cfg: WorkflowConfig = serde_yaml::from_str(
+            r#"
+roles:
+  backend:
+    kind: specialist
+    agent: codex_fast
+agents:
+  codex_fast:
+    backend: codex
+    command: codex
+    args: [app-server]
+    model: gpt-5-codex
+    extra_args: [--profile, fast, --api-key, super-secret]
+"#,
+        )
+        .unwrap();
+
+        let (_runner, metadata) = build_agent_runner_for_role(&cfg, "backend").unwrap();
+        assert_eq!(metadata.role, "backend");
+        assert_eq!(metadata.profile, "codex_fast");
+        assert_eq!(metadata.backend, AgentBackend::Codex);
+        assert_eq!(
+            metadata.effective_argv,
+            vec![
+                "codex",
+                "app-server",
+                "--model",
+                "gpt-5-codex",
+                "--profile",
+                "fast",
+                "[REDACTED]",
+                "[REDACTED]"
+            ]
+        );
+    }
+
+    #[test]
+    fn role_scoped_runner_distinguishes_two_roles_on_same_backend() {
+        let cfg: WorkflowConfig = serde_yaml::from_str(
+            r#"
+roles:
+  backend:
+    kind: specialist
+    agent: codex_fast
+  frontend:
+    kind: specialist
+    agent: codex_ui
+agents:
+  codex_fast:
+    backend: codex
+    command: codex
+    args: [app-server]
+    model: gpt-5-codex
+    extra_args: [--profile, fast]
+  codex_ui:
+    backend: codex
+    command: codex
+    args: [app-server]
+    model: gpt-5.5
+    extra_args: [--profile, ui]
+"#,
+        )
+        .unwrap();
+
+        let (_backend_runner, backend_meta) = build_agent_runner_for_role(&cfg, "backend").unwrap();
+        let (_frontend_runner, frontend_meta) =
+            build_agent_runner_for_role(&cfg, "frontend").unwrap();
+        assert_eq!(backend_meta.backend, AgentBackend::Codex);
+        assert_eq!(frontend_meta.backend, AgentBackend::Codex);
+        assert!(backend_meta.effective_argv.contains(&"gpt-5-codex".into()));
+        assert!(frontend_meta.effective_argv.contains(&"gpt-5.5".into()));
+        assert!(backend_meta.effective_argv.contains(&"fast".into()));
+        assert!(frontend_meta.effective_argv.contains(&"ui".into()));
+    }
+
+    #[test]
+    fn role_scoped_runner_fails_for_missing_role_agent_profile() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.roles.insert("backend".into(), {
+            let mut role = symphony_config::RoleConfig {
+                kind: RoleKind::Specialist,
+                description: None,
+                agent: None,
+                max_concurrent: None,
+                can_decompose: None,
+                can_assign: None,
+                can_request_qa: None,
+                can_close_parent: None,
+                can_file_blockers: None,
+                can_file_followups: None,
+                required_for_done: None,
+                instructions: symphony_config::RoleInstructionConfig::default(),
+                assignment: symphony_config::RoleAssignmentMetadata::default(),
+            };
+            role.agent = Some("ghost".into());
+            role
+        });
+        let err = match build_agent_runner_for_role(&cfg, "backend") {
+            Ok(_) => panic!("expected missing profile error"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("ghost"));
     }
 
     #[test]

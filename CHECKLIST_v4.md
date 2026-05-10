@@ -59,15 +59,15 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 5 — Role-Scoped Runtime Profile Resolution
 
-- [ ] Replace the single global `build_agent_runner(cfg.agent.kind)` production path with role-aware runner resolution: run/work item role → `roles.<role>.agent` → `agents.<profile>` → concrete backend/composite runner.
-- [ ] Extend `AgentBackendProfile` with structured `args: Vec<String>` and `extra_args: Vec<String>` fields; keep `command` as executable/shell entrypoint, not a raw concatenated command line.
-- [ ] Preserve compatibility for existing `command: codex app-server` fixtures via migration/defaulting or fixture updates, but make the canonical v4 examples use `command: codex` + `args: [app-server]`.
-- [ ] Honor `AgentBackendProfile.model` in every concrete backend adapter: Claude via model flag, Codex via app-server conversation/session config. (Hermes is deprecated — see `CHECKLIST_v5.md` Phase 0 for code removal.)
-- [ ] Wire per-profile runtime overrides into composite/tandem profiles so lead and follower can use different models, args, tools, and budgets.
-- [ ] Add validation for missing role agent, dangling agent profile, unsupported model override for backend, unsupported args ordering, and non-runnable composite profiles.
-- [ ] Add tests proving two roles using the same backend can launch with different models and extra args.
-- [ ] Add tests proving effective argv/debug metadata is emitted with secrets redacted.
-- [ ] Add operator docs showing model/args/extra_args examples for Claude and Codex.
+- [x] Replace the single global `build_agent_runner(cfg.agent.kind)` production path with role-aware runner resolution: run/work item role → `roles.<role>.agent` → `agents.<profile>` → concrete backend/composite runner.
+- [x] Extend `AgentBackendProfile` with structured `args: Vec<String>` and `extra_args: Vec<String>` fields; keep `command` as executable/shell entrypoint, not a raw concatenated command line.
+- [x] Preserve compatibility for existing `command: codex app-server` fixtures via migration/defaulting or fixture updates, but make the canonical v4 examples use `command: codex` + `args: [app-server]`.
+- [x] Honor `AgentBackendProfile.model` in every concrete backend adapter: Claude via model flag, Codex via app-server conversation/session config. (Hermes is deprecated — see `CHECKLIST_v5.md` Phase 0 for code removal.)
+- [x] Wire per-profile runtime overrides into composite/tandem profiles so lead and follower can use different models, args, tools, and budgets.
+- [x] Add validation for missing role agent, dangling agent profile, unsupported model override for backend, unsupported args ordering, and non-runnable composite profiles.
+- [x] Add tests proving two roles using the same backend can launch with different models and extra args.
+- [x] Add tests proving effective argv/debug metadata is emitted with secrets redacted.
+- [x] Add operator docs showing model/args/extra_args examples for Claude and Codex.
 
 ## Phase 6 — Platform Lead Decomposition and Integration Prompts
 
