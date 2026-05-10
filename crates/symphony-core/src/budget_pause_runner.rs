@@ -51,6 +51,9 @@ use crate::blocker::RunRef;
 use crate::budget_pause_tick::{
     BudgetPauseDispatchQueue, BudgetPauseDispatchRequest, BudgetPauseId,
 };
+use crate::concurrency_gate::{
+    ConcurrencyGate, DispatchTriple, RunnerScopes, ScopeContended, ScopeKind, ScopePermitSet,
+};
 use crate::lease::{LeaseClock, LeaseConfig, LeaseOwner};
 use crate::run_lease::{
     HeartbeatPulseObservation, LeaseAcquireOutcome, LeaseHeartbeat, RunLeaseGuard, RunLeaseStore,
@@ -140,6 +143,15 @@ pub struct BudgetPauseRunReport {
     /// The request is parked on the deferred queue so a transient I/O
     /// blip does not lose the dispatch.
     pub lease_backend_error: usize,
+    /// Requests parked because at least one
+    /// [`crate::concurrency_gate::ConcurrencyGate`] scope was at cap.
+    /// Length matches `scope_contentions.len()` — the typed observations
+    /// are surfaced separately so callers can route them.
+    pub deferred_scope_contention: usize,
+    /// Typed in-flight observations for every dispatch that was deferred
+    /// because a scope was at cap on this pass. Emitted in walk order so
+    /// downstream observers can correlate against the parked dispatches.
+    pub scope_contentions: Vec<ScopeContendedObservation>,
 }
 
 impl BudgetPauseRunReport {
@@ -150,6 +162,42 @@ impl BudgetPauseRunReport {
             && self.deferred_lease_contention == 0
             && self.missing_run == 0
             && self.lease_backend_error == 0
+            && self.deferred_scope_contention == 0
+            && self.scope_contentions.is_empty()
+    }
+}
+
+/// Per-pass typed observation surfaced when a budget-pause dispatch
+/// could not acquire its [`RunnerScopes`] permit set because at least
+/// one scope was at cap.
+///
+/// Pairs the parked request's pause id with the [`ScopeContended`]
+/// reported by [`ConcurrencyGate::try_acquire`] so a downstream observer
+/// can answer "why is this resume not running" without re-deriving the
+/// scope keys from workflow config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeContendedObservation {
+    /// Pause id the parked request carries.
+    pub pause_id: BudgetPauseId,
+    /// The kind of scope that contended.
+    pub scope_kind: ScopeKind,
+    /// The scope key (role/profile/repo label, or `""` for `Global`).
+    pub scope_key: String,
+    /// In-flight permits on the contended scope at rejection.
+    pub in_flight: u32,
+    /// Configured cap on the contended scope.
+    pub cap: u32,
+}
+
+impl ScopeContendedObservation {
+    fn from_contention(pause_id: BudgetPauseId, contended: &ScopeContended) -> Self {
+        Self {
+            pause_id,
+            scope_kind: contended.scope.kind(),
+            scope_key: contended.scope.key().to_owned(),
+            in_flight: contended.in_flight,
+            cap: contended.cap,
+        }
     }
 }
 
@@ -199,6 +247,16 @@ pub struct BudgetPauseRunner {
     /// snapshots the map and renews each due lease through the
     /// configured wiring's clock.
     heartbeats: Arc<Mutex<HashMap<RunRef, HeartbeatRegistration>>>,
+    /// Optional multi-scope concurrency gate. When `Some`, every
+    /// dispatch carrying a `role` acquires
+    /// `{Global, Role, AgentProfile?, Repository?}` permits before the
+    /// resume handler runs and releases them on terminal completion.
+    /// When `None` (or when a request has no `role`), only the local
+    /// capacity semaphore caps concurrency. ARCHITECTURE_v2 ADR records
+    /// that budget-pause resume is gated under the configured workflow
+    /// resume role by convention — producers populate `role` from that
+    /// config (typically the same role that owns budget waivers).
+    concurrency_gate: Option<ConcurrencyGate>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -228,7 +286,23 @@ impl BudgetPauseRunner {
             max_concurrent,
             leasing: None,
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
+            concurrency_gate: None,
         }
+    }
+
+    /// Wire a [`ConcurrencyGate`] into the runner.
+    ///
+    /// Each subsequent dispatch whose request carries a `role` builds a
+    /// [`DispatchTriple`] from `(role, agent_profile, repository)`, calls
+    /// [`RunnerScopes::try_acquire`], and only proceeds when every
+    /// configured scope has headroom. A contended scope produces a
+    /// [`ScopeContendedObservation`] on the pass report and the request
+    /// is parked on the deferred queue for a future pass — capacity and
+    /// lease are *not* consumed when the gate rejects. Requests without
+    /// a `role` bypass the gate entirely.
+    pub fn with_concurrency_gate(mut self, gate: ConcurrencyGate) -> Self {
+        self.concurrency_gate = Some(gate);
+        self
     }
 
     /// Enable durable-lease wiring. Each subsequent dispatch whose
@@ -301,6 +375,35 @@ impl BudgetPauseRunner {
                 }
             };
 
+            // Multi-scope concurrency gate. A contended scope must not
+            // consume the local capacity permit — drop it before parking
+            // so a different routable dispatch can take that slot in the
+            // same pass. Lease acquisition runs after this so a parked
+            // dispatch never holds a lease while waiting on a scope cap.
+            let scope_permits = match self.try_acquire_scopes(&req) {
+                Ok(set) => set,
+                Err(contended) => {
+                    drop(permit);
+                    report
+                        .scope_contentions
+                        .push(ScopeContendedObservation::from_contention(
+                            req.pause_id,
+                            &contended,
+                        ));
+                    debug!(
+                        pause_id = req.pause_id.get(),
+                        scope_kind = ?contended.scope.kind(),
+                        scope_key = %contended.scope.key(),
+                        in_flight = contended.in_flight,
+                        cap = contended.cap,
+                        "budget pause runner: scope contended; parking",
+                    );
+                    new_deferred.push(req);
+                    report.deferred_scope_contention += 1;
+                    continue;
+                }
+            };
+
             // Durable-lease acquisition. Held through the spawned
             // dispatch and released on terminal completion. Permit is
             // only consumed once the lease is acquired so contention or
@@ -309,17 +412,20 @@ impl BudgetPauseRunner {
                 LeaseAttempt::Acquired(leased) => leased,
                 LeaseAttempt::Skipped => None,
                 LeaseAttempt::Contended => {
+                    drop(scope_permits);
                     drop(permit);
                     new_deferred.push(req);
                     report.deferred_lease_contention += 1;
                     continue;
                 }
                 LeaseAttempt::NotFound => {
+                    drop(scope_permits);
                     drop(permit);
                     report.missing_run += 1;
                     continue;
                 }
                 LeaseAttempt::BackendError => {
+                    drop(scope_permits);
                     drop(permit);
                     new_deferred.push(req);
                     report.lease_backend_error += 1;
@@ -367,6 +473,9 @@ impl BudgetPauseRunner {
                 if let Some(run_id) = heartbeat_run_id {
                     heartbeats.lock().await.remove(&run_id);
                 }
+                // Release scope permits exactly once on terminal exit;
+                // ScopePermitSet::Drop is idempotent across the move.
+                drop(scope_permits);
                 drop(permit);
                 BudgetPauseDispatchOutcome {
                     pause_id,
@@ -391,6 +500,31 @@ impl BudgetPauseRunner {
         }
 
         report
+    }
+
+    /// Attempt to acquire scope permits for `req` against the configured
+    /// [`ConcurrencyGate`]. Returns `Ok(None)` when no gate is wired or
+    /// the request lacks a `role`, `Ok(Some(set))` when every scope had
+    /// headroom, and `Err(_)` when any scope was at cap (no permits held
+    /// — the inner gate already rolled back partial acquisitions).
+    fn try_acquire_scopes(
+        &self,
+        req: &BudgetPauseDispatchRequest,
+    ) -> Result<Option<ScopePermitSet>, ScopeContended> {
+        let Some(gate) = &self.concurrency_gate else {
+            return Ok(None);
+        };
+        let Some(role) = req.role.as_ref() else {
+            return Ok(None);
+        };
+        let triple = DispatchTriple::new(
+            role.as_str().to_owned(),
+            req.agent_profile.clone(),
+            req.repository.clone(),
+        );
+        RunnerScopes::new(gate.clone(), triple)
+            .try_acquire()
+            .map(Some)
     }
 
     async fn try_acquire_lease(&self, req: &BudgetPauseDispatchRequest) -> LeaseAttempt {
@@ -565,6 +699,9 @@ mod tests {
             limit_value: 5.0,
             observed: 6.0,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         }
     }
 
@@ -576,6 +713,30 @@ mod tests {
             limit_value: 5.0,
             observed: 6.0,
             run_id: Some(crate::blocker::RunRef::new(run_id)),
+            role: None,
+            agent_profile: None,
+            repository: None,
+        }
+    }
+
+    fn req_full(
+        id: i64,
+        work: i64,
+        kind: &str,
+        role: &str,
+        agent_profile: Option<&str>,
+        repository: Option<&str>,
+    ) -> BudgetPauseDispatchRequest {
+        BudgetPauseDispatchRequest {
+            pause_id: BudgetPauseId::new(id),
+            work_item_id: WorkItemId::new(work),
+            budget_kind: kind.into(),
+            limit_value: 5.0,
+            observed: 6.0,
+            run_id: None,
+            role: Some(crate::role::RoleName::new(role)),
+            agent_profile: agent_profile.map(str::to_owned),
+            repository: repository.map(str::to_owned),
         }
     }
 
@@ -1388,5 +1549,160 @@ mod tests {
         assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
         assert!(store.snapshot(RunRef::new(42)).await.is_none());
         assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    // ---- Concurrency-gate wiring (CHECKLIST_v2 Phase 11) -----------
+
+    use crate::concurrency_gate::Scope;
+
+    #[tokio::test]
+    async fn resume_role_cap_serializes_dispatch_independent_of_other_caps() {
+        // Resume role cap=1 must serialize budget-pause dispatch even
+        // when other role caps allow more.
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("platform_lead".into()), 1);
+        gate.set_cap(Scope::Role("qa".into()), 99);
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(1, 100, "max_cost", "platform_lead", None, None));
+        queue.enqueue(req_full(2, 100, "max_cost", "platform_lead", None, None));
+        queue.enqueue(req_full(3, 100, "max_cost", "platform_lead", None, None));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 2);
+        assert_eq!(report.scope_contentions.len(), 2);
+        for obs in &report.scope_contentions {
+            assert_eq!(obs.scope_kind, ScopeKind::Role);
+            assert_eq!(obs.scope_key, "platform_lead");
+            assert_eq!(obs.cap, 1);
+            assert_eq!(obs.in_flight, 1);
+        }
+        let parked: Vec<i64> = report
+            .scope_contentions
+            .iter()
+            .map(|o| o.pause_id.get())
+            .collect();
+        assert_eq!(parked, vec![2, 3]);
+
+        // Local capacity unaffected — parked dispatches did not consume
+        // permits.
+        assert_eq!(runner.inflight_count().await, 1);
+        assert_eq!(runner.deferred_count().await, 2);
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+
+        // Next pass: one parked dispatch acquires the freed permit and
+        // spawns; the second re-defers because cap=1.
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 1);
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn repository_cap_parks_without_consuming_capacity() {
+        // A per-repository cap defers the second dispatch but the local
+        // capacity permit must NOT be consumed: a third (different
+        // repo) dispatch on the same pass still spawns.
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Repository("acme/widgets".into()), 1);
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 2)
+            .with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(
+            1,
+            100,
+            "k",
+            "platform_lead",
+            None,
+            Some("acme/widgets"),
+        ));
+        queue.enqueue(req_full(
+            2,
+            100,
+            "k",
+            "platform_lead",
+            None,
+            Some("acme/widgets"),
+        ));
+        queue.enqueue(req_full(
+            3,
+            100,
+            "k",
+            "platform_lead",
+            None,
+            Some("other/repo"),
+        ));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 2, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 1);
+        assert_eq!(report.scope_contentions.len(), 1);
+        let obs = &report.scope_contentions[0];
+        assert_eq!(obs.pause_id, BudgetPauseId::new(2));
+        assert_eq!(obs.scope_kind, ScopeKind::Repository);
+        assert_eq!(obs.scope_key, "acme/widgets");
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 2).await;
+    }
+
+    #[tokio::test]
+    async fn no_gate_passthrough_dispatches_normally() {
+        // No gate wired — every request dispatches up to local capacity.
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 4);
+
+        queue.enqueue(req_full(1, 100, "k", "platform_lead", None, None));
+        queue.enqueue(req_full(2, 100, "k", "platform_lead", None, None));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 2);
+        assert_eq!(report.deferred_scope_contention, 0);
+        assert!(report.scope_contentions.is_empty());
+
+        let _ = wait_for_outcomes(&runner, 2).await;
+    }
+
+    #[tokio::test]
+    async fn role_less_request_bypasses_gate() {
+        // A request without a `role` is dispatched even when scope caps
+        // are configured: gate keys cannot be derived without a role.
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Global, 0);
+        gate.set_cap(Scope::Role("platform_lead".into()), 0);
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate);
+
+        // role: None — should bypass gate entirely.
+        queue.enqueue(req(1, 100, "max_cost"));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 0);
+
+        let _ = wait_for_outcomes(&runner, 1).await;
     }
 }
