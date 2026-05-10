@@ -89,6 +89,63 @@ pub enum Command {
     /// 'pending'` collapses duplicates to an in-place payload replace.
     /// The summary line distinguishes the first enqueue from a nudge.
     Cancel(CancelArgs),
+
+    /// Issue-graph inspection commands (ARCHITECTURE v2 §6 / Phase 12).
+    ///
+    /// The kernel models work-item relationships as typed edges in
+    /// `work_item_edges` (`parent_child`, `blocks`, `relates_to`,
+    /// `followup_of`). Operators and tests need a way to read those
+    /// edges without writing SQL — this group of subcommands serves that
+    /// need.
+    Issue(IssueArgs),
+}
+
+/// Arguments for `symphony issue`.
+///
+/// The `issue` namespace groups read-only inspection commands that
+/// answer "what does the orchestrator believe about this work item?"
+/// without mutating durable state. The first subcommand is `graph`;
+/// future siblings (e.g. `qa-evidence`) will land alongside the
+/// remaining Phase 12 items.
+#[derive(Debug, clap::Args)]
+pub struct IssueArgs {
+    /// The chosen `issue` subcommand.
+    #[command(subcommand)]
+    pub command: IssueCommand,
+}
+
+/// Concrete `symphony issue` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum IssueCommand {
+    /// Print the parent/child/blocker/follow-up/relates-to graph rooted
+    /// at a given work item, reading the durable `work_items` and
+    /// `work_item_edges` tables.
+    Graph(IssueGraphArgs),
+}
+
+/// Arguments for `symphony issue graph`.
+///
+/// The positional id is the durable `work_items.id` (matching the shape
+/// `symphony cancel --issue` accepts). Tracker-identifier resolution
+/// (e.g. `ENG-101` → numeric id) lands when `symphony status` surfaces
+/// the durable id alongside each row; until then operators copy the id
+/// from a direct DB read or from upcoming JSON status output.
+#[derive(Debug, clap::Args)]
+pub struct IssueGraphArgs {
+    /// Numeric `work_items.id` of the root to inspect.
+    #[arg(value_name = "ID")]
+    pub id: i64,
+
+    /// Path to the durable state SQLite database. Must already exist —
+    /// `issue graph` is a read-only command and refuses to create a
+    /// database on demand for the same reason `symphony cancel` does:
+    /// mutating an unrecognised file is a footgun.
+    #[arg(
+        long = "state-db",
+        value_name = "PATH",
+        default_value = "symphony.sqlite3"
+    )]
+    pub state_db: PathBuf,
 }
 
 /// Arguments for `symphony cancel`.

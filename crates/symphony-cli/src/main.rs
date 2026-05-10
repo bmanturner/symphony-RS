@@ -13,6 +13,7 @@
 
 mod cancel;
 mod cli;
+mod issue;
 mod logging;
 mod run;
 mod scheduler;
@@ -94,6 +95,15 @@ fn main() -> anyhow::Result<ExitCode> {
                     Ok(ExitCode::from(1))
                 }
             }
+        }
+        Some(Command::Issue(args)) => {
+            // `issue graph` is read-only and synchronous: it opens the
+            // durable SQLite store, joins one work item plus its
+            // typed-edge neighbourhood, and prints the result. No tokio
+            // runtime needed.
+            let outcome = issue::run(&args.command);
+            let code = issue::render(&outcome);
+            Ok(ExitCode::from(code as u8))
         }
         Some(Command::Cancel(args)) => {
             // `cancel` is a synchronous one-shot: it opens the durable
