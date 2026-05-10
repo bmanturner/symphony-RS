@@ -234,6 +234,78 @@ pub(crate) fn build_specialist_prompt(
     Ok(PromptAssembly::new(sections))
 }
 
+pub(crate) fn build_qa_prompt(
+    workflow_prompt: &str,
+    instruction_packs: &InstructionPackBundle,
+    qa_role: &str,
+    issue: &Issue,
+    child_handoffs: &[symphony_core::integration_request::IntegrationChild],
+    known_blockers: Vec<PromptBlocker>,
+    acceptance_criteria: Vec<String>,
+    ci_status: Option<&str>,
+) -> Result<PromptAssembly> {
+    let ctx = PromptContext::for_issue(issue)
+        .with_blockers(known_blockers.clone())
+        .with_acceptance_criteria(acceptance_criteria.clone());
+    let mut sections = vec![PromptSection::new(
+        PromptSectionKind::GlobalWorkflowInstructions,
+        render_prompt(workflow_prompt, &ctx).context("render workflow prompt")?,
+    )];
+    if let Some(pack) = instruction_packs.roles.get(qa_role) {
+        if let Some(role_prompt) = &pack.role_prompt {
+            sections.push(PromptSection::new(
+                PromptSectionKind::RolePrompt,
+                role_prompt.content.clone(),
+            ));
+        }
+        if let Some(soul) = &pack.soul {
+            sections.push(PromptSection::new(
+                PromptSectionKind::RoleSoul,
+                soul.content.clone(),
+            ));
+        }
+    }
+    sections.extend([
+        PromptSection::new(
+            PromptSectionKind::IssueContext,
+            format!(
+                "{}\nci_status: {}\nqa_scope: integrated output gate",
+                issue_context(issue),
+                ci_status.unwrap_or("unknown")
+            ),
+        ),
+        PromptSection::new(
+            PromptSectionKind::ParentChildGraph,
+            render_integration_children(child_handoffs),
+        ),
+        PromptSection::new(
+            PromptSectionKind::Blockers,
+            if known_blockers.is_empty() {
+                "none".into()
+            } else {
+                known_blockers
+                    .iter()
+                    .map(|b| format!("- [{}] {}", b.severity, b.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        ),
+        PromptSection::new(
+            PromptSectionKind::AcceptanceCriteria,
+            acceptance_criteria
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        PromptSection::new(
+            PromptSectionKind::OutputSchema,
+            "Emit a QA verdict with verdict, evidence, acceptance_trace, blockers_created, waiver_role, and reason.",
+        ),
+    ]);
+    Ok(PromptAssembly::new(sections))
+}
+
 fn issue_context(issue: &Issue) -> String {
     format!(
         "identifier: {}\ntitle: {}\nlabels: {}\npriority: {}\nblocked_by: {}",
@@ -565,5 +637,93 @@ followups:
 
         assert!(prompt.contains("waiting for schema child"));
         assert!(prompt.contains("[high]"));
+    }
+
+    #[test]
+    fn qa_prompt_includes_verdict_schema_and_child_handoffs() {
+        let mut packs = InstructionPackBundle::default();
+        packs.roles.insert(
+            "qa".into(),
+            specialist_pack("qa", "QA role prompt", "QA soul"),
+        );
+        let issue = Issue::minimal("p", "ENG-1", "Integrated broad work", "QA");
+        let handoff = Handoff {
+            summary: "Backend complete".into(),
+            changed_files: vec!["crates/api.rs".into()],
+            tests_run: vec!["cargo test -p api".into()],
+            verification_evidence: vec!["green tests".into()],
+            known_risks: Vec::new(),
+            blockers_created: Vec::new(),
+            followups_created_or_proposed: Vec::new(),
+            branch_or_workspace: BranchOrWorkspace {
+                branch: Some("feat/backend".into()),
+                workspace_path: Some("/tmp/backend".into()),
+                base_ref: Some("main".into()),
+            },
+            ready_for: ReadyFor::Qa,
+            block_reason: None,
+            reporting_role: Some(RoleName::new("backend")),
+            verdict_request: None,
+        };
+        let children = vec![IntegrationChild {
+            child_id: WorkItemId::new(2),
+            identifier: "ENG-2".into(),
+            title: "Backend".into(),
+            status_class: WorkItemStatusClass::Done,
+            branch: Some("feat/backend".into()),
+            latest_handoff: Some(handoff),
+        }];
+
+        let prompt = build_qa_prompt(
+            "Global {{identifier}}",
+            &packs,
+            "qa",
+            &issue,
+            &children,
+            Vec::new(),
+            vec!["Acceptance traced".into()],
+            Some("green"),
+        )
+        .unwrap()
+        .render();
+
+        assert!(prompt.contains("QA role prompt"));
+        assert!(prompt.contains("QA soul"));
+        assert!(prompt.contains("qa_scope: integrated output gate"));
+        assert!(prompt.contains("ci_status: green"));
+        assert!(prompt.contains("summary: Backend complete"));
+        assert!(prompt.contains("changed_files: crates/api.rs"));
+        assert!(prompt.contains("- Acceptance traced"));
+        assert!(prompt.contains("verdict"));
+        assert!(prompt.contains("acceptance_trace"));
+        assert!(prompt.contains("evidence"));
+    }
+
+    #[test]
+    fn qa_prompt_uses_same_handoff_rendering_as_integration_prompt() {
+        let children = vec![IntegrationChild {
+            child_id: WorkItemId::new(3),
+            identifier: "ENG-3".into(),
+            title: "Frontend".into(),
+            status_class: WorkItemStatusClass::Done,
+            branch: Some("feat/frontend".into()),
+            latest_handoff: None,
+        }];
+        let issue = Issue::minimal("p", "ENG-1", "Integrated broad work", "QA");
+        let qa_prompt = build_qa_prompt(
+            "Global",
+            &InstructionPackBundle::default(),
+            "qa",
+            &issue,
+            &children,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+        .render();
+        let rendered_children = render_integration_children(&children);
+        assert!(qa_prompt.contains(&rendered_children));
+        assert!(qa_prompt.contains("latest_handoff: none"));
     }
 }

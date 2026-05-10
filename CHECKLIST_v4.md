@@ -94,11 +94,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 8 — QA Prompts
 
-- [ ] Add QA prompt assembly that includes global workflow prompt, QA `role_prompt`, QA `soul`, integrated branch/draft PR context, acceptance trace, child handoffs, known blockers, CI/check status, and QA verdict schema.
-- [ ] Ensure QA prompt construction treats QA as a gate over integrated output, not a normal implementation child by default.
-- [ ] Add tests proving QA verdict schema and evidence requirements are present.
-- [ ] Add tests proving QA can see child handoffs and integration summary.
-- [ ] Read child handoffs from `HandoffRepository::latest_handoff` (same source as Phase 6 integration-owner prompt) and include the SPEC v4 §5.2 fields. Both Phase 6 and Phase 8 must agree on the rendering format so a child handoff reads identically downstream.
+- [x] Add QA prompt assembly that includes global workflow prompt, QA `role_prompt`, QA `soul`, integrated branch/draft PR context, acceptance trace, child handoffs, known blockers, CI/check status, and QA verdict schema.
+- [x] Ensure QA prompt construction treats QA as a gate over integrated output, not a normal implementation child by default.
+- [x] Add tests proving QA verdict schema and evidence requirements are present.
+- [x] Add tests proving QA can see child handoffs and integration summary.
+- [x] Read child handoffs from `HandoffRepository::latest_handoff` (same source as Phase 6 integration-owner prompt) and include the SPEC v4 §5.2 fields. Both Phase 6 and Phase 8 must agree on the rendering format so a child handoff reads identically downstream.
 
 ## Phase 9 — Fixtures and Examples
 
