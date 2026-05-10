@@ -529,3 +529,11 @@ Context: Filing blockers/follow-ups through prompts alone makes workflow mutatio
 Decision: Split tracker adapters into read and mutation capabilities. Workflows requiring autonomous issue creation or blockers must use mutation-capable adapters.
 
 Consequence: Read-only trackers still work in advisory mode, but full v2 behavior requires mutation support.
+
+### 2026-05-09 — Follow-up approval is gated under the configured `followups.approval_role`
+
+Context: Phase 11 wires `ConcurrencyGate` into every dispatch runner so global, role, agent-profile, and repository caps serialize work uniformly. The follow-up approval runner is structurally a dispatch runner — it consumes a queue, leases a durable run row, and invokes a per-proposal handler — but its "role" is operator-decision, not specialist work. Without an explicit choice, operators could not bound how many approval sessions run in parallel for a given approval role.
+
+Decision: Wire `ConcurrencyGate` into `FollowupApprovalRunner` mirroring the QA contract. `FollowupApprovalDispatchRequest` carries optional `(role, agent_profile, repository)` triples; producers populate `role` from the configured `followups.approval_role` so approval dispatches respect that role's cap (and any per-profile/per-repository caps). Acquisition runs after local capacity but before lease acquisition, so a contended scope drops the local permit before parking and never holds a lease while waiting on a scope cap. Role-less requests bypass gate acquisition entirely (today's tick emits role-less requests; populating the triple is opt-in for producers that want gating).
+
+Consequence: Operators can bound approval concurrency under the same workflow knob that governs every other role. The runner surfaces `ScopeContendedObservation` on `FollowupApprovalRunReport` so the durable-event subtask (Phase 11 §194) can persist `ScopeCapReached` events for approval traffic without re-deriving scope keys from workflow config.

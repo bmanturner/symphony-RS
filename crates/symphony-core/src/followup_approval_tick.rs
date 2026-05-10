@@ -117,6 +117,24 @@ pub struct FollowupApprovalDispatchRequest {
     /// dispatches bypass lease acquisition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<crate::blocker::RunRef>,
+    /// Optional role key for the multi-scope concurrency gate
+    /// (CHECKLIST_v2 Phase 11). When `Some`, the follow-up approval
+    /// runner builds a [`crate::concurrency_gate::DispatchTriple`] from
+    /// `(role, agent_profile, repository)` and gates dispatch through
+    /// the configured [`crate::concurrency_gate::ConcurrencyGate`].
+    /// Producers typically populate this with the configured
+    /// `followups.approval_role` so approval dispatches respect that
+    /// role's cap. `None` bypasses gate acquisition entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<RoleName>,
+    /// Optional agent-profile scope key. Paired with `role` for gate
+    /// acquisition; ignored when `role` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<String>,
+    /// Optional repository scope key. Paired with `role` for gate
+    /// acquisition; ignored when `role` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 /// Shared FIFO of pending [`FollowupApprovalDispatchRequest`]s.
@@ -281,6 +299,9 @@ impl QueueTick for FollowupApprovalQueueTick {
                 blocking: c.blocking,
                 approval_role: c.approval_role,
                 run_id: None,
+                role: None,
+                agent_profile: None,
+                repository: None,
             });
             self.claimed
                 .lock()
@@ -613,6 +634,9 @@ mod tests {
             blocking: false,
             approval_role: role.clone(),
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         });
         q.enqueue(FollowupApprovalDispatchRequest {
             followup_id: FollowupId::new(2),
@@ -621,6 +645,9 @@ mod tests {
             blocking: true,
             approval_role: role,
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         });
         assert_eq!(q.len(), 2);
         let drained = q.drain();
@@ -653,6 +680,9 @@ mod tests {
             blocking: false,
             approval_role: RoleName::new("platform_lead"),
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: FollowupApprovalDispatchRequest = serde_json::from_str(&json).unwrap();
@@ -668,10 +698,33 @@ mod tests {
             blocking: false,
             approval_role: RoleName::new("platform_lead"),
             run_id: Some(crate::blocker::RunRef::new(99)),
+            role: None,
+            agent_profile: None,
+            repository: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: FollowupApprovalDispatchRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert!(json.contains("run_id"));
+    }
+
+    #[test]
+    fn dispatch_request_round_trips_when_scope_keys_present() {
+        let r = FollowupApprovalDispatchRequest {
+            followup_id: FollowupId::new(8),
+            source_work_item: WorkItemId::new(100),
+            title: "verify".into(),
+            blocking: false,
+            approval_role: RoleName::new("platform_lead"),
+            run_id: None,
+            role: Some(RoleName::new("platform_lead")),
+            agent_profile: Some("claude".into()),
+            repository: Some("acme/widgets".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: FollowupApprovalDispatchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+        assert!(json.contains("agent_profile"));
+        assert!(json.contains("repository"));
     }
 }

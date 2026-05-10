@@ -41,6 +41,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::blocker::RunRef;
+use crate::concurrency_gate::{
+    ConcurrencyGate, DispatchTriple, RunnerScopes, ScopeContended, ScopeKind, ScopePermitSet,
+};
 use crate::followup::FollowupId;
 use crate::followup_approval_tick::{
     FollowupApprovalDispatchQueue, FollowupApprovalDispatchRequest,
@@ -136,6 +139,15 @@ pub struct FollowupApprovalRunReport {
     /// The request is parked on the deferred queue so a transient I/O
     /// blip does not lose the dispatch.
     pub lease_backend_error: usize,
+    /// Requests parked because at least one
+    /// [`crate::concurrency_gate::ConcurrencyGate`] scope was at cap.
+    /// Length matches `scope_contentions.len()` — the typed observations
+    /// are surfaced separately so callers can route them.
+    pub deferred_scope_contention: usize,
+    /// Typed in-flight observations for every dispatch that was deferred
+    /// because a scope was at cap on this pass. Emitted in walk order so
+    /// downstream observers can correlate against the parked dispatches.
+    pub scope_contentions: Vec<ScopeContendedObservation>,
 }
 
 impl FollowupApprovalRunReport {
@@ -146,6 +158,42 @@ impl FollowupApprovalRunReport {
             && self.deferred_lease_contention == 0
             && self.missing_run == 0
             && self.lease_backend_error == 0
+            && self.deferred_scope_contention == 0
+            && self.scope_contentions.is_empty()
+    }
+}
+
+/// Per-pass typed observation surfaced when a follow-up approval
+/// dispatch could not acquire its [`RunnerScopes`] permit set because at
+/// least one scope was at cap.
+///
+/// Pairs the parked request's follow-up id with the [`ScopeContended`]
+/// reported by [`ConcurrencyGate::try_acquire`] so a downstream observer
+/// can answer "why is this approval not running" without re-deriving the
+/// scope keys from workflow config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeContendedObservation {
+    /// Follow-up id the parked request carries.
+    pub followup_id: FollowupId,
+    /// The kind of scope that contended.
+    pub scope_kind: ScopeKind,
+    /// The scope key (role/profile/repo label, or `""` for `Global`).
+    pub scope_key: String,
+    /// In-flight permits on the contended scope at rejection.
+    pub in_flight: u32,
+    /// Configured cap on the contended scope.
+    pub cap: u32,
+}
+
+impl ScopeContendedObservation {
+    fn from_contention(followup_id: FollowupId, contended: &ScopeContended) -> Self {
+        Self {
+            followup_id,
+            scope_kind: contended.scope.kind(),
+            scope_key: contended.scope.key().to_owned(),
+            in_flight: contended.in_flight,
+            cap: contended.cap,
+        }
     }
 }
 
@@ -195,6 +243,16 @@ pub struct FollowupApprovalRunner {
     /// snapshots the map and renews each due lease through the
     /// configured wiring's clock.
     heartbeats: Arc<Mutex<HashMap<RunRef, HeartbeatRegistration>>>,
+    /// Optional multi-scope concurrency gate. When `Some`, every
+    /// dispatch carrying a `role` acquires
+    /// `{Global, Role, AgentProfile?, Repository?}` permits before the
+    /// approval handler runs and releases them on terminal completion.
+    /// When `None` (or when a request has no `role`), only the local
+    /// capacity semaphore caps concurrency. ARCHITECTURE_v2 ADR records
+    /// that approval is gated under the configured
+    /// `followups.approval_role` by convention — producers populate
+    /// `role` from that config.
+    concurrency_gate: Option<ConcurrencyGate>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -224,7 +282,23 @@ impl FollowupApprovalRunner {
             max_concurrent,
             leasing: None,
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
+            concurrency_gate: None,
         }
+    }
+
+    /// Wire a [`ConcurrencyGate`] into the runner.
+    ///
+    /// Each subsequent dispatch whose request carries a `role` builds a
+    /// [`DispatchTriple`] from `(role, agent_profile, repository)`, calls
+    /// [`RunnerScopes::try_acquire`], and only proceeds when every
+    /// configured scope has headroom. A contended scope produces a
+    /// [`ScopeContendedObservation`] on the pass report and the request
+    /// is parked on the deferred queue for a future pass — capacity and
+    /// lease are *not* consumed when the gate rejects. Requests without
+    /// a `role` bypass the gate entirely.
+    pub fn with_concurrency_gate(mut self, gate: ConcurrencyGate) -> Self {
+        self.concurrency_gate = Some(gate);
+        self
     }
 
     /// Enable durable-lease wiring. Each subsequent dispatch whose
@@ -297,6 +371,35 @@ impl FollowupApprovalRunner {
                 }
             };
 
+            // Multi-scope concurrency gate. A contended scope must not
+            // consume the local capacity permit — drop it before parking
+            // so a different routable dispatch can take that slot in the
+            // same pass. Lease acquisition runs after this so a parked
+            // dispatch never holds a lease while waiting on a scope cap.
+            let scope_permits = match self.try_acquire_scopes(&req) {
+                Ok(set) => set,
+                Err(contended) => {
+                    drop(permit);
+                    report
+                        .scope_contentions
+                        .push(ScopeContendedObservation::from_contention(
+                            req.followup_id,
+                            &contended,
+                        ));
+                    debug!(
+                        followup_id = req.followup_id.get(),
+                        scope_kind = ?contended.scope.kind(),
+                        scope_key = %contended.scope.key(),
+                        in_flight = contended.in_flight,
+                        cap = contended.cap,
+                        "followup approval runner: scope contended; parking",
+                    );
+                    new_deferred.push(req);
+                    report.deferred_scope_contention += 1;
+                    continue;
+                }
+            };
+
             // Durable-lease acquisition. Held through the spawned
             // dispatch and released on terminal completion. Permit is
             // only consumed once the lease is acquired so contention or
@@ -305,17 +408,20 @@ impl FollowupApprovalRunner {
                 LeaseAttempt::Acquired(leased) => leased,
                 LeaseAttempt::Skipped => None,
                 LeaseAttempt::Contended => {
+                    drop(scope_permits);
                     drop(permit);
                     new_deferred.push(req);
                     report.deferred_lease_contention += 1;
                     continue;
                 }
                 LeaseAttempt::NotFound => {
+                    drop(scope_permits);
                     drop(permit);
                     report.missing_run += 1;
                     continue;
                 }
                 LeaseAttempt::BackendError => {
+                    drop(scope_permits);
                     drop(permit);
                     new_deferred.push(req);
                     report.lease_backend_error += 1;
@@ -363,6 +469,9 @@ impl FollowupApprovalRunner {
                 if let Some(run_id) = heartbeat_run_id {
                     heartbeats.lock().await.remove(&run_id);
                 }
+                // Release scope permits exactly once on terminal exit;
+                // ScopePermitSet::Drop is idempotent across the move.
+                drop(scope_permits);
                 drop(permit);
                 FollowupApprovalDispatchOutcome {
                     followup_id,
@@ -386,6 +495,31 @@ impl FollowupApprovalRunner {
         }
 
         report
+    }
+
+    /// Attempt to acquire scope permits for `req` against the configured
+    /// [`ConcurrencyGate`]. Returns `Ok(None)` when no gate is wired or
+    /// the request lacks a `role`, `Ok(Some(set))` when every scope had
+    /// headroom, and `Err(_)` when any scope was at cap (no permits held
+    /// — the inner gate already rolled back partial acquisitions).
+    fn try_acquire_scopes(
+        &self,
+        req: &FollowupApprovalDispatchRequest,
+    ) -> Result<Option<ScopePermitSet>, ScopeContended> {
+        let Some(gate) = &self.concurrency_gate else {
+            return Ok(None);
+        };
+        let Some(role) = req.role.as_ref() else {
+            return Ok(None);
+        };
+        let triple = DispatchTriple::new(
+            role.as_str().to_owned(),
+            req.agent_profile.clone(),
+            req.repository.clone(),
+        );
+        RunnerScopes::new(gate.clone(), triple)
+            .try_acquire()
+            .map(Some)
     }
 
     async fn try_acquire_lease(&self, req: &FollowupApprovalDispatchRequest) -> LeaseAttempt {
@@ -562,6 +696,9 @@ mod tests {
             blocking,
             approval_role: RoleName::new("platform_lead"),
             run_id: None,
+            role: None,
+            agent_profile: None,
+            repository: None,
         }
     }
 
@@ -579,6 +716,30 @@ mod tests {
             blocking,
             approval_role: RoleName::new("platform_lead"),
             run_id: Some(crate::blocker::RunRef::new(run_id)),
+            role: None,
+            agent_profile: None,
+            repository: None,
+        }
+    }
+
+    fn req_full(
+        id: i64,
+        source: i64,
+        title: &str,
+        role: &str,
+        agent_profile: Option<&str>,
+        repository: Option<&str>,
+    ) -> FollowupApprovalDispatchRequest {
+        FollowupApprovalDispatchRequest {
+            followup_id: FollowupId::new(id),
+            source_work_item: WorkItemId::new(source),
+            title: title.into(),
+            blocking: false,
+            approval_role: RoleName::new("platform_lead"),
+            run_id: None,
+            role: Some(RoleName::new(role)),
+            agent_profile: agent_profile.map(str::to_owned),
+            repository: repository.map(str::to_owned),
         }
     }
 
@@ -1442,5 +1603,170 @@ mod tests {
         assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
         assert!(store.snapshot(RunRef::new(42)).await.is_none());
         assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    // ---- Concurrency-gate wiring (CHECKLIST_v2 Phase 11) -----------
+
+    use crate::concurrency_gate::Scope;
+
+    #[tokio::test]
+    async fn approval_role_cap_serializes_dispatch_independent_of_qa_cap() {
+        // The follow-up approval role's cap must hold even when other
+        // role caps (QA, specialist) allow more. A QA cap of 99 must
+        // not affect approval dispatch.
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("platform_lead".into()), 1);
+        gate.set_cap(Scope::Role("qa".into()), 99);
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(1, 100, "a", "platform_lead", None, None));
+        queue.enqueue(req_full(2, 100, "b", "platform_lead", None, None));
+        queue.enqueue(req_full(3, 100, "c", "platform_lead", None, None));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 2);
+        assert_eq!(report.scope_contentions.len(), 2);
+        for obs in &report.scope_contentions {
+            assert_eq!(obs.scope_kind, crate::concurrency_gate::ScopeKind::Role);
+            assert_eq!(obs.scope_key, "platform_lead");
+            assert_eq!(obs.cap, 1);
+            assert_eq!(obs.in_flight, 1);
+        }
+        let parked: Vec<i64> = report
+            .scope_contentions
+            .iter()
+            .map(|o| o.followup_id.get())
+            .collect();
+        assert_eq!(parked, vec![2, 3]);
+
+        // Local capacity unaffected — parked dispatches did not consume
+        // permits.
+        assert_eq!(runner.inflight_count().await, 1);
+        assert_eq!(runner.deferred_count().await, 2);
+
+        dispatcher.enable_gate();
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+
+        // Next pass: one parked dispatch acquires the freed permit and
+        // spawns; the second re-defers because cap=1.
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 1);
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn approval_repository_cap_parks_without_consuming_capacity() {
+        // A per-repository cap defers the second dispatch but the local
+        // capacity permit must NOT be consumed: a third (different
+        // repo) dispatch on the same pass still spawns.
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Repository("acme/widgets".into()), 1);
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 2)
+            .with_concurrency_gate(gate);
+
+        queue.enqueue(req_full(
+            1,
+            100,
+            "a",
+            "platform_lead",
+            None,
+            Some("acme/widgets"),
+        ));
+        queue.enqueue(req_full(
+            2,
+            100,
+            "b",
+            "platform_lead",
+            None,
+            Some("acme/widgets"),
+        ));
+        queue.enqueue(req_full(
+            3,
+            100,
+            "c",
+            "platform_lead",
+            None,
+            Some("acme/other"),
+        ));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 2, "report = {report:?}");
+        assert_eq!(report.deferred_scope_contention, 1);
+        let obs = &report.scope_contentions[0];
+        assert_eq!(
+            obs.scope_kind,
+            crate::concurrency_gate::ScopeKind::Repository
+        );
+        assert_eq!(obs.scope_key, "acme/widgets");
+        assert_eq!(obs.followup_id, FollowupId::new(2));
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 2).await;
+    }
+
+    #[tokio::test]
+    async fn approval_no_concurrency_gate_means_no_scope_observations() {
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4);
+        queue.enqueue(req_full(
+            1,
+            100,
+            "a",
+            "platform_lead",
+            Some("claude"),
+            Some("acme/widgets"),
+        ));
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert!(report.scope_contentions.is_empty());
+        assert_eq!(report.deferred_scope_contention, 0);
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    #[tokio::test]
+    async fn approval_dispatch_without_role_bypasses_concurrency_gate() {
+        // Requests without a `role` must bypass gate acquisition even
+        // when a gate is wired — the tick today emits role-less
+        // requests, and they should not block on a Global cap.
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Global, 0);
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate);
+
+        queue.enqueue(req(1, 100, "a", false));
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert!(report.scope_contentions.is_empty());
+        let _ = wait_for_outcomes(&runner, 1).await;
     }
 }
