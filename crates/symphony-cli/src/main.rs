@@ -14,6 +14,7 @@
 mod cancel;
 mod cli;
 mod dashboard;
+mod debug;
 mod issue;
 mod logging;
 mod prompt_builders;
@@ -152,6 +153,11 @@ fn main() -> anyhow::Result<ExitCode> {
             if let dashboard::DashboardOutcome::TerminalFailed(err) = &outcome {
                 eprintln!("dashboard: terminal error: {err}");
             }
+            Ok(ExitCode::from(code as u8))
+        }
+        Some(Command::Debug(args)) => {
+            let outcome = debug::run(&args.command);
+            let code = debug::render(&outcome);
             Ok(ExitCode::from(code as u8))
         }
         Some(Command::Status(args)) => {

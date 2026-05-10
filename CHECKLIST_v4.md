@@ -111,11 +111,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 10 — Operator Surface and Debugging
 
-- [ ] Add a command or debug mode to render the effective prompt for a role/run without launching an agent.
-- [ ] Add a command or debug mode to render only the platform-lead role catalog.
-- [ ] Show role instruction provenance in status/run metadata.
-- [ ] Add JSON output for role catalog inspection.
-- [ ] Add tests for prompt preview redaction and provenance output.
+- [x] Add a command or debug mode to render the effective prompt for a role/run without launching an agent.
+- [x] Add a command or debug mode to render only the platform-lead role catalog.
+- [x] Show role instruction provenance in status/run metadata.
+- [x] Add JSON output for role catalog inspection.
+- [x] Add tests for prompt preview redaction and provenance output.
 
 ## Phase 11 — End-to-End Scenarios
 

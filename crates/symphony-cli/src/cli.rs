@@ -127,6 +127,78 @@ pub enum Command {
     /// up. Tabs cover queues, blockers, QA verdicts, integration
     /// records, and runs.
     Dashboard(DashboardArgs),
+
+    /// Render prompt/catalog debug surfaces without launching agents.
+    Debug(DebugArgs),
+}
+
+/// Arguments for `symphony debug`.
+#[derive(Debug, clap::Args)]
+pub struct DebugArgs {
+    /// The chosen `debug` subcommand.
+    #[command(subcommand)]
+    pub command: DebugCommand,
+}
+
+/// Concrete `symphony debug` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum DebugCommand {
+    /// Render the effective prompt for a role and synthetic issue
+    /// context without launching an agent.
+    Prompt(DebugPromptArgs),
+
+    /// Render the generated platform-lead role catalog.
+    Catalog(DebugCatalogArgs),
+}
+
+/// Arguments for `symphony debug prompt`.
+#[derive(Debug, clap::Args)]
+pub struct DebugPromptArgs {
+    /// Path to the `WORKFLOW.md` file to read.
+    #[arg(value_name = "PATH", default_value = "WORKFLOW.md")]
+    pub path: PathBuf,
+
+    /// Workflow role whose prompt should be previewed.
+    #[arg(long, value_name = "ROLE")]
+    pub role: String,
+
+    /// Synthetic tracker identifier used for placeholder rendering.
+    #[arg(long, value_name = "ID", default_value = "PREVIEW-1")]
+    pub identifier: String,
+
+    /// Synthetic issue title used for placeholder rendering.
+    #[arg(long, value_name = "TITLE", default_value = "Prompt preview")]
+    pub title: String,
+
+    /// Synthetic tracker state used for placeholder rendering.
+    #[arg(long, value_name = "STATE", default_value = "Todo")]
+    pub state: String,
+
+    /// Emit a stable JSON document with rendered prompt and provenance.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+
+    /// Include raw instruction-file contents. By default the preview
+    /// redacts secret-looking instruction text.
+    #[arg(long = "unsafe-unredacted", default_value_t = false)]
+    pub unsafe_unredacted: bool,
+}
+
+/// Arguments for `symphony debug catalog`.
+#[derive(Debug, clap::Args)]
+pub struct DebugCatalogArgs {
+    /// Path to the `WORKFLOW.md` file to read.
+    #[arg(value_name = "PATH", default_value = "WORKFLOW.md")]
+    pub path: PathBuf,
+
+    /// Platform-lead role used as the current role and excluded from
+    /// the generated child-role catalog.
+    #[arg(long, value_name = "ROLE", default_value = "platform_lead")]
+    pub role: String,
+
+    /// Emit a stable JSON document instead of prompt text.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `symphony dashboard`.

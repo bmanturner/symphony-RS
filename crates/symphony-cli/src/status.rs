@@ -48,7 +48,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use symphony_config::{
-    ConfigValidationError, LayeredLoadError, LayeredLoader, LoadedWorkflow, TrackerKind,
+    ConfigValidationError, InstructionPackBundle, LayeredLoadError, LayeredLoader, LoadedWorkflow,
+    TrackerKind,
 };
 use symphony_core::tracker::Issue;
 use symphony_core::tracker_trait::{TrackerError, TrackerRead};
@@ -347,6 +348,16 @@ pub struct ConfigJson {
     pub poll_interval_ms: u64,
     pub max_concurrent_agents: u32,
     pub agent_kind: String,
+    pub role_instruction_provenance: Vec<RoleInstructionProvenanceJson>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RoleInstructionProvenanceJson {
+    pub role: String,
+    pub role_prompt_path: Option<String>,
+    pub role_prompt_hash: Option<String>,
+    pub soul_path: Option<String>,
+    pub soul_hash: Option<String>,
 }
 
 /// Durable-mode row in JSON form. Keeps the on-wire field set narrow
@@ -406,6 +417,9 @@ impl StatusJson {
             poll_interval_ms: cfg.polling.interval_ms,
             max_concurrent_agents: cfg.agent.max_concurrent_agents,
             agent_kind: format!("{:?}", cfg.agent.kind),
+            role_instruction_provenance: role_instruction_provenance(
+                &snap.loaded.instruction_packs,
+            ),
         };
         let workflow_path = snap.loaded.source_path.display().to_string();
 
@@ -487,6 +501,34 @@ fn tracker_issue_to_json(issue: &Issue) -> TrackerIssueJson {
     }
 }
 
+pub(crate) fn role_instruction_provenance(
+    packs: &InstructionPackBundle,
+) -> Vec<RoleInstructionProvenanceJson> {
+    packs
+        .roles
+        .iter()
+        .map(|(role, pack)| RoleInstructionProvenanceJson {
+            role: role.clone(),
+            role_prompt_path: pack
+                .role_prompt
+                .as_ref()
+                .map(|instruction| instruction.source.path.display().to_string()),
+            role_prompt_hash: pack
+                .role_prompt
+                .as_ref()
+                .map(|instruction| instruction.source.content_hash.clone()),
+            soul_path: pack
+                .soul
+                .as_ref()
+                .map(|instruction| instruction.source.path.display().to_string()),
+            soul_hash: pack
+                .soul
+                .as_ref()
+                .map(|instruction| instruction.source.content_hash.clone()),
+        })
+        .collect()
+}
+
 fn tracker_kind_str(kind: TrackerKind) -> &'static str {
     match kind {
         TrackerKind::Linear => "linear",
@@ -514,6 +556,18 @@ fn render_snapshot(snap: &StatusSnapshot) {
         "  config: poll_interval={}ms, max_concurrent={}, agent={:?}",
         cfg.polling.interval_ms, cfg.agent.max_concurrent_agents, cfg.agent.kind,
     );
+    let provenance = role_instruction_provenance(&snap.loaded.instruction_packs);
+    if !provenance.is_empty() {
+        println!("  role instructions:");
+        for item in provenance {
+            println!(
+                "    {} role_prompt={} soul={}",
+                item.role,
+                item.role_prompt_hash.as_deref().unwrap_or("-"),
+                item.soul_hash.as_deref().unwrap_or("-")
+            );
+        }
+    }
 
     match &snap.view {
         StatusView::Durable { items } => render_durable(items, cfg.tracker.kind),

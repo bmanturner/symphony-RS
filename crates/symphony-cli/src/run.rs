@@ -136,6 +136,16 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         max_concurrent = loaded.config.agent.max_concurrent_agents,
         "starting symphony run",
     );
+    for provenance in crate::status::role_instruction_provenance(&loaded.instruction_packs) {
+        info!(
+            role = %provenance.role,
+            role_prompt_path = provenance.role_prompt_path.as_deref().unwrap_or(""),
+            role_prompt_hash = provenance.role_prompt_hash.as_deref().unwrap_or(""),
+            soul_path = provenance.soul_path.as_deref().unwrap_or(""),
+            soul_hash = provenance.soul_hash.as_deref().unwrap_or(""),
+            "loaded role instruction provenance",
+        );
+    }
 
     let tracker = build_tracker(&loaded.config, &loaded.source_path)
         .with_context(|| "building issue tracker adapter")?;
