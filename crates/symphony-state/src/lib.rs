@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 pub mod cancel_requests;
+pub mod decomposition_apply;
 pub mod edges;
 pub mod events;
 pub mod handoffs;
@@ -88,6 +89,11 @@ pub enum StateError {
         /// The status the caller attempted to transition to, as a string.
         to: String,
     },
+
+    /// A composed state transition violated a kernel invariant before
+    /// SQLite could express the problem.
+    #[error("state invariant violation: {0}")]
+    Invariant(String),
 }
 
 /// Convenience result alias for the state crate.
