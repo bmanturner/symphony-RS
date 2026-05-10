@@ -403,7 +403,7 @@ mod tests {
     fn materializes_each_depends_on_as_a_local_open_blocks_edge() {
         let mut db = open();
         let parent = seed_parent(&mut db);
-        let proposal = proposal(parent);
+        let mut proposal = proposal(parent);
 
         let persisted =
             persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
@@ -433,6 +433,14 @@ mod tests {
             persisted.dependency_edges[1].reason.as_deref(),
             Some("C depends on B")
         );
+
+        proposal
+            .mark_applied(
+                persisted.child_work_item_ids(),
+                persisted.local_dependency_evidence(),
+            )
+            .expect("A -> B -> C materialization is enough to apply");
+        assert_eq!(proposal.status, DecompositionStatus::Applied);
     }
 
     #[test]

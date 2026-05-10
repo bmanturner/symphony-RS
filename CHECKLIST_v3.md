@@ -35,7 +35,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] For each `ChildProposal.depends_on`, resolve both `ChildKey`s to created child `WorkItemId`s and create a local open `blocks` edge.
 - [x] Preserve partial child creation state when child creation succeeds but dependency materialization fails.
 - [x] Prevent a decomposition proposal from being marked fully applied until dependency edges are persisted and, when required, tracker sync state is recorded.
-- [ ] Add tests for successful `A -> B -> C` child creation plus local `blocks` edge materialization.
+- [x] Add tests for successful `A -> B -> C` child creation plus local `blocks` edge materialization.
 - [ ] Add tests for mixed parallel/sequential graph materialization.
 - [ ] Add tests for partial failure: child issue created, dependency edge creation fails, decomposition remains partial/blocked and no unsafe child dispatch occurs.
 
