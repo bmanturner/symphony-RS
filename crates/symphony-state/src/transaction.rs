@@ -30,7 +30,7 @@ use rusqlite::Transaction;
 use crate::edges::{
     EdgeId, NewDecompositionBlockerEdge, NewWorkItemEdge, WorkItemEdgeRecord,
     create_decomposition_blocker_edges_in, create_edge_in, get_edge_in,
-    list_open_blockers_for_subtree_in, update_edge_status_in,
+    list_incoming_open_blockers_in, list_open_blockers_for_subtree_in, update_edge_status_in,
 };
 use crate::events::{EventRecord, NewEvent};
 use crate::handoffs::{HandoffRecord, NewHandoff, create_handoff_in};
@@ -167,6 +167,18 @@ impl<'conn> StateTransaction<'conn> {
         target: WorkItemId,
     ) -> StateResult<Vec<WorkItemEdgeRecord>> {
         list_open_blockers_for_subtree_in(&self.tx, target)
+    }
+
+    /// Read open incoming `blocks` edges for one child work item inside
+    /// this transaction.
+    ///
+    /// Specialist dispatch uses this narrower query to park a child on
+    /// its direct dependency blockers without walking the whole subtree.
+    pub fn list_incoming_open_blockers(
+        &self,
+        blocked: WorkItemId,
+    ) -> StateResult<Vec<WorkItemEdgeRecord>> {
+        list_incoming_open_blockers_in(&self.tx, blocked)
     }
 
     /// Append one event to the durable log inside this transaction.

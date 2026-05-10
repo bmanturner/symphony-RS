@@ -241,6 +241,16 @@ pub trait WorkItemEdgeRepository {
         kind: EdgeType,
     ) -> StateResult<Vec<WorkItemEdgeRecord>>;
 
+    /// List open `Blocks` edges where `child_id = blocked`.
+    ///
+    /// This is the specialist-dispatch gate primitive for v3 dependency
+    /// orchestration: if this returns any rows, the child work item must
+    /// remain parked until every prerequisite blocker edge resolves.
+    fn list_incoming_open_blockers(
+        &self,
+        blocked: WorkItemId,
+    ) -> StateResult<Vec<WorkItemEdgeRecord>>;
+
     /// Return all `Blocks` edges in `open` status that gate `target` —
     /// either directly (`child_id = target`) or transitively via
     /// `ParentChild` descendants of `target`.
@@ -410,6 +420,24 @@ pub(crate) fn list_incoming_in(
     Ok(out)
 }
 
+pub(crate) fn list_incoming_open_blockers_in(
+    conn: &Connection,
+    blocked: WorkItemId,
+) -> StateResult<Vec<WorkItemEdgeRecord>> {
+    let sql = format!(
+        "SELECT {EDGE_COLUMNS} FROM work_item_edges \
+         WHERE child_id = ?1 AND edge_type = 'blocks' AND status = 'open' \
+         ORDER BY id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![blocked.0], map_edge)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn list_open_blockers_for_subtree_in(
     conn: &Connection,
     target: WorkItemId,
@@ -474,6 +502,13 @@ impl WorkItemEdgeRepository for StateDb {
         kind: EdgeType,
     ) -> StateResult<Vec<WorkItemEdgeRecord>> {
         list_incoming_in(self.conn(), destination, kind)
+    }
+
+    fn list_incoming_open_blockers(
+        &self,
+        blocked: WorkItemId,
+    ) -> StateResult<Vec<WorkItemEdgeRecord>> {
+        list_incoming_open_blockers_in(self.conn(), blocked)
     }
 
     fn list_open_blockers_for_subtree(
@@ -882,6 +917,62 @@ mod tests {
         let edges = db.list_incoming(c, EdgeType::Blocks).unwrap();
         let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![inbound.id, inbound2.id]);
+    }
+
+    #[test]
+    fn list_incoming_open_blockers_filters_to_direct_open_blocks() {
+        let mut db = open();
+        let blocker_a = seed_item(&mut db, "ENG-1");
+        let blocker_b = seed_item(&mut db, "ENG-2");
+        let blocked = seed_item(&mut db, "ENG-3");
+        let unrelated_blocked = seed_item(&mut db, "ENG-4");
+
+        let open_a = db
+            .create_edge(new_edge(
+                blocker_a,
+                blocked,
+                EdgeType::Blocks,
+                "open",
+                Some("schema before api"),
+            ))
+            .unwrap();
+        let _resolved = db
+            .create_edge(new_edge(
+                blocker_b,
+                blocked,
+                EdgeType::Blocks,
+                "resolved",
+                Some("already cleared"),
+            ))
+            .unwrap();
+        let _other_kind = db
+            .create_edge(new_edge(
+                blocker_a,
+                blocked,
+                EdgeType::ParentChild,
+                "open",
+                None,
+            ))
+            .unwrap();
+        let _other_child = db
+            .create_edge(new_edge(
+                blocker_a,
+                unrelated_blocked,
+                EdgeType::Blocks,
+                "open",
+                Some("not this child"),
+            ))
+            .unwrap();
+
+        let blockers = db.list_incoming_open_blockers(blocked).unwrap();
+        assert_eq!(
+            blockers.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+            vec![open_a.id]
+        );
+        assert_eq!(blockers[0].parent_id, blocker_a);
+        assert_eq!(blockers[0].child_id, blocked);
+        assert_eq!(blockers[0].edge_type, EdgeType::Blocks);
+        assert_eq!(blockers[0].status, "open");
     }
 
     #[test]
