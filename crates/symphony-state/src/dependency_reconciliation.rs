@@ -8,7 +8,10 @@
 
 use symphony_core::work_item::WorkItemStatusClass;
 
-use crate::edges::{EdgeId, WorkItemEdgeRecord, WorkItemEdgeRepository};
+use crate::edges::{
+    EdgeId, TrackerEdgeSyncFailure, TrackerEdgeSyncSuccess, WorkItemEdgeRecord,
+    WorkItemEdgeRepository,
+};
 use crate::repository::WorkItemRepository;
 use crate::{StateDb, StateResult};
 
@@ -23,6 +26,17 @@ pub struct DependencyReconciliationReport {
     /// Safer-blocked disagreements observed while comparing terminal
     /// local children with tracker-side structural blocker state.
     pub warnings: Vec<DependencyReconciliationWarning>,
+}
+
+/// Summary returned by a tracker sync retry pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencySyncRetryReport {
+    /// Failed dependency-edge syncs selected for retry.
+    pub attempted: usize,
+    /// Retries that succeeded and updated tracker mirror metadata.
+    pub succeeded: usize,
+    /// Retries that failed again and incremented retry metadata.
+    pub failed: usize,
 }
 
 /// Warning emitted by a reconciliation pass.
@@ -49,6 +63,29 @@ pub enum TrackerDependencyState {
 pub trait TrackerDependencyStateProvider {
     /// Return the current tracker-side state for `edge`.
     fn dependency_state(&self, edge: &WorkItemEdgeRecord) -> StateResult<TrackerDependencyState>;
+}
+
+/// Result of retrying one tracker dependency mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencySyncRetryOutcome {
+    /// Tracker mutation succeeded. Carries a tracker-native relation id
+    /// when the adapter exposes one.
+    Synced {
+        /// Tracker-native dependency/relation id, if the adapter returns one.
+        tracker_edge_id: Option<String>,
+    },
+    /// Tracker mutation failed again. The string is persisted as the
+    /// latest retry error.
+    Failed {
+        /// Operator-facing error from the failed retry attempt.
+        error: String,
+    },
+}
+
+/// Hook used to retry failed structural tracker blocker syncs.
+pub trait DependencySyncRetryer {
+    /// Retry syncing `edge` to the tracker.
+    fn retry_edge(&self, edge: &WorkItemEdgeRecord) -> StateResult<DependencySyncRetryOutcome>;
 }
 
 #[derive(Debug, Default)]
@@ -128,6 +165,74 @@ pub fn reconcile_terminal_decomposition_blockers_with_tracker(
         released_children,
         warnings,
     })
+}
+
+/// Retry failed tracker-edge syncs for open decomposition blockers.
+///
+/// The retryer owns tracker-specific mutation details. This helper owns
+/// the durable retry bookkeeping: success records `synced`, failure
+/// records `failed`, and both paths increment the edge attempt counter.
+pub fn retry_failed_dependency_edge_syncs(
+    db: &mut StateDb,
+    now: &str,
+    retryer: &dyn DependencySyncRetryer,
+) -> StateResult<DependencySyncRetryReport> {
+    let failed_edges = failed_dependency_sync_edges(db)?;
+    let mut report = DependencySyncRetryReport {
+        attempted: failed_edges.len(),
+        succeeded: 0,
+        failed: 0,
+    };
+
+    for edge in failed_edges {
+        match retryer.retry_edge(&edge)? {
+            DependencySyncRetryOutcome::Synced { tracker_edge_id } => {
+                db.record_tracker_edge_sync_success(TrackerEdgeSyncSuccess {
+                    edge_id: edge.id,
+                    tracker_edge_id: tracker_edge_id.as_deref(),
+                    attempted_at: now,
+                })?;
+                report.succeeded += 1;
+            }
+            DependencySyncRetryOutcome::Failed { error } => {
+                db.record_tracker_edge_sync_failure(TrackerEdgeSyncFailure {
+                    edge_id: edge.id,
+                    error: &error,
+                    attempted_at: now,
+                })?;
+                report.failed += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn failed_dependency_sync_edges(db: &StateDb) -> StateResult<Vec<WorkItemEdgeRecord>> {
+    let ids = {
+        let mut stmt = db.conn().prepare(
+            "SELECT id FROM work_item_edges
+              WHERE edge_type = 'blocks'
+                AND status = 'open'
+                AND source = 'decomposition'
+                AND tracker_sync_status = 'failed'
+              ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(EdgeId(row?));
+        }
+        ids
+    };
+
+    let mut edges = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(edge) = db.get_edge(id)? {
+            edges.push(edge);
+        }
+    }
+    Ok(edges)
 }
 
 #[cfg(test)]
@@ -300,5 +405,104 @@ mod tests {
             db.get_work_item(b).unwrap().unwrap().status_class,
             "blocked"
         );
+    }
+
+    #[derive(Debug)]
+    struct FixedRetryer(DependencySyncRetryOutcome);
+
+    impl DependencySyncRetryer for FixedRetryer {
+        fn retry_edge(
+            &self,
+            _edge: &WorkItemEdgeRecord,
+        ) -> StateResult<DependencySyncRetryOutcome> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn failed_dependency_sync_retry_success_records_eventual_success() {
+        let mut db = open();
+        let a = seed_item(&mut db, "A", "ready");
+        let b = seed_item(&mut db, "B", "blocked");
+        let edge = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: a,
+                blocked_id: b,
+                reason: "B depends on A",
+                now: "2026-05-10T00:00:00Z",
+            }])
+            .unwrap()
+            .remove(0);
+        db.record_tracker_edge_sync_failure(TrackerEdgeSyncFailure {
+            edge_id: edge.id,
+            error: "Linear timeout",
+            attempted_at: "2026-05-10T00:01:00Z",
+        })
+        .unwrap();
+
+        let report = retry_failed_dependency_edge_syncs(
+            &mut db,
+            "2026-05-10T00:02:00Z",
+            &FixedRetryer(DependencySyncRetryOutcome::Synced {
+                tracker_edge_id: Some("rel-2".into()),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report,
+            DependencySyncRetryReport {
+                attempted: 1,
+                succeeded: 1,
+                failed: 0,
+            }
+        );
+        let fetched = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(fetched.tracker_edge_id.as_deref(), Some("rel-2"));
+        assert_eq!(fetched.tracker_sync_status.as_deref(), Some("synced"));
+        assert_eq!(fetched.tracker_sync_last_error, None);
+        assert_eq!(fetched.tracker_sync_attempts, 2);
+    }
+
+    #[test]
+    fn failed_dependency_sync_retry_failure_increments_counter() {
+        let mut db = open();
+        let a = seed_item(&mut db, "A", "ready");
+        let b = seed_item(&mut db, "B", "blocked");
+        let edge = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: a,
+                blocked_id: b,
+                reason: "B depends on A",
+                now: "2026-05-10T00:00:00Z",
+            }])
+            .unwrap()
+            .remove(0);
+        db.record_tracker_edge_sync_failure(TrackerEdgeSyncFailure {
+            edge_id: edge.id,
+            error: "first failure",
+            attempted_at: "2026-05-10T00:01:00Z",
+        })
+        .unwrap();
+
+        let report = retry_failed_dependency_edge_syncs(
+            &mut db,
+            "2026-05-10T00:02:00Z",
+            &FixedRetryer(DependencySyncRetryOutcome::Failed {
+                error: "still down".into(),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 1);
+        let fetched = db.get_edge(edge.id).unwrap().unwrap();
+        assert_eq!(fetched.tracker_sync_status.as_deref(), Some("failed"));
+        assert_eq!(
+            fetched.tracker_sync_last_error.as_deref(),
+            Some("still down")
+        );
+        assert_eq!(fetched.tracker_sync_attempts, 2);
     }
 }
