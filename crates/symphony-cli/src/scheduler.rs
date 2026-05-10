@@ -1174,6 +1174,8 @@ mod tests {
             can_file_blockers: None,
             can_file_followups: None,
             required_for_done: None,
+            instructions: cfg::RoleInstructionConfig::default(),
+            assignment: cfg::RoleAssignmentMetadata::default(),
         }
     }
 

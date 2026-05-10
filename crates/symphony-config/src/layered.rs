@@ -38,7 +38,7 @@ use gray_matter::Matter;
 use gray_matter::engine::YAML;
 
 use crate::config::WorkflowConfig;
-use crate::loader::{LoadedWorkflow, WorkflowLoadError};
+use crate::loader::{LoadedWorkflow, WorkflowLoadError, load_instruction_packs};
 
 /// Errors that can surface from a layered load.
 ///
@@ -141,11 +141,13 @@ impl LayeredLoader {
             .merge(Yaml::string(&front_matter));
 
         let config: WorkflowConfig = figment.extract().map_err(Box::new)?;
+        let instruction_packs = load_instruction_packs(&config, path)?;
 
         Ok(LoadedWorkflow {
             source_path: path.to_path_buf(),
             config,
             prompt_template,
+            instruction_packs,
         })
     }
 }

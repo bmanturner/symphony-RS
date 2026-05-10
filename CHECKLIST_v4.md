@@ -24,12 +24,12 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 2 — Instruction File Loading
 
-- [ ] Add an instruction-pack loader that reads role `role_prompt` and `soul` files at workflow load time or dispatch preflight.
-- [ ] Cache instruction file contents and invalidate on workflow reload.
-- [ ] Preserve source provenance: role name, instruction kind, path, hash/mtime, and load timestamp.
-- [ ] Redact secrets from instruction content before logging or event emission.
-- [ ] Fail loud when a required configured instruction file cannot be loaded.
-- [ ] Add tests for successful load, cache invalidation, missing file failure, path escape rejection, and log redaction.
+- [x] Add an instruction-pack loader that reads role `role_prompt` and `soul` files at workflow load time or dispatch preflight.
+- [x] Cache instruction file contents and invalidate on workflow reload.
+- [x] Preserve source provenance: role name, instruction kind, path, hash/mtime, and load timestamp.
+- [x] Redact secrets from instruction content before logging or event emission.
+- [x] Fail loud when a required configured instruction file cannot be loaded.
+- [x] Add tests for successful load, cache invalidation, missing file failure, path escape rejection, and log redaction.
 
 ## Phase 3 — Role Catalog Builder
 

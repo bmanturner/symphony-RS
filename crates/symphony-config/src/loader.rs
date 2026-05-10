@@ -17,14 +17,92 @@
 //! Layered configuration (defaults → env → front matter) lives in a
 //! sibling module; this loader only owns the on-disk format.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gray_matter::Matter;
 use gray_matter::engine::YAML;
 
 use crate::config::WorkflowConfig;
+
+/// Loaded file-backed instruction packs, keyed by role name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstructionPackBundle {
+    /// Loaded instructions for each role that configured at least one
+    /// instruction file.
+    pub roles: BTreeMap<String, LoadedRoleInstructionPack>,
+}
+
+/// Loaded instruction files for one role.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoadedRoleInstructionPack {
+    /// Long-form operating instructions for the role.
+    pub role_prompt: Option<LoadedRoleInstruction>,
+
+    /// Concise identity/voice doctrine for the role.
+    pub soul: Option<LoadedRoleInstruction>,
+}
+
+/// One loaded role instruction file plus its source provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedRoleInstruction {
+    /// Provenance captured at load time.
+    pub source: InstructionSource,
+
+    /// Raw instruction content as read from disk.
+    pub content: String,
+}
+
+impl LoadedRoleInstruction {
+    /// Content safe to include in logs, traces, or debug event payloads.
+    pub fn redacted_content(&self) -> String {
+        redact_instruction_content(&self.content)
+    }
+}
+
+/// Stable instruction source metadata for prompt provenance and debugging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionSource {
+    /// Role whose configuration requested this file.
+    pub role: String,
+
+    /// Which instruction slot this file populated.
+    pub kind: InstructionKind,
+
+    /// Resolved path on disk.
+    pub path: PathBuf,
+
+    /// Stable hash of the loaded content.
+    pub content_hash: String,
+
+    /// File modification timestamp in Unix milliseconds when available.
+    pub modified_unix_ms: Option<u128>,
+
+    /// Load timestamp in Unix milliseconds.
+    pub loaded_at_unix_ms: u128,
+}
+
+/// Role instruction file kind.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InstructionKind {
+    /// `roles.<role>.instructions.role_prompt`
+    RolePrompt,
+
+    /// `roles.<role>.instructions.soul`
+    Soul,
+}
+
+impl InstructionKind {
+    fn as_config_key(self) -> &'static str {
+        match self {
+            Self::RolePrompt => "role_prompt",
+            Self::Soul => "soul",
+        }
+    }
+}
 
 /// Parsed `WORKFLOW.md` payload — the typed front matter plus the
 /// trimmed Markdown prompt body.
@@ -46,6 +124,9 @@ pub struct LoadedWorkflow {
     /// runtime will surface a separate "empty prompt" error at dispatch
     /// preflight, not here).
     pub prompt_template: String,
+
+    /// File-backed role instructions loaded from the workflow root.
+    pub instruction_packs: InstructionPackBundle,
 }
 
 /// Errors raised while reading and parsing `WORKFLOW.md`.
@@ -149,6 +230,7 @@ impl WorkflowLoader {
             parse_front_matter(&parsed.matter, path)?
         };
         validate_role_instruction_paths(&config, path)?;
+        let instruction_packs = load_instruction_packs(&config, path)?;
 
         // SPEC §5.2: prompt body is trimmed before use. We trim the
         // *content* (post-front-matter) string from gray_matter, which
@@ -159,15 +241,99 @@ impl WorkflowLoader {
             source_path: path.to_path_buf(),
             config,
             prompt_template,
+            instruction_packs,
         })
     }
+}
+
+pub(crate) fn load_instruction_packs(
+    config: &WorkflowConfig,
+    workflow_path: &Path,
+) -> Result<InstructionPackBundle, WorkflowLoadError> {
+    let mut roles = BTreeMap::new();
+
+    for (role_name, role) in &config.roles {
+        let role_prompt = match role.instructions.role_prompt.as_ref() {
+            Some(path) => Some(load_role_instruction(
+                workflow_path,
+                role_name,
+                InstructionKind::RolePrompt,
+                path,
+            )?),
+            None => None,
+        };
+        let soul = match role.instructions.soul.as_ref() {
+            Some(path) => Some(load_role_instruction(
+                workflow_path,
+                role_name,
+                InstructionKind::Soul,
+                path,
+            )?),
+            None => None,
+        };
+
+        if role_prompt.is_some() || soul.is_some() {
+            roles.insert(
+                role_name.clone(),
+                LoadedRoleInstructionPack { role_prompt, soul },
+            );
+        }
+    }
+
+    Ok(InstructionPackBundle { roles })
+}
+
+fn load_role_instruction(
+    workflow_path: &Path,
+    role: &str,
+    kind: InstructionKind,
+    configured_path: &Path,
+) -> Result<LoadedRoleInstruction, WorkflowLoadError> {
+    let resolved = resolve_instruction_path(workflow_path, role, kind, configured_path)?;
+    let metadata =
+        fs::metadata(&resolved).map_err(|source| WorkflowLoadError::InstructionPath {
+            workflow_path: workflow_path.to_path_buf(),
+            role: role.to_string(),
+            kind: kind.as_config_key(),
+            path: configured_path.to_path_buf(),
+            reason: format!("file could not be read: {source}"),
+        })?;
+    if !metadata.is_file() {
+        return Err(WorkflowLoadError::InstructionPath {
+            workflow_path: workflow_path.to_path_buf(),
+            role: role.to_string(),
+            kind: kind.as_config_key(),
+            path: configured_path.to_path_buf(),
+            reason: "path exists but is not a file".to_string(),
+        });
+    }
+
+    let content =
+        fs::read_to_string(&resolved).map_err(|source| WorkflowLoadError::InstructionPath {
+            workflow_path: workflow_path.to_path_buf(),
+            role: role.to_string(),
+            kind: kind.as_config_key(),
+            path: configured_path.to_path_buf(),
+            reason: format!("file could not be read: {source}"),
+        })?;
+
+    Ok(LoadedRoleInstruction {
+        source: InstructionSource {
+            role: role.to_string(),
+            kind,
+            path: resolved,
+            content_hash: stable_content_hash(&content),
+            modified_unix_ms: metadata.modified().ok().and_then(unix_ms),
+            loaded_at_unix_ms: unix_ms(SystemTime::now()).unwrap_or_default(),
+        },
+        content,
+    })
 }
 
 fn validate_role_instruction_paths(
     config: &WorkflowConfig,
     workflow_path: &Path,
 ) -> Result<(), WorkflowLoadError> {
-    let root = workflow_path.parent().unwrap_or_else(|| Path::new("."));
     for (role_name, role) in &config.roles {
         for (kind, maybe_path) in [
             ("role_prompt", role.instructions.role_prompt.as_ref()),
@@ -176,23 +342,16 @@ fn validate_role_instruction_paths(
             let Some(path) = maybe_path else {
                 continue;
             };
-            if path.is_absolute()
-                || path.components().any(|c| {
-                    matches!(
-                        c,
-                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                    )
-                })
-            {
-                return Err(WorkflowLoadError::InstructionPath {
-                    workflow_path: workflow_path.to_path_buf(),
-                    role: role_name.clone(),
-                    kind,
-                    path: path.clone(),
-                    reason: "path must stay inside the workflow root".to_string(),
-                });
-            }
-            let resolved = root.join(path);
+            let resolved = resolve_instruction_path(
+                workflow_path,
+                role_name,
+                if kind == "role_prompt" {
+                    InstructionKind::RolePrompt
+                } else {
+                    InstructionKind::Soul
+                },
+                path,
+            )?;
             match fs::metadata(&resolved) {
                 Ok(meta) if meta.is_file() => {}
                 Ok(_) => {
@@ -217,6 +376,73 @@ fn validate_role_instruction_paths(
         }
     }
     Ok(())
+}
+
+fn resolve_instruction_path(
+    workflow_path: &Path,
+    role: &str,
+    kind: InstructionKind,
+    path: &Path,
+) -> Result<PathBuf, WorkflowLoadError> {
+    if path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(WorkflowLoadError::InstructionPath {
+            workflow_path: workflow_path.to_path_buf(),
+            role: role.to_string(),
+            kind: kind.as_config_key(),
+            path: path.to_path_buf(),
+            reason: "path must stay inside the workflow root".to_string(),
+        });
+    }
+
+    let root = workflow_path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(root.join(path))
+}
+
+fn stable_content_hash(content: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn unix_ms(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
+}
+
+/// Redact likely secret values before instruction content reaches logs or events.
+pub fn redact_instruction_content(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            let is_secret = ["api_key", "apikey", "token", "secret", "password"]
+                .iter()
+                .any(|needle| lower.contains(needle));
+            if !is_secret {
+                return line.to_string();
+            }
+
+            if let Some((key, _value)) = line.split_once(':') {
+                format!("{key}: [REDACTED]")
+            } else if let Some((key, _value)) = line.split_once('=') {
+                format!("{key}=[REDACTED]")
+            } else {
+                "[REDACTED]".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Re-parse the raw YAML front-matter string into our typed config.
@@ -476,5 +702,115 @@ body
             backend.instructions.soul.as_deref(),
             Some(Path::new(".symphony/roles/backend/SOUL.md"))
         );
+        let pack = loaded.instruction_packs.roles.get("backend").unwrap();
+        let role_prompt = pack.role_prompt.as_ref().unwrap();
+        assert_eq!(role_prompt.content, "backend instructions");
+        assert_eq!(role_prompt.source.role, "backend");
+        assert_eq!(role_prompt.source.kind, InstructionKind::RolePrompt);
+        assert!(
+            role_prompt
+                .source
+                .path
+                .ends_with(".symphony/roles/backend/AGENTS.md")
+        );
+        assert!(!role_prompt.source.content_hash.is_empty());
+        assert!(role_prompt.source.modified_unix_ms.is_some());
+        assert!(role_prompt.source.loaded_at_unix_ms > 0);
+
+        let soul = pack.soul.as_ref().unwrap();
+        assert_eq!(soul.content, "backend soul");
+        assert_eq!(soul.source.kind, InstructionKind::Soul);
+    }
+
+    #[test]
+    fn workflow_reload_reloads_instruction_pack_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let role_dir = dir.path().join(".symphony/roles/backend");
+        fs::create_dir_all(&role_dir).unwrap();
+        let agents_path = role_dir.join("AGENTS.md");
+        fs::write(&agents_path, "backend instructions v1").unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &path,
+            r#"---
+roles:
+  backend:
+    kind: specialist
+    instructions:
+      role_prompt: .symphony/roles/backend/AGENTS.md
+---
+body
+"#,
+        )
+        .unwrap();
+
+        let first = WorkflowLoader::from_path(&path).unwrap();
+        fs::write(&agents_path, "backend instructions v2").unwrap();
+        let second = WorkflowLoader::from_path(&path).unwrap();
+
+        let first_instruction = first
+            .instruction_packs
+            .roles
+            .get("backend")
+            .unwrap()
+            .role_prompt
+            .as_ref()
+            .unwrap();
+        let second_instruction = second
+            .instruction_packs
+            .roles
+            .get("backend")
+            .unwrap()
+            .role_prompt
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_instruction.content, "backend instructions v1");
+        assert_eq!(second_instruction.content, "backend instructions v2");
+        assert_ne!(
+            first_instruction.source.content_hash,
+            second_instruction.source.content_hash
+        );
+    }
+
+    #[test]
+    fn instruction_pack_log_content_redacts_likely_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let role_dir = dir.path().join(".symphony/roles/backend");
+        fs::create_dir_all(&role_dir).unwrap();
+        fs::write(
+            role_dir.join("AGENTS.md"),
+            "Use the deploy flow.\napi_key: super-secret\nTOKEN=also-secret\nKeep context.",
+        )
+        .unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        fs::write(
+            &path,
+            r#"---
+roles:
+  backend:
+    kind: specialist
+    instructions:
+      role_prompt: .symphony/roles/backend/AGENTS.md
+---
+body
+"#,
+        )
+        .unwrap();
+
+        let loaded = WorkflowLoader::from_path(&path).unwrap();
+        let redacted = loaded
+            .instruction_packs
+            .roles
+            .get("backend")
+            .unwrap()
+            .role_prompt
+            .as_ref()
+            .unwrap()
+            .redacted_content();
+        assert!(redacted.contains("Use the deploy flow."));
+        assert!(redacted.contains("api_key: [REDACTED]"));
+        assert!(redacted.contains("TOKEN=[REDACTED]"));
+        assert!(!redacted.contains("super-secret"));
+        assert!(!redacted.contains("also-secret"));
     }
 }
