@@ -18,6 +18,7 @@ pub mod adapter_scope;
 pub mod config;
 pub mod layered;
 pub mod loader;
+pub mod role_catalog;
 
 pub use adapter_scope::{
     SUPPORTED_PRODUCT_AGENT_BACKENDS, SUPPORTED_PRODUCT_TRACKERS, SUPPORTED_SOURCE_CONTROL_ADAPTER,
@@ -43,4 +44,8 @@ pub use loader::{
     InstructionKind, InstructionPackBundle, InstructionSource, LoadedRoleInstruction,
     LoadedRoleInstructionPack, LoadedWorkflow, WorkflowLoadError, WorkflowLoader,
     redact_instruction_content,
+};
+pub use role_catalog::{
+    InstructionPackSummary, RoleCatalog, RoleCatalogBuilder, RoleCatalogEntry,
+    RoleCatalogSourceSummary, RoutingRuleSummary,
 };

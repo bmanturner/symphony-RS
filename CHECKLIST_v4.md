@@ -33,15 +33,15 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 3 — Role Catalog Builder
 
-- [ ] Implement a role catalog builder that reads `WorkflowConfig.roles`, `WorkflowConfig.agents`, global `routing.rules`, and role-local assignment metadata.
-- [ ] Include in each catalog entry: role name, kind, description, agent profile/backend, concurrency, tools/toolsets, owns, does-not-own, requires, handoff expectations, and routing hints.
-- [ ] Include `specialist` roles by default.
-- [ ] Include `reviewer` roles only when review can be requested as child/follow-up work.
-- [ ] Include `operator` roles only when runtime/deployment/data work can be child-scoped.
-- [ ] Exclude `qa_gate` from normal implementation child assignment unless workflow explicitly allows manual QA task issues.
-- [ ] Exclude other `integration_owner` roles from normal child assignment unless workflow explicitly allows nested/secondary integration ownership.
-- [ ] Add deterministic rendering for the platform-lead catalog prompt section.
-- [ ] Add tests proving terse-description fallback emits warnings.
+- [x] Implement a role catalog builder that reads `WorkflowConfig.roles`, `WorkflowConfig.agents`, global `routing.rules`, and role-local assignment metadata.
+- [x] Include in each catalog entry: role name, kind, description, agent profile/backend, concurrency, tools/toolsets, owns, does-not-own, requires, handoff expectations, and routing hints.
+- [x] Include `specialist` roles by default.
+- [x] Include `reviewer` roles only when review can be requested as child/follow-up work.
+- [x] Include `operator` roles only when runtime/deployment/data work can be child-scoped.
+- [x] Exclude `qa_gate` from normal implementation child assignment unless workflow explicitly allows manual QA task issues.
+- [x] Exclude other `integration_owner` roles from normal child assignment unless workflow explicitly allows nested/secondary integration ownership.
+- [x] Add deterministic rendering for the platform-lead catalog prompt section.
+- [x] Add tests proving terse-description fallback emits warnings.
 
 ## Phase 4 — Production Prompt Assembly
 
