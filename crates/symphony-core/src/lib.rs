@@ -56,6 +56,7 @@ pub mod retry;
 pub mod role;
 pub mod routing;
 pub mod run_lease;
+pub mod run_status;
 pub mod scheduler_v2;
 pub mod scope_contention_broadcaster;
 pub mod scope_contention_log;
@@ -208,6 +209,7 @@ pub use routing::{
 pub use run_lease::{
     InMemoryRunLeaseStore, LeaseAcquireOutcome, RunLeaseError, RunLeaseGuard, RunLeaseStore,
 };
+pub use run_status::RunStatus;
 pub use scheduler_v2::{SchedulerTickReport, SchedulerV2, SchedulerV2Config};
 pub use scope_contention_broadcaster::{
     ScopeContentionEventBroadcaster, ScopeContentionEventSink, ScopeContentionSinkError,
