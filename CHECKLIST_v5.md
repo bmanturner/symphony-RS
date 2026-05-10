@@ -23,13 +23,13 @@ mock agent.
 
 ## Phase 1 — MCP Crate Scaffolding
 
-- [ ] Evaluate Rust MCP server crates (transport on unix sockets, dynamic per-session tool registration, structured tool-result errors). Pick one. Record the choice in an ADR addendum to `ARCHITECTURE_v5.md`.
-- [ ] Create the `crates/symphony-mcp` crate as a workspace member with `serde`, `serde_json`, `async-trait`, `thiserror`, the chosen MCP crate, and `symphony-core` as dependencies.
-- [ ] Define the `ToolHandler`, `ToolResult`, and `ToolError` traits/types in `symphony-mcp::handler`.
-- [ ] Define the `Server` type with `spawn(SpawnParams)` (returns `McpHandle` RAII guard) and `tools_for(role)` (returns the tool registry for a role profile).
-- [ ] Implement per-run unix-socket bind/serve/shutdown semantics with stale-socket cleanup on bind retry.
-- [ ] Add a `ToolRegistry` that maps tool names to handlers, supports per-session enable/disable, and rejects duplicate registrations.
-- [ ] Add unit tests for socket lifecycle, registry duplicate rejection, and a no-op `Echo` tool round-trip.
+- [x] Evaluate Rust MCP server crates (transport on unix sockets, dynamic per-session tool registration, structured tool-result errors). Pick one. Record the choice in an ADR addendum to `ARCHITECTURE_v5.md`.
+- [x] Create the `crates/symphony-mcp` crate as a workspace member with `serde`, `serde_json`, `async-trait`, `thiserror`, the chosen MCP crate, and `symphony-core` as dependencies.
+- [x] Define the `ToolHandler`, `ToolResult`, and `ToolError` traits/types in `symphony-mcp::handler`.
+- [x] Define the `Server` type with `spawn(SpawnParams)` (returns `McpHandle` RAII guard) and `tools_for(role)` (returns the tool registry for a role profile).
+- [x] Implement per-run unix-socket bind/serve/shutdown semantics with stale-socket cleanup on bind retry.
+- [x] Add a `ToolRegistry` that maps tool names to handlers, supports per-session enable/disable, and rejects duplicate registrations.
+- [x] Add unit tests for socket lifecycle, registry duplicate rejection, and a no-op `Echo` tool round-trip.
 
 ## Phase 2 — Symphony-Agent Integration
 
