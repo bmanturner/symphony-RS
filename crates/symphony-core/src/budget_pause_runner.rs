@@ -51,6 +51,8 @@ use crate::blocker::RunRef;
 use crate::budget_pause_tick::{
     BudgetPauseDispatchQueue, BudgetPauseDispatchRequest, BudgetPauseId,
 };
+use crate::cancellation::{CancelRequest, CancellationQueue};
+use crate::cancellation_observer::{CancellationDecision, observe_for_run};
 use crate::concurrency_gate::{
     ConcurrencyGate, DispatchTriple, RunnerScopes, ScopeContended, ScopeKind, ScopePermitSet,
 };
@@ -60,6 +62,7 @@ use crate::run_lease::{
     pulse_observed,
 };
 use crate::scope_contention_broadcaster::{ScopeContentionEventBroadcaster, ScopeFields};
+use crate::specialist_runner::RunCancellationStatusSink;
 use crate::work_item::WorkItemId;
 
 /// Final outcome of one budget-pause dispatch.
@@ -153,6 +156,12 @@ pub struct BudgetPauseRunReport {
     /// because a scope was at cap on this pass. Emitted in walk order so
     /// downstream observers can correlate against the parked dispatches.
     pub scope_contentions: Vec<ScopeContendedObservation>,
+    /// Requests aborted by the pre-lease cancellation observation
+    /// (SPEC v2 §4.5 / Phase 11.5). Length matches `cancellations.len()`.
+    pub cancelled_before_lease: usize,
+    /// Typed observations for every dispatch that was aborted by the
+    /// pre-lease cancellation check this pass, in walk order.
+    pub cancellations: Vec<BudgetPauseCancellationObserved>,
 }
 
 impl BudgetPauseRunReport {
@@ -165,7 +174,30 @@ impl BudgetPauseRunReport {
             && self.lease_backend_error == 0
             && self.deferred_scope_contention == 0
             && self.scope_contentions.is_empty()
+            && self.cancelled_before_lease == 0
+            && self.cancellations.is_empty()
     }
+}
+
+/// Per-request observation surfaced when the pre-lease cancellation
+/// check (SPEC v2 §4.5 / Phase 11.5) aborted a budget-pause dispatch.
+///
+/// Budget pause has no parent context, so the runner observes only the
+/// run keyspace via [`observe_for_run`] (per
+/// [`crate::cancellation_observer`] policy). Requests without a
+/// `run_id` therefore bypass the observation entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetPauseCancellationObserved {
+    /// Pause id the parked request carries.
+    pub pause_id: BudgetPauseId,
+    /// Work item the pause blocks.
+    pub work_item_id: WorkItemId,
+    /// Durable run row that was reserved for the dispatch and now
+    /// matched a pending cancel.
+    pub run_id: RunRef,
+    /// Reason / requester / timestamp clone snapshotted from the queue
+    /// at observation time.
+    pub request: CancelRequest,
 }
 
 /// Per-pass typed observation surfaced when a budget-pause dispatch
@@ -279,6 +311,17 @@ pub struct BudgetPauseRunner {
     /// rather than `run_id`. When `None`, observations remain on the
     /// run report only.
     scope_contention_broadcaster: Option<Arc<ScopeContentionEventBroadcaster>>,
+    /// Optional cooperative-cancellation wiring (SPEC v2 §4.5 / Phase
+    /// 11.5). Budget pause has no parent context, so the runner only
+    /// observes the run keyspace via [`observe_for_run`].
+    cancellation: Option<CancellationWiring>,
+}
+
+/// Bundle holding the shared in-memory [`CancellationQueue`] and the
+/// typed-status sink the runner flows an observed cancel through.
+struct CancellationWiring {
+    queue: Arc<Mutex<CancellationQueue>>,
+    sink: Arc<dyn RunCancellationStatusSink>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -310,7 +353,26 @@ impl BudgetPauseRunner {
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
             concurrency_gate: None,
             scope_contention_broadcaster: None,
+            cancellation: None,
         }
+    }
+
+    /// Wire cooperative cancellation observation into the runner
+    /// (SPEC v2 §4.5 / Phase 11.5).
+    ///
+    /// Budget pause has no parent context, so the runner observes only
+    /// the run keyspace via [`observe_for_run`]. Requests without a
+    /// `run_id` reservation skip observation entirely. On an `Abort`
+    /// outcome the runner releases the just-acquired scope/capacity
+    /// permits, marks the run `Cancelled` via the typed-status sink,
+    /// and drains the run-keyed queue entry.
+    pub fn with_cancellation(
+        mut self,
+        queue: Arc<Mutex<CancellationQueue>>,
+        sink: Arc<dyn RunCancellationStatusSink>,
+    ) -> Self {
+        self.cancellation = Some(CancellationWiring { queue, sink });
+        self
     }
 
     /// Wire a [`ScopeContentionEventBroadcaster`] into the runner.
@@ -456,6 +518,49 @@ impl BudgetPauseRunner {
                     continue;
                 }
             };
+
+            // Cooperative cancellation observation (SPEC v2 §4.5).
+            // Budget pause has no parent context — only the run keyspace
+            // is consulted, and requests without a `run_id` reservation
+            // skip observation entirely.
+            if let (Some(wiring), Some(run_id)) = (self.cancellation.as_ref(), req.run_id) {
+                let observed: Option<CancelRequest> = {
+                    let q = wiring.queue.lock().await;
+                    match observe_for_run(&q, run_id) {
+                        CancellationDecision::Abort(req) => Some(req),
+                        CancellationDecision::Proceed => None,
+                    }
+                };
+                if let Some(cancel_req) = observed {
+                    drop(scope_permits);
+                    drop(permit);
+                    if let Err(err) = wiring.sink.mark_cancelled(run_id, &cancel_req) {
+                        warn!(
+                            pause_id = req.pause_id.get(),
+                            run_id = %run_id,
+                            error = %err,
+                            "budget pause runner: cancellation status sink failed; relying on operator re-issue",
+                        );
+                    }
+                    {
+                        let mut q = wiring.queue.lock().await;
+                        q.drain_for_run(run_id);
+                    }
+                    debug!(
+                        pause_id = req.pause_id.get(),
+                        reason = %cancel_req.reason,
+                        "budget pause runner: pre-lease cancel observed; aborted dispatch",
+                    );
+                    report.cancelled_before_lease += 1;
+                    report.cancellations.push(BudgetPauseCancellationObserved {
+                        pause_id: req.pause_id,
+                        work_item_id: req.work_item_id,
+                        run_id,
+                        request: cancel_req,
+                    });
+                    continue;
+                }
+            }
 
             // Durable-lease acquisition. Held through the spawned
             // dispatch and released on terminal completion. Permit is
@@ -1991,5 +2096,130 @@ mod tests {
         let _ = runner.run_pending(CancellationToken::new()).await;
         dispatcher.release_gate();
         let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    // -- Pre-lease cancellation observation ------------------------------
+
+    struct RecordingCancellationSink {
+        calls: StdMutex<Vec<(RunRef, CancelRequest)>>,
+    }
+
+    impl RecordingCancellationSink {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+        fn snapshot(&self) -> Vec<(RunRef, CancelRequest)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RunCancellationStatusSink for RecordingCancellationSink {
+        fn mark_cancelled(
+            &self,
+            run_id: RunRef,
+            request: &CancelRequest,
+        ) -> Result<bool, crate::specialist_runner::RunCancellationStatusError> {
+            self.calls.lock().unwrap().push((run_id, request.clone()));
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_observed_for_run_aborts_budget_pause_dispatch() {
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+        let cancel_queue = Arc::new(Mutex::new(CancellationQueue::new()));
+        let sink = Arc::new(RecordingCancellationSink::new());
+
+        cancel_queue.lock().await.enqueue(CancelRequest::for_run(
+            RunRef::new(42),
+            "operator cancel",
+            "tester",
+            "2026-05-09T00:00:00Z",
+        ));
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_cancellation(cancel_queue.clone(), sink.clone());
+
+        queue.enqueue(req_with_run(1, 7, "tokens", 42));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 0);
+        assert_eq!(report.cancelled_before_lease, 1);
+        assert_eq!(report.cancellations[0].pause_id, BudgetPauseId::new(1));
+        assert_eq!(report.cancellations[0].work_item_id, WorkItemId::new(7));
+        assert_eq!(report.cancellations[0].run_id, RunRef::new(42));
+        assert_eq!(report.cancellations[0].request.reason, "operator cancel");
+
+        assert!(dispatcher.calls().is_empty());
+        let calls = sink.snapshot();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, RunRef::new(42));
+
+        let q = cancel_queue.lock().await;
+        assert!(q.pending_for_run(RunRef::new(42)).is_none());
+    }
+
+    #[tokio::test]
+    async fn budget_pause_ignores_work_item_keyspace_per_observe_for_run_contract() {
+        // Budget pause uses observe_for_run only — a work-item keyed
+        // cancel must not abort the dispatch.
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+        let cancel_queue = Arc::new(Mutex::new(CancellationQueue::new()));
+        let sink = Arc::new(RecordingCancellationSink::new());
+
+        cancel_queue
+            .lock()
+            .await
+            .enqueue(CancelRequest::for_work_item(
+                WorkItemId::new(7),
+                "work item cancel",
+                "tester",
+                "2026-05-09T00:00:00Z",
+            ));
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_cancellation(cancel_queue.clone(), sink.clone());
+
+        queue.enqueue(req_with_run(1, 7, "tokens", 99));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1, "report = {report:?}");
+        assert_eq!(report.cancelled_before_lease, 0);
+
+        let _ = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(dispatcher.calls(), vec![BudgetPauseId::new(1)]);
+        assert!(sink.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn budget_pause_request_without_run_id_skips_cancellation_observation() {
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(BudgetPauseDispatchReason::Resumed));
+        let cancel_queue = Arc::new(Mutex::new(CancellationQueue::new()));
+        let sink = Arc::new(RecordingCancellationSink::new());
+
+        // Even an exact-numeric run keyspace match (id=1) must not abort
+        // a request that has no run_id reservation.
+        cancel_queue.lock().await.enqueue(CancelRequest::for_run(
+            RunRef::new(1),
+            "irrelevant",
+            "tester",
+            "2026-05-09T00:00:00Z",
+        ));
+
+        let runner = BudgetPauseRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_cancellation(cancel_queue.clone(), sink.clone());
+
+        queue.enqueue(req(1, 7, "tokens"));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        assert_eq!(report.cancelled_before_lease, 0);
+        let _ = wait_for_outcomes(&runner, 1).await;
+        assert!(sink.snapshot().is_empty());
     }
 }

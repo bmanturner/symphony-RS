@@ -41,6 +41,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::blocker::RunRef;
+use crate::cancellation::{CancelRequest, CancellationQueue};
+use crate::cancellation_observer::{CancellationDecision, observe_for_run_or_parent};
 use crate::concurrency_gate::{
     ConcurrencyGate, DispatchTriple, RunnerScopes, ScopeContended, ScopeKind, ScopePermitSet,
 };
@@ -54,6 +56,8 @@ use crate::run_lease::{
     pulse_observed,
 };
 use crate::scope_contention_broadcaster::{ScopeContentionEventBroadcaster, ScopeFields};
+use crate::specialist_runner::RunCancellationStatusSink;
+use crate::work_item::WorkItemId;
 
 /// Final outcome of one follow-up approval dispatch.
 ///
@@ -149,6 +153,12 @@ pub struct FollowupApprovalRunReport {
     /// because a scope was at cap on this pass. Emitted in walk order so
     /// downstream observers can correlate against the parked dispatches.
     pub scope_contentions: Vec<ScopeContendedObservation>,
+    /// Requests aborted by the pre-lease cancellation observation
+    /// (SPEC v2 §4.5 / Phase 11.5). Length matches `cancellations.len()`.
+    pub cancelled_before_lease: usize,
+    /// Typed observations for every dispatch that was aborted by the
+    /// pre-lease cancellation check this pass, in walk order.
+    pub cancellations: Vec<FollowupApprovalCancellationObserved>,
 }
 
 impl FollowupApprovalRunReport {
@@ -161,7 +171,33 @@ impl FollowupApprovalRunReport {
             && self.lease_backend_error == 0
             && self.deferred_scope_contention == 0
             && self.scope_contentions.is_empty()
+            && self.cancelled_before_lease == 0
+            && self.cancellations.is_empty()
     }
+}
+
+/// Per-request observation surfaced when the pre-lease cancellation
+/// check (SPEC v2 §4.5 / Phase 11.5) aborted a follow-up approval
+/// dispatch.
+///
+/// The runner observes the run keyspace first and falls back to the
+/// `source_work_item` keyspace so a cancel against the work item that
+/// spawned the proposal still short-circuits a fresh approval dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowupApprovalCancellationObserved {
+    /// Durable follow-up id the parked request carries.
+    pub followup_id: FollowupId,
+    /// Source work item that spawned the proposal — used as the
+    /// cancellation parent keyspace for this runner.
+    pub source_work_item: WorkItemId,
+    /// Durable run row reserved for the dispatch, if any. The runner
+    /// only marks the run `Cancelled` and drains the run-keyed queue
+    /// entry when this is `Some`; parent-only observations leave the
+    /// work-item entry pending so the propagator keeps fanning it out.
+    pub run_id: Option<RunRef>,
+    /// Reason / requester / timestamp clone snapshotted from the queue
+    /// at observation time.
+    pub request: CancelRequest,
 }
 
 /// Per-pass typed observation surfaced when a follow-up approval
@@ -275,6 +311,16 @@ pub struct FollowupApprovalRunner {
     /// `run_id`. When `None`, observations remain on the run report
     /// only.
     scope_contention_broadcaster: Option<Arc<ScopeContentionEventBroadcaster>>,
+    /// Optional cooperative-cancellation wiring (SPEC v2 §4.5 / Phase
+    /// 11.5).
+    cancellation: Option<CancellationWiring>,
+}
+
+/// Bundle holding the shared in-memory [`CancellationQueue`] and the
+/// typed-status sink the runner flows an observed cancel through.
+struct CancellationWiring {
+    queue: Arc<Mutex<CancellationQueue>>,
+    sink: Arc<dyn RunCancellationStatusSink>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -306,7 +352,29 @@ impl FollowupApprovalRunner {
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
             concurrency_gate: None,
             scope_contention_broadcaster: None,
+            cancellation: None,
         }
+    }
+
+    /// Wire cooperative cancellation observation into the runner
+    /// (SPEC v2 §4.5 / Phase 11.5).
+    ///
+    /// After scope acquisition and before lease acquisition, the runner
+    /// calls [`observe_for_run_or_parent`] against the shared queue
+    /// using the request's `run_id` and its always-present
+    /// `source_work_item`. On an `Abort` outcome the runner releases
+    /// the just-acquired scope/capacity permits, marks the run
+    /// `Cancelled` via the typed-status sink (when a `run_id` is
+    /// reserved), and drains the run-keyed queue entry. Parent-only
+    /// observations leave the work-item entry pending for the
+    /// propagator.
+    pub fn with_cancellation(
+        mut self,
+        queue: Arc<Mutex<CancellationQueue>>,
+        sink: Arc<dyn RunCancellationStatusSink>,
+    ) -> Self {
+        self.cancellation = Some(CancellationWiring { queue, sink });
+        self
     }
 
     /// Wire a [`ScopeContentionEventBroadcaster`] into the runner.
@@ -452,6 +520,53 @@ impl FollowupApprovalRunner {
                     continue;
                 }
             };
+
+            // Cooperative cancellation observation (SPEC v2 §4.5).
+            if let Some(wiring) = self.cancellation.as_ref() {
+                let observed: Option<CancelRequest> = {
+                    let q = wiring.queue.lock().await;
+                    let from_run = req.run_id.and_then(|run_id| {
+                        match observe_for_run_or_parent(&q, run_id, None) {
+                            CancellationDecision::Abort(req) => Some(req),
+                            CancellationDecision::Proceed => None,
+                        }
+                    });
+                    from_run.or_else(|| q.pending_for_work_item(req.source_work_item).cloned())
+                };
+                if let Some(cancel_req) = observed {
+                    drop(scope_permits);
+                    drop(permit);
+                    if let Some(run_id) = req.run_id
+                        && let Err(err) = wiring.sink.mark_cancelled(run_id, &cancel_req)
+                    {
+                        warn!(
+                            followup_id = req.followup_id.get(),
+                            run_id = %run_id,
+                            error = %err,
+                            "followup approval runner: cancellation status sink failed; relying on operator re-issue",
+                        );
+                    }
+                    if let Some(run_id) = req.run_id {
+                        let mut q = wiring.queue.lock().await;
+                        q.drain_for_run(run_id);
+                    }
+                    debug!(
+                        followup_id = req.followup_id.get(),
+                        reason = %cancel_req.reason,
+                        "followup approval runner: pre-lease cancel observed; aborted dispatch",
+                    );
+                    report.cancelled_before_lease += 1;
+                    report
+                        .cancellations
+                        .push(FollowupApprovalCancellationObserved {
+                            followup_id: req.followup_id,
+                            source_work_item: req.source_work_item,
+                            run_id: req.run_id,
+                            request: cancel_req,
+                        });
+                    continue;
+                }
+            }
 
             // Durable-lease acquisition. Held through the spawned
             // dispatch and released on terminal completion. Permit is
@@ -2059,5 +2174,141 @@ mod tests {
         let _ = runner.run_pending(CancellationToken::new()).await;
         dispatcher.release_gate();
         let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    // -- Pre-lease cancellation observation ------------------------------
+
+    struct RecordingCancellationSink {
+        calls: StdMutex<Vec<(RunRef, CancelRequest)>>,
+    }
+
+    impl RecordingCancellationSink {
+        fn new() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+        fn snapshot(&self) -> Vec<(RunRef, CancelRequest)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RunCancellationStatusSink for RecordingCancellationSink {
+        fn mark_cancelled(
+            &self,
+            run_id: RunRef,
+            request: &CancelRequest,
+        ) -> Result<bool, crate::specialist_runner::RunCancellationStatusError> {
+            self.calls.lock().unwrap().push((run_id, request.clone()));
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_observed_for_run_aborts_followup_dispatch() {
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        let cancel_queue = Arc::new(Mutex::new(CancellationQueue::new()));
+        let sink = Arc::new(RecordingCancellationSink::new());
+
+        cancel_queue.lock().await.enqueue(CancelRequest::for_run(
+            RunRef::new(42),
+            "operator cancel",
+            "tester",
+            "2026-05-09T00:00:00Z",
+        ));
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_cancellation(cancel_queue.clone(), sink.clone());
+
+        queue.enqueue(req_with_run(1, 7, "fix", false, 42));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 0);
+        assert_eq!(report.cancelled_before_lease, 1);
+        assert_eq!(report.cancellations[0].followup_id, FollowupId::new(1));
+        assert_eq!(report.cancellations[0].source_work_item, WorkItemId::new(7));
+        assert_eq!(report.cancellations[0].run_id, Some(RunRef::new(42)));
+        assert_eq!(report.cancellations[0].request.reason, "operator cancel");
+
+        assert!(dispatcher.calls().is_empty());
+        let calls = sink.snapshot();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, RunRef::new(42));
+
+        let q = cancel_queue.lock().await;
+        assert!(q.pending_for_run(RunRef::new(42)).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_observed_via_source_work_item_aborts_followup_but_leaves_entry() {
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        let cancel_queue = Arc::new(Mutex::new(CancellationQueue::new()));
+        let sink = Arc::new(RecordingCancellationSink::new());
+
+        cancel_queue
+            .lock()
+            .await
+            .enqueue(CancelRequest::for_work_item(
+                WorkItemId::new(7),
+                "source cancel",
+                "tester",
+                "2026-05-09T00:00:00Z",
+            ));
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_cancellation(cancel_queue.clone(), sink.clone());
+
+        queue.enqueue(req_with_run(1, 7, "fix", false, 99));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.cancelled_before_lease, 1);
+        assert_eq!(report.cancellations[0].request.reason, "source cancel");
+
+        let calls = sink.snapshot();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, RunRef::new(99));
+
+        let q = cancel_queue.lock().await;
+        assert!(q.pending_for_work_item(WorkItemId::new(7)).is_some());
+        assert!(q.pending_for_run(RunRef::new(99)).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_run_reservation_skips_followup_sink_and_drain() {
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        let cancel_queue = Arc::new(Mutex::new(CancellationQueue::new()));
+        let sink = Arc::new(RecordingCancellationSink::new());
+
+        cancel_queue
+            .lock()
+            .await
+            .enqueue(CancelRequest::for_work_item(
+                WorkItemId::new(7),
+                "source cancel",
+                "tester",
+                "2026-05-09T00:00:00Z",
+            ));
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_cancellation(cancel_queue.clone(), sink.clone());
+
+        queue.enqueue(req(1, 7, "fix", false));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.cancelled_before_lease, 1);
+        assert!(dispatcher.calls().is_empty());
+        assert!(sink.snapshot().is_empty());
+
+        let q = cancel_queue.lock().await;
+        assert!(q.pending_for_work_item(WorkItemId::new(7)).is_some());
     }
 }

@@ -220,7 +220,10 @@ pub use scope_contention_broadcaster::{
     ScopeFields,
 };
 pub use scope_contention_log::{ContentionObservation, ContentionSubject, ScopeContentionEventLog};
-pub use specialist_runner::{SpecialistDispatchOutcome, SpecialistRunReport, SpecialistRunner};
+pub use specialist_runner::{
+    RunCancellationStatusError, RunCancellationStatusSink, SpecialistDispatchOutcome,
+    SpecialistRunReport, SpecialistRunner,
+};
 pub use specialist_tick::{
     RoleKindLookup, SpecialistDispatchQueue, SpecialistDispatchRequest, SpecialistQueueTick,
 };

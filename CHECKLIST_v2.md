@@ -128,7 +128,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add pure `cancellation_observer` primitive (`CancellationDecision` + `observe_for_run` + `observe_for_run_or_parent`) that turns a `CancellationQueue` lookup into an abort/proceed decision.
 - [x] Wire pre-lease cancellation observation into `SpecialistRunner` and `IntegrationDispatchRunner` with `RunCancellationStatusSink` and run-keyed drain semantics.
 - [x] Add durable `cancel_requests` table, `CancelRequestRepository`, and write-through + startup hydration so `CancellationQueue` survives restart.
-- [ ] Wire pre-lease cancellation observation into the QA, follow-up approval, and budget-pause runners under the same contract used by specialist + integration.
+- [x] Wire pre-lease cancellation observation into the QA, follow-up approval, and budget-pause runners under the same contract used by specialist + integration.
 - [ ] Add Dispatcher-level cooperation point for between-agent-step cancellation checks in long-running dispatches.
 - [ ] Add `OrchestratorEvent::RunCancelled` with kernel-side `CancellationEventLog` dedup, and a `CancellationPropagator` that cascades work-item cancellation across `WorkItemEdge::ParentChild` to in-flight child runs.
 - [ ] Add `symphony cancel <id>` CLI subcommand with `--reason`, `--run` / `--issue` flags, idempotent re-runs, and a one-line summary of cascaded targets.

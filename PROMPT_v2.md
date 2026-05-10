@@ -66,11 +66,7 @@ Read the v2 files listed above. If they are missing, restore or create them befo
 
 Open `CHECKLIST_v2.md`. Pick the first unchecked item whose dependencies are satisfied.
 
-Default to doing the item. If a task fits in roughly one focused commit (~200 LOC including tests), just do it — do not decompose. Only decompose when a task genuinely cannot be landed as one coherent change, and when you do, break it down in your head and do the first piece in this iteration. Do not commit checklist edits as their own iteration; decomposition is planning, not progress.
-
-Checklist items are at most one level of sub-bullets. No sub-sub-items.
-
-One commit = one coherent change.
+Do the item.
 
 ### Step 3 — Implement with tests
 
@@ -155,8 +151,13 @@ Good: agents surface adjacent problems that matter; they note minor observations
 
 ### Decomposition sprawl
 
-Bad: every task spawns a "decompose X" entry plus 5–8 sub-items, and the decomposition entry itself counts as progress.
-Good: tasks that fit in one coherent commit get done. Decomposition happens in your head, not as a committed checklist edit. Finishing is the goal; the checklist should shrink, not grow.
+Bad: every task spawns a "decompose X" entry plus 5–8 sub-items, and the decomposition entry itself counts as progress. The checklist grows visibly nested while real work stalls.
+Good: the checklist stays flat. Tasks that fit in one coherent commit get done. Decomposition happens in your head, not as a committed checklist edit. If you find yourself about to add a sub-bullet, stop — pick the smallest coherent commit you can land for the parent item and do that instead. Finishing is the goal; the checklist should shrink, not grow.
+
+### Skipping the hard half
+
+Bad: a task says "Add X model + durable Y table + Z primitive" and the agent ships only the in-memory primitive while leaving the durable table unbuilt — then proceeds to wire downstream code against the in-memory surface.
+Good: when an item names persistence, persist. When an item names a durable table, write the migration. If the full item genuinely cannot land in one commit, do the persistence-bearing piece first — never the easy in-memory half — and only tick the item when its full surface (including durability) is built.
 
 ## Completion Sentinel
 
