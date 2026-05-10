@@ -88,10 +88,10 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 9 — End-to-End Scenarios
 
-- [ ] Add deterministic fake E2E: parent decomposes into `A -> B -> C`; only A runs first; B then C run after terminal prerequisites; platform lead integrates; QA passes; parent closes.
-- [ ] Add deterministic fake E2E: parallel roots A/B run together, C waits for both, B fails QA/rework, C remains blocked until B passes.
-- [ ] Add Linear-backed adapter test path proving native blocker relations are created and reconciled.
-- [ ] Add GitHub local-only/advisory scenario proving local Symphony state enforces sequencing when tracker-native blockers are unavailable.
+- [x] Add deterministic fake E2E: parent decomposes into `A -> B -> C`; only A runs first; B then C run after terminal prerequisites; platform lead integrates; QA passes; parent closes.
+- [x] Add deterministic fake E2E: parallel roots A/B run together, C waits for both, B fails QA/rework, C remains blocked until B passes.
+- [x] Add Linear-backed adapter test path proving native blocker relations are created and reconciled.
+- [x] Add GitHub local-only/advisory scenario proving local Symphony state enforces sequencing when tracker-native blockers are unavailable.
 
 ## Phase 10 — Documentation
 

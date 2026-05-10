@@ -239,8 +239,11 @@ fn failed_dependency_sync_edges(db: &StateDb) -> StateResult<Vec<WorkItemEdgeRec
 mod tests {
     use super::*;
     use crate::edges::{EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge};
+    use crate::integration_queue::IntegrationQueueRepository;
+    use crate::integration_records::{IntegrationRecordRepository, NewIntegrationRecord};
     use crate::migrations::migrations;
-    use crate::repository::{NewWorkItem, WorkItemId};
+    use crate::qa_queue::QaQueueRepository;
+    use crate::repository::{NewRun, NewWorkItem, RunRepository, WorkItemId};
 
     fn open() -> StateDb {
         let mut db = StateDb::open_in_memory().expect("open");
@@ -265,6 +268,51 @@ mod tests {
         })
         .expect("seed work item")
         .id
+    }
+
+    fn seed_run(db: &mut StateDb, work_item: WorkItemId, role: &str, now: &str) {
+        db.create_run(NewRun {
+            work_item_id: work_item,
+            role,
+            agent: "codex",
+            status: "completed",
+            workspace_claim_id: None,
+            now,
+        })
+        .expect("seed run");
+    }
+
+    fn link_parent_child(db: &mut StateDb, parent: WorkItemId, child: WorkItemId) {
+        db.create_edge(NewWorkItemEdge {
+            parent_id: parent,
+            child_id: child,
+            edge_type: EdgeType::ParentChild,
+            reason: Some("decomposition child"),
+            status: "linked",
+            source: EdgeSource::Decomposition,
+            now: "2026-05-10T00:00:00Z",
+        })
+        .expect("parent child edge");
+    }
+
+    fn succeeded_integration(db: &mut StateDb, parent: WorkItemId, now: &str) {
+        db.create_integration_record(NewIntegrationRecord {
+            parent_work_item_id: parent,
+            owner_role: "platform_lead",
+            run_id: None,
+            status: "succeeded",
+            merge_strategy: "merge_commits",
+            integration_branch: Some("integration/parent"),
+            base_ref: Some("main"),
+            head_sha: Some("deadbeef"),
+            workspace_path: None,
+            children_consolidated: Some("[]"),
+            summary: Some("integrated children"),
+            conflicts: None,
+            blockers_filed: None,
+            now,
+        })
+        .expect("integration record");
     }
 
     #[test]
@@ -504,5 +552,108 @@ mod tests {
             Some("still down")
         );
         assert_eq!(fetched.tracker_sync_attempts, 2);
+    }
+
+    #[test]
+    fn fake_e2e_sequential_chain_reaches_integration_and_qa() {
+        let mut db = open();
+        let parent = seed_item(&mut db, "P", "running");
+        let a = seed_item(&mut db, "A", "ready");
+        let b = seed_item(&mut db, "B", "blocked");
+        let c = seed_item(&mut db, "C", "blocked");
+        for child in [a, b, c] {
+            link_parent_child(&mut db, parent, child);
+        }
+        db.create_decomposition_blocker_edges(&[
+            NewDecompositionBlockerEdge {
+                blocker_id: a,
+                blocked_id: b,
+                reason: "B depends on A",
+                now: "2026-05-10T00:00:00Z",
+            },
+            NewDecompositionBlockerEdge {
+                blocker_id: b,
+                blocked_id: c,
+                reason: "C depends on B",
+                now: "2026-05-10T00:00:00Z",
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(db.list_incoming_open_blockers(a).unwrap().len(), 0);
+        assert_eq!(db.list_incoming_open_blockers(b).unwrap().len(), 1);
+        assert_eq!(db.list_incoming_open_blockers(c).unwrap().len(), 1);
+
+        seed_run(&mut db, a, "backend", "2026-05-10T00:01:00Z");
+        db.update_work_item_status(a, "done", "done", "2026-05-10T00:02:00Z")
+            .unwrap();
+        reconcile_terminal_decomposition_blockers(&mut db, "2026-05-10T00:03:00Z").unwrap();
+        assert_eq!(db.get_work_item(b).unwrap().unwrap().status_class, "ready");
+
+        seed_run(&mut db, b, "backend", "2026-05-10T00:04:00Z");
+        db.update_work_item_status(b, "done", "done", "2026-05-10T00:05:00Z")
+            .unwrap();
+        reconcile_terminal_decomposition_blockers(&mut db, "2026-05-10T00:06:00Z").unwrap();
+        assert_eq!(db.get_work_item(c).unwrap().unwrap().status_class, "ready");
+
+        seed_run(&mut db, c, "frontend", "2026-05-10T00:07:00Z");
+        db.update_work_item_status(c, "done", "done", "2026-05-10T00:08:00Z")
+            .unwrap();
+        assert_eq!(db.list_ready_for_integration().unwrap()[0].id(), parent);
+
+        succeeded_integration(&mut db, parent, "2026-05-10T00:09:00Z");
+        assert_eq!(db.list_ready_for_qa().unwrap()[0].id(), parent);
+
+        db.update_work_item_status(parent, "done", "done", "2026-05-10T00:10:00Z")
+            .unwrap();
+        assert!(db.list_ready_for_integration().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fake_e2e_parallel_roots_join_child_waits_for_reworked_root() {
+        let mut db = open();
+        let parent = seed_item(&mut db, "P", "running");
+        let a = seed_item(&mut db, "A", "ready");
+        let b = seed_item(&mut db, "B", "ready");
+        let c = seed_item(&mut db, "C", "blocked");
+        for child in [a, b, c] {
+            link_parent_child(&mut db, parent, child);
+        }
+        db.create_decomposition_blocker_edges(&[
+            NewDecompositionBlockerEdge {
+                blocker_id: a,
+                blocked_id: c,
+                reason: "C depends on A",
+                now: "2026-05-10T00:00:00Z",
+            },
+            NewDecompositionBlockerEdge {
+                blocker_id: b,
+                blocked_id: c,
+                reason: "C depends on B",
+                now: "2026-05-10T00:00:00Z",
+            },
+        ])
+        .unwrap();
+
+        seed_run(&mut db, a, "backend", "2026-05-10T00:01:00Z");
+        seed_run(&mut db, b, "frontend", "2026-05-10T00:01:00Z");
+        db.update_work_item_status(a, "done", "done", "2026-05-10T00:02:00Z")
+            .unwrap();
+        db.update_work_item_status(b, "blocked", "qa_rework", "2026-05-10T00:02:30Z")
+            .unwrap();
+        reconcile_terminal_decomposition_blockers(&mut db, "2026-05-10T00:03:00Z").unwrap();
+
+        assert_eq!(
+            db.get_work_item(c).unwrap().unwrap().status_class,
+            "blocked"
+        );
+        assert_eq!(db.list_incoming_open_blockers(c).unwrap().len(), 1);
+
+        db.update_work_item_status(b, "done", "done", "2026-05-10T00:04:00Z")
+            .unwrap();
+        reconcile_terminal_decomposition_blockers(&mut db, "2026-05-10T00:05:00Z").unwrap();
+
+        assert_eq!(db.get_work_item(c).unwrap().unwrap().status_class, "ready");
+        assert!(db.list_incoming_open_blockers(c).unwrap().is_empty());
     }
 }
