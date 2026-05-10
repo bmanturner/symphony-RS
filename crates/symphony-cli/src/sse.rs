@@ -55,19 +55,23 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::Stream;
 use futures::StreamExt;
+use serde::Deserialize;
 use symphony_core::event_bus::EventBus;
 use symphony_core::events::OrchestratorEvent;
+use symphony_state::events::{EventRecord, EventRepository, EventSequence};
+use symphony_state::{StateDb, StateError};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_util::sync::CancellationToken;
@@ -86,6 +90,18 @@ pub const DEFAULT_MAX_SUBSCRIBERS: usize = 32;
 /// frame every 15 s keeps the socket warm without spamming the wire.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Default cadence at which the durable-tail handler polls the
+/// `events` table for new rows. Sized so a stalled write side doesn't
+/// burn CPU and a bursty write side still feels live (200 ms is well
+/// under the human-perceptible threshold for a status surface).
+pub const DEFAULT_DURABLE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Default page size for each durable-tail poll. Big enough that the
+/// handler catches up to backlogs without thousands of round-trips,
+/// small enough that one slow consumer doesn't pin a giant payload in
+/// memory.
+pub const DEFAULT_DURABLE_PAGE_SIZE: usize = 256;
+
 /// Tunables for the SSE handler. Cheaply [`Clone`]able — the router
 /// stores one copy and hands clones into request handlers.
 #[derive(Debug, Clone)]
@@ -93,37 +109,166 @@ pub struct SseConfig {
     /// Hard cap on concurrent subscribers. Past this, new connections
     /// receive `503 Service Unavailable`.
     pub max_subscribers: usize,
+    /// Cadence the durable-tail handler polls the `events` table at.
+    pub durable_poll_interval: Duration,
+    /// Maximum rows the durable-tail handler reads per poll.
+    pub durable_page_size: usize,
 }
 
 impl Default for SseConfig {
     fn default() -> Self {
         Self {
             max_subscribers: DEFAULT_MAX_SUBSCRIBERS,
+            durable_poll_interval: DEFAULT_DURABLE_POLL_INTERVAL,
+            durable_page_size: DEFAULT_DURABLE_PAGE_SIZE,
         }
+    }
+}
+
+/// Read-only access to the durable event tail used by the SSE handler.
+///
+/// The kernel persists every event into the `events` table before
+/// broadcasting (ARCHITECTURE_v2 §5.7). The SSE surface therefore reads
+/// from the durable log rather than the in-process broadcast channel —
+/// a reconnecting consumer can resume from any sequence and trust the
+/// stream is gap-free.
+///
+/// The trait is intentionally narrow: one paged read keyed by sequence
+/// and one "where is the head right now" lookup. That is the entire
+/// contract a polling SSE handler needs, and it lets tests substitute a
+/// fake without depending on SQLite.
+pub trait DurableTailSource: Send + Sync + 'static {
+    /// Events strictly after `after`, in ascending sequence order, up
+    /// to `limit`. Pass `None` to start from the beginning.
+    fn events_after(
+        &self,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<DurableEvent>, StateError>;
+
+    /// The highest persisted sequence, or `None` when the log is empty.
+    fn last_sequence(&self) -> Result<Option<i64>, StateError>;
+}
+
+/// Wire-shape representation of one durable event, decoupled from the
+/// `symphony-state` row type so the SSE module can serialise without
+/// pulling SQLite types into the response surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableEvent {
+    /// Monotonically increasing sequence assigned at append time.
+    pub sequence: i64,
+    /// Event type discriminator, written to the SSE `event:` field.
+    pub event_type: String,
+    /// Already-encoded JSON payload, written to the SSE `data:` field.
+    pub payload: String,
+}
+
+impl From<EventRecord> for DurableEvent {
+    fn from(record: EventRecord) -> Self {
+        Self {
+            sequence: record.sequence.0,
+            event_type: record.event_type,
+            payload: record.payload,
+        }
+    }
+}
+
+/// `DurableTailSource` adapter over a shared [`StateDb`] handle.
+///
+/// `StateDb` wraps a single `rusqlite::Connection`, which is `!Sync`;
+/// we serialise reads through a `Mutex` so the SSE handler (which may
+/// run multiple concurrent subscribers) can share one connection
+/// without each spinning up its own SQLite handle.
+pub struct StateDbTailSource {
+    db: Arc<Mutex<StateDb>>,
+}
+
+impl StateDbTailSource {
+    /// Wrap an existing `StateDb`. The caller is responsible for having
+    /// already run migrations.
+    #[must_use]
+    pub fn new(db: Arc<Mutex<StateDb>>) -> Self {
+        Self { db }
+    }
+}
+
+impl DurableTailSource for StateDbTailSource {
+    fn events_after(
+        &self,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<DurableEvent>, StateError> {
+        let db = self.db.lock().expect("state-db mutex poisoned");
+        let rows = db.list_events_after(after.map(EventSequence), limit)?;
+        Ok(rows.into_iter().map(DurableEvent::from).collect())
+    }
+
+    fn last_sequence(&self) -> Result<Option<i64>, StateError> {
+        let db = self.db.lock().expect("state-db mutex poisoned");
+        Ok(db.last_event_sequence()?.map(|s| s.0))
     }
 }
 
 /// Application state passed to the `GET /events` handler.
 ///
-/// Holds a clone of the orchestrator's [`EventBus`] (so subscribers see
-/// the same stream the daemon emits), the typed [`SseConfig`] knobs,
-/// and an atomic counter tracking active subscribers. The counter is
-/// shared via `Arc` so the [`SubscriberGuard`] can decrement it on
-/// drop without needing access to the `Router` state.
-#[derive(Debug, Clone)]
+/// Holds the typed [`SseConfig`] knobs, an atomic counter tracking
+/// active subscribers, and one of two event sources:
+///
+/// - The orchestrator's [`EventBus`] (for legacy/tests).
+/// - A [`DurableTailSource`] backed by the durable `events` table —
+///   the production path per SPEC v2 §5.14, which lets a reconnecting
+///   consumer resume from any sequence without losing rows.
+///
+/// The counter is shared via `Arc` so the [`SubscriberGuard`] can
+/// decrement it on drop without needing access to the `Router` state.
+#[derive(Clone)]
 pub struct SseState {
     bus: EventBus,
+    durable: Option<Arc<dyn DurableTailSource>>,
     config: SseConfig,
     active: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for SseState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseState")
+            .field("bus", &self.bus)
+            .field("durable", &self.durable.as_ref().map(|_| "<durable>"))
+            .field("config", &self.config)
+            .field("active", &self.active)
+            .finish()
+    }
 }
 
 impl SseState {
     /// Build state from an existing [`EventBus`] (typically the same
     /// instance the orchestrator emits onto) and the configured caps.
+    /// The handler streams from the in-process broadcast channel — no
+    /// durable replay or resume.
     #[must_use]
     pub fn new(bus: EventBus, config: SseConfig) -> Self {
         Self {
             bus,
+            durable: None,
+            config,
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Build state that streams from a [`DurableTailSource`] (the
+    /// production path) instead of the in-process broadcast channel.
+    /// `bus` is still kept on the struct so legacy callers wiring
+    /// `EventBus`-based tests through this constructor remain
+    /// compatible; the handler ignores it whenever `durable` is set.
+    #[must_use]
+    pub fn with_durable_tail(
+        bus: EventBus,
+        durable: Arc<dyn DurableTailSource>,
+        config: SseConfig,
+    ) -> Self {
+        Self {
+            bus,
+            durable: Some(durable),
             config,
             active: Arc::new(AtomicUsize::new(0)),
         }
@@ -225,10 +370,30 @@ pub async fn bind_and_serve(
     serve(listener, state, cancel).await
 }
 
+/// Query parameters accepted by `GET /events`.
+#[derive(Debug, Deserialize, Default)]
+pub struct EventsQuery {
+    /// Resume after this sequence. Equivalent to `Last-Event-ID`. The
+    /// query parameter is honoured first because some intermediate
+    /// proxies strip arbitrary headers; passing `?after=N` works
+    /// everywhere.
+    pub after: Option<i64>,
+}
+
 /// `GET /events` handler. Fast-fails with 503 when over cap; otherwise
 /// returns a long-lived SSE response that stays open until the client
-/// disconnects or the broadcast channel signals an unrecoverable lag.
-async fn events_handler(State(state): State<SseState>) -> Response {
+/// disconnects.
+///
+/// When the SSE state was built with [`SseState::with_durable_tail`]
+/// the response streams from the durable `events` table (resume cursor
+/// honoured via `Last-Event-ID` or `?after=`). Otherwise it falls back
+/// to the in-process broadcast channel, which the handler keeps for
+/// tests and for the headless-CI codepath.
+async fn events_handler(
+    State(state): State<SseState>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> Response {
     let Some(guard) = state.try_acquire() else {
         warn!(
             cap = state.config.max_subscribers,
@@ -242,10 +407,115 @@ async fn events_handler(State(state): State<SseState>) -> Response {
     };
     debug!(active = state.active(), "accepted SSE subscriber");
 
+    if let Some(durable) = state.durable.clone() {
+        // Per SSE convention, `Last-Event-ID` carries the cursor on
+        // reconnect. We accept the query parameter as a fallback for
+        // proxies that drop the header.
+        let cursor = query
+            .after
+            .or_else(|| parse_last_event_id(&headers))
+            .or_else(|| match durable.last_sequence() {
+                Ok(seq) => seq,
+                Err(err) => {
+                    warn!(error = %err, "durable last-sequence lookup failed; starting from 0");
+                    None
+                }
+            });
+        let stream = durable_tail_stream(
+            durable,
+            cursor,
+            state.config.durable_poll_interval,
+            state.config.durable_page_size,
+            guard,
+        );
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL))
+            .into_response();
+    }
+
     let stream = sse_stream(state.bus.subscribe(), guard);
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL))
         .into_response()
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+/// Adapt a [`DurableTailSource`] into the [`Stream`] shape `axum`'s
+/// [`Sse`] expects.
+///
+/// The stream polls the source on `poll_interval`, walks each page of
+/// new events into SSE frames (one frame per row, with `id:` set to
+/// the sequence so a reconnect can resume), and advances the cursor.
+/// On a query error we emit a warn-log and back off one tick rather
+/// than ending the stream — a transient SQLite hiccup should not force
+/// every subscriber to reconnect.
+fn durable_tail_stream(
+    source: Arc<dyn DurableTailSource>,
+    start_after: Option<i64>,
+    poll_interval: Duration,
+    page_size: usize,
+    guard: SubscriberGuard,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send + 'static {
+    // State carries (source, current cursor, guard, pending page drain).
+    // The drain queue absorbs a multi-row page so each poll yields one
+    // SSE frame per `next()` rather than baking up a Vec into the
+    // stream. When the queue empties, we sleep one `poll_interval` and
+    // refill.
+    let init = (
+        source,
+        start_after,
+        guard,
+        std::collections::VecDeque::<DurableEvent>::new(),
+    );
+    futures::stream::unfold(
+        init,
+        move |(source, cursor, guard, mut pending)| async move {
+            // Drain any already-fetched page first.
+            if let Some(event) = pending.pop_front() {
+                let next_cursor = Some(event.sequence);
+                let frame = Event::default()
+                    .id(event.sequence.to_string())
+                    .event(event.event_type)
+                    .data(event.payload);
+                return Some((Ok(frame), (source, next_cursor, guard, pending)));
+            }
+            // Backoff between polls. Yields a keep-alive comment frame so
+            // the SSE wire stays warm even on quiet logs; production
+            // consumers ignore comment lines.
+            tokio::time::sleep(poll_interval).await;
+            match source.events_after(cursor, page_size) {
+                Ok(rows) => {
+                    pending.extend(rows);
+                    if let Some(event) = pending.pop_front() {
+                        let next_cursor = Some(event.sequence);
+                        let frame = Event::default()
+                            .id(event.sequence.to_string())
+                            .event(event.event_type)
+                            .data(event.payload);
+                        Some((Ok(frame), (source, next_cursor, guard, pending)))
+                    } else {
+                        Some((
+                            Ok(Event::default().comment("idle")),
+                            (source, cursor, guard, pending),
+                        ))
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "durable-tail poll failed; backing off");
+                    Some((
+                        Ok(Event::default().comment("poll-error")),
+                        (source, cursor, guard, pending),
+                    ))
+                }
+            }
+        },
+    )
 }
 
 /// Adapt a broadcast subscription into the [`Stream`] shape `axum`'s
@@ -368,7 +638,13 @@ mod tests {
     #[tokio::test]
     async fn try_acquire_enforces_max_subscribers() {
         let bus = EventBus::new(4);
-        let state = SseState::new(bus, SseConfig { max_subscribers: 2 });
+        let state = SseState::new(
+            bus,
+            SseConfig {
+                max_subscribers: 2,
+                ..SseConfig::default()
+            },
+        );
 
         let g1 = state.try_acquire().expect("first slot");
         let g2 = state.try_acquire().expect("second slot");
@@ -387,7 +663,13 @@ mod tests {
     #[tokio::test]
     async fn dropping_stream_releases_subscriber_slot() {
         let bus = EventBus::new(4);
-        let state = SseState::new(bus.clone(), SseConfig { max_subscribers: 1 });
+        let state = SseState::new(
+            bus.clone(),
+            SseConfig {
+                max_subscribers: 1,
+                ..SseConfig::default()
+            },
+        );
 
         // Build and drop a stream; the embedded guard must release.
         {
@@ -403,7 +685,13 @@ mod tests {
         // Smoke-check the router builds and that `try_acquire`
         // returns the expected 503 path.
         let bus = EventBus::new(4);
-        let state = SseState::new(bus, SseConfig { max_subscribers: 1 });
+        let state = SseState::new(
+            bus,
+            SseConfig {
+                max_subscribers: 1,
+                ..SseConfig::default()
+            },
+        );
         let _g = state.try_acquire().expect("slot");
         let _router = router(state.clone());
         assert!(state.try_acquire().is_none());
@@ -531,5 +819,188 @@ mod tests {
         buf.lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .collect()
+    }
+
+    /// In-memory `DurableTailSource` for handler tests. Holds an
+    /// append-only Vec keyed by sequence; `push_event` mimics the
+    /// kernel writing an event into `events`.
+    #[derive(Default)]
+    struct FakeDurableTail {
+        rows: std::sync::Mutex<Vec<DurableEvent>>,
+    }
+
+    impl FakeDurableTail {
+        fn push(&self, event_type: &str, payload: &str) -> i64 {
+            let mut rows = self.rows.lock().unwrap();
+            let sequence = rows.last().map(|e| e.sequence).unwrap_or(0) + 1;
+            rows.push(DurableEvent {
+                sequence,
+                event_type: event_type.into(),
+                payload: payload.into(),
+            });
+            sequence
+        }
+    }
+
+    impl DurableTailSource for FakeDurableTail {
+        fn events_after(
+            &self,
+            after: Option<i64>,
+            limit: usize,
+        ) -> Result<Vec<DurableEvent>, StateError> {
+            let rows = self.rows.lock().unwrap();
+            let cutoff = after.unwrap_or(0);
+            Ok(rows
+                .iter()
+                .filter(|e| e.sequence > cutoff)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn last_sequence(&self) -> Result<Option<i64>, StateError> {
+            Ok(self.rows.lock().unwrap().last().map(|e| e.sequence))
+        }
+    }
+
+    fn frame_dbg(event: &Event) -> String {
+        format!("{event:?}")
+    }
+
+    #[tokio::test]
+    async fn durable_tail_emits_persisted_events_in_sequence_order() {
+        let tail = Arc::new(FakeDurableTail::default());
+        tail.push("work_item.created", r#"{"id":1}"#);
+        tail.push("run.started", r#"{"id":1}"#);
+
+        let bus = EventBus::new(8);
+        let state = SseState::with_durable_tail(
+            bus,
+            tail.clone(),
+            SseConfig {
+                durable_poll_interval: Duration::from_millis(10),
+                ..SseConfig::default()
+            },
+        );
+        let guard = state.try_acquire().expect("slot");
+        let mut stream = Box::pin(durable_tail_stream(
+            tail,
+            None,
+            Duration::from_millis(10),
+            16,
+            guard,
+        ));
+
+        // First poll picks up both rows; first frame is sequence 1.
+        let f1 = stream.next().await.expect("frame").expect("ok");
+        let dbg = frame_dbg(&f1);
+        assert!(dbg.contains("work_item.created"), "got {dbg:?}");
+        // VecDeque drain hands out the second row without a fresh poll.
+        let f2 = stream.next().await.expect("frame").expect("ok");
+        let dbg = frame_dbg(&f2);
+        assert!(dbg.contains("run.started"), "got {dbg:?}");
+    }
+
+    #[tokio::test]
+    async fn durable_tail_resume_from_cursor_skips_seen_events() {
+        let tail = Arc::new(FakeDurableTail::default());
+        tail.push("a", r#"{"k":1}"#);
+        tail.push("b", r#"{"k":2}"#);
+        tail.push("c", r#"{"k":3}"#);
+
+        // Resume after sequence 2 — only "c" is new.
+        let bus = EventBus::new(8);
+        let _state = SseState::with_durable_tail(bus, tail.clone(), SseConfig::default());
+        let active = Arc::new(AtomicUsize::new(1));
+        let guard = SubscriberGuard {
+            counter: active.clone(),
+        };
+        let mut stream = Box::pin(durable_tail_stream(
+            tail,
+            Some(2),
+            Duration::from_millis(10),
+            16,
+            guard,
+        ));
+
+        let frame = stream.next().await.expect("frame").expect("ok");
+        let dbg = frame_dbg(&frame);
+        assert!(dbg.contains("event: c"), "got {dbg:?}");
+        assert!(dbg.contains("id: 3"), "got {dbg:?}");
+    }
+
+    #[tokio::test]
+    async fn durable_tail_picks_up_late_appends() {
+        let tail = Arc::new(FakeDurableTail::default());
+        tail.push("first", r#"{"n":1}"#);
+
+        let active = Arc::new(AtomicUsize::new(1));
+        let guard = SubscriberGuard {
+            counter: active.clone(),
+        };
+        let mut stream = Box::pin(durable_tail_stream(
+            tail.clone(),
+            None,
+            Duration::from_millis(10),
+            16,
+            guard,
+        ));
+
+        let f1 = stream.next().await.expect("frame").expect("ok");
+        assert!(frame_dbg(&f1).contains("first"));
+
+        // After the page drains the next poll yields a comment frame.
+        // Push a new row and assert the *following* frame carries it —
+        // the comment is acceptable noise on idle ticks.
+        tail.push("second", r#"{"n":2}"#);
+        // Drain frames until we see the new event or hit a budget.
+        let mut saw_second = false;
+        for _ in 0..5 {
+            let f = stream.next().await.expect("frame").expect("ok");
+            if frame_dbg(&f).contains("second") {
+                saw_second = true;
+                break;
+            }
+        }
+        assert!(saw_second, "expected `second` event after late append");
+    }
+
+    #[test]
+    fn parse_last_event_id_handles_well_formed_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "42".parse().unwrap());
+        assert_eq!(parse_last_event_id(&headers), Some(42));
+    }
+
+    #[test]
+    fn parse_last_event_id_returns_none_on_garbage() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "not-a-number".parse().unwrap());
+        assert_eq!(parse_last_event_id(&headers), None);
+    }
+
+    #[test]
+    fn state_db_tail_source_round_trips_events() {
+        use symphony_state::events::NewEvent;
+        use symphony_state::migrations::migrations;
+
+        let mut db = StateDb::open_in_memory().expect("open");
+        db.migrate(migrations()).expect("migrate");
+        db.append_event(NewEvent {
+            event_type: "x.created",
+            work_item_id: None,
+            run_id: None,
+            payload: r#"{"hello":"world"}"#,
+            now: "2026-05-08T00:00:00Z",
+        })
+        .expect("append");
+
+        let source = StateDbTailSource::new(Arc::new(Mutex::new(db)));
+        let last = source.last_sequence().expect("last");
+        assert_eq!(last, Some(1));
+        let rows = source.events_after(None, 10).expect("after");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "x.created");
+        assert_eq!(rows[0].payload, r#"{"hello":"world"}"#);
     }
 }

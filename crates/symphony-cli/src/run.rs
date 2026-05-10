@@ -180,12 +180,39 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // loop is the load-bearing surface, and an operator who hits a
     // port-already-in-use should still be able to drive issues through.
     // The error is logged loudly so the failure is visible.
+    // Optional durable event tail. When `--state-db` is provided we
+    // open the SQLite store, run migrations, and feed the SSE surface
+    // from the `events` table (SPEC v2 §5.14). Without it the SSE
+    // surface streams the in-process broadcast channel — which is fine
+    // for tests and CI smoke runs where no events are persisted.
+    let durable_tail: Option<std::sync::Arc<dyn crate::sse::DurableTailSource>> =
+        if let Some(state_db) = args.state_db.as_ref() {
+            let mut db = symphony_state::StateDb::open(state_db)
+                .with_context(|| format!("opening state-db at {}", state_db.display()))?;
+            db.migrate(symphony_state::migrations::migrations())
+                .with_context(|| "running state-db migrations")?;
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(db));
+            Some(std::sync::Arc::new(crate::sse::StateDbTailSource::new(
+                shared,
+            )))
+        } else {
+            None
+        };
+
     let status_task = if loaded.config.observability.sse.enabled {
         let bind = loaded.config.observability.sse.bind.clone();
         let bus = bus.clone();
         let cancel = cancel.clone();
+        let durable_tail = durable_tail.clone();
         Some(tokio::spawn(async move {
-            let state = crate::sse::SseState::new(bus, crate::sse::SseConfig::default());
+            let state = match durable_tail {
+                Some(tail) => crate::sse::SseState::with_durable_tail(
+                    bus,
+                    tail,
+                    crate::sse::SseConfig::default(),
+                ),
+                None => crate::sse::SseState::new(bus, crate::sse::SseConfig::default()),
+            };
             if let Err(err) = crate::sse::bind_and_serve(&bind, state, cancel).await {
                 error!(bind = %bind, error = %err, "SSE status server failed");
             }

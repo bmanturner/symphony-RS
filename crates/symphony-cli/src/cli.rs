@@ -377,6 +377,16 @@ pub struct RunArgs {
     /// Path to the `WORKFLOW.md` file to drive the orchestrator from.
     #[arg(value_name = "PATH", default_value = "WORKFLOW.md")]
     pub path: PathBuf,
+
+    /// Optional path to the durable state SQLite database. When
+    /// provided, `symphony run` opens (and migrates) the database and
+    /// the SSE surface streams from the durable event tail (SPEC v2
+    /// §5.14) — a reconnecting consumer can resume from any sequence
+    /// via `Last-Event-ID` or `?after=`. When omitted the SSE surface
+    /// falls back to the in-process broadcast channel, suitable for
+    /// the headless-CI codepath that does not persist events.
+    #[arg(long = "state-db", value_name = "PATH")]
+    pub state_db: Option<PathBuf>,
 }
 
 /// Arguments for `symphony validate`.
