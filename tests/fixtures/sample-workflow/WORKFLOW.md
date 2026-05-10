@@ -42,6 +42,14 @@ roles:
     kind: integration_owner
     description: Owns decomposition, integration branch, and final PR/QA handoff.
     agent: lead_agent
+    instructions:
+      role_prompt: .symphony/roles/platform_lead/AGENTS.md
+      soul: .symphony/roles/platform_lead/SOUL.md
+    assignment:
+      owns: [broad issue decomposition, integration branch, final PR handoff]
+      does_not_own: [direct specialist implementation, QA verdicts]
+      requires: [parent issue context, role catalog, child handoffs]
+      handoff_expectations: [integrated summary, child status table, QA request]
     max_concurrent: 1
     can_decompose: true
     can_assign: true
@@ -51,6 +59,14 @@ roles:
     kind: qa_gate
     description: Verifies acceptance criteria, files blockers, rejects incomplete work.
     agent: qa_agent
+    instructions:
+      role_prompt: .symphony/roles/qa/AGENTS.md
+      soul: .symphony/roles/qa/SOUL.md
+    assignment:
+      owns: [acceptance verification, blocker filing, QA verdicts]
+      does_not_own: [normal implementation children]
+      requires: [integrated output, child handoffs, CI status]
+      handoff_expectations: [verdict, evidence, acceptance trace]
     max_concurrent: 2
     can_file_blockers: true
     can_file_followups: true
@@ -59,14 +75,56 @@ roles:
     kind: specialist
     description: Implements scoped backend changes.
     agent: codex_fast
+    instructions:
+      role_prompt: .symphony/roles/backend_engineer/AGENTS.md
+      soul: .symphony/roles/backend_engineer/SOUL.md
+    assignment:
+      owns: [Rust core, state repositories, tracker adapters]
+      does_not_own: [TUI layout polish]
+      requires: [acceptance criteria, schema contracts]
+      handoff_expectations: [changed files, tests run, migration risks]
+      routing_hints:
+        paths_any: [crates/**, tests/**]
+        labels_any: [backend]
+        domains_any: [state, tracker]
   frontend_engineer:
     kind: specialist
     description: Implements scoped UI/TUI changes.
     agent: claude_fast
+    instructions:
+      role_prompt: .symphony/roles/frontend_engineer/AGENTS.md
+      soul: .symphony/roles/frontend_engineer/SOUL.md
+    assignment:
+      owns: [CLI output, TUI screens, prompt preview surfaces]
+      does_not_own: [database migrations]
+      requires: [terminal viewport constraints, sample data]
+      handoff_expectations: [screens touched, visual/runtime evidence]
+      routing_hints:
+        paths_any: [crates/symphony-cli/src/tui/**, crates/symphony-cli/src/dashboard.rs]
+        labels_any: [frontend, tui]
+        domains_any: [operator UX]
   reviewer:
     kind: reviewer
     description: Optional design/security review for sensitive changes.
     agent: qa_agent
+    assignment:
+      owns: [security review, design review, risk review]
+      does_not_own: [implementation]
+      requires: [diff summary, threat model notes]
+      handoff_expectations: [findings, approval or requested changes]
+      routing_hints:
+        labels_any: [security, review]
+  release_operator:
+    kind: operator
+    description: Performs release and deployment chores.
+    agent: codex_fast
+    assignment:
+      owns: [release notes, deployment checks, environment updates]
+      does_not_own: [feature implementation]
+      requires: [release target, deployment runbook]
+      handoff_expectations: [commands run, rollback notes]
+      routing_hints:
+        labels_any: [release, deploy]
 
 agents:
   lead_agent:

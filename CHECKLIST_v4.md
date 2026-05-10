@@ -102,12 +102,12 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 9 — Fixtures and Examples
 
-- [ ] Update `tests/fixtures/sample-workflow/WORKFLOW.md` with rich role assignment metadata for platform lead, QA, backend specialist, frontend/TUI specialist, reviewer, and operator examples.
-- [ ] Add `.symphony/roles/platform_lead/AGENTS.md` and `SOUL.md` fixture files.
-- [ ] Add `.symphony/roles/qa/AGENTS.md` and `SOUL.md` fixture files.
-- [ ] Add at least two specialist fixture instruction packs with distinct ownership boundaries.
-- [ ] Add fixture tests proving `WorkflowLoader` validates and resolves those files.
-- [ ] Add fixture tests proving generated platform-lead catalog text changes when `WORKFLOW.md` role metadata changes.
+- [x] Update `tests/fixtures/sample-workflow/WORKFLOW.md` with rich role assignment metadata for platform lead, QA, backend specialist, frontend/TUI specialist, reviewer, and operator examples.
+- [x] Add `.symphony/roles/platform_lead/AGENTS.md` and `SOUL.md` fixture files.
+- [x] Add `.symphony/roles/qa/AGENTS.md` and `SOUL.md` fixture files.
+- [x] Add at least two specialist fixture instruction packs with distinct ownership boundaries.
+- [x] Add fixture tests proving `WorkflowLoader` validates and resolves those files.
+- [x] Add fixture tests proving generated platform-lead catalog text changes when `WORKFLOW.md` role metadata changes.
 
 ## Phase 10 — Operator Surface and Debugging
 

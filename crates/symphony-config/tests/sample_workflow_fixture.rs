@@ -26,9 +26,9 @@ use std::path::PathBuf;
 use symphony_config::{
     AgentBackend, AgentProfileConfig, AgentStrategy, BlockerPolicy, ChildIssuePolicy,
     ConflictPolicy, DependencyTrackerSyncPolicy, IntegrationRequirement, MergeStrategy,
-    PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider, RoleKind, RoutingMatchMode,
-    TandemMode, TrackerKind, WorkflowConfig, WorkflowLoader, WorkspaceCleanupPolicy,
-    WorkspaceStrategyKind,
+    PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider, RoleCatalogBuilder, RoleKind,
+    RoutingMatchMode, TandemMode, TrackerKind, WorkflowConfig, WorkflowLoader,
+    WorkspaceCleanupPolicy, WorkspaceStrategyKind,
 };
 
 /// Resolve the fixture path from the crate's manifest dir up to the
@@ -78,12 +78,104 @@ fn sample_fixture_loads_and_validates() {
         .expect("fixture declares platform_lead role");
     assert_eq!(lead.kind, RoleKind::IntegrationOwner);
     assert_eq!(lead.agent.as_deref(), Some("lead_agent"));
+    assert_eq!(
+        lead.instructions.role_prompt.as_deref(),
+        Some(std::path::Path::new(
+            ".symphony/roles/platform_lead/AGENTS.md"
+        ))
+    );
+    assert_eq!(
+        lead.instructions.soul.as_deref(),
+        Some(std::path::Path::new(
+            ".symphony/roles/platform_lead/SOUL.md"
+        ))
+    );
+    assert!(
+        lead.assignment
+            .owns
+            .contains(&"broad issue decomposition".to_string())
+    );
+    assert!(
+        lead.assignment
+            .does_not_own
+            .contains(&"QA verdicts".to_string())
+    );
     assert_eq!(lead.can_decompose, Some(true));
     assert_eq!(lead.can_close_parent, Some(true));
 
     let qa = cfg.roles.get("qa").expect("fixture declares qa role");
     assert_eq!(qa.kind, RoleKind::QaGate);
+    assert_eq!(
+        qa.instructions.role_prompt.as_deref(),
+        Some(std::path::Path::new(".symphony/roles/qa/AGENTS.md"))
+    );
+    assert_eq!(
+        qa.instructions.soul.as_deref(),
+        Some(std::path::Path::new(".symphony/roles/qa/SOUL.md"))
+    );
+    assert!(
+        qa.assignment
+            .handoff_expectations
+            .contains(&"acceptance trace".to_string())
+    );
     assert_eq!(qa.required_for_done, Some(true));
+
+    let backend = cfg
+        .roles
+        .get("backend_engineer")
+        .expect("fixture declares backend specialist");
+    assert_eq!(backend.kind, RoleKind::Specialist);
+    assert!(backend.assignment.owns.contains(&"Rust core".to_string()));
+    assert!(
+        backend
+            .assignment
+            .routing_hints
+            .labels_any
+            .contains(&"backend".to_string())
+    );
+
+    let frontend = cfg
+        .roles
+        .get("frontend_engineer")
+        .expect("fixture declares frontend specialist");
+    assert_eq!(frontend.kind, RoleKind::Specialist);
+    assert!(
+        frontend
+            .assignment
+            .owns
+            .contains(&"TUI screens".to_string())
+    );
+    assert!(
+        frontend
+            .assignment
+            .routing_hints
+            .labels_any
+            .contains(&"tui".to_string())
+    );
+
+    let reviewer = cfg
+        .roles
+        .get("reviewer")
+        .expect("fixture declares reviewer role");
+    assert_eq!(reviewer.kind, RoleKind::Reviewer);
+    assert!(
+        reviewer
+            .assignment
+            .owns
+            .contains(&"security review".to_string())
+    );
+
+    let operator = cfg
+        .roles
+        .get("release_operator")
+        .expect("fixture declares operator role");
+    assert_eq!(operator.kind, RoleKind::Operator);
+    assert!(
+        operator
+            .assignment
+            .owns
+            .contains(&"release notes".to_string())
+    );
 
     // Agents — backend profile + composite (tandem) profile both round-trip.
     let lead_agent = cfg
@@ -300,4 +392,83 @@ fn sample_fixture_round_trips_through_serde_yaml() {
     reparsed
         .validate()
         .expect("round-tripped fixture must still satisfy WorkflowConfig::validate");
+}
+
+#[test]
+fn sample_fixture_instruction_packs_load_with_provenance() {
+    let path = fixture_path();
+    let loaded = WorkflowLoader::from_path(&path)
+        .unwrap_or_else(|e| panic!("failed to load sample fixture at {}: {e}", path.display()));
+
+    for role in [
+        "platform_lead",
+        "qa",
+        "backend_engineer",
+        "frontend_engineer",
+    ] {
+        let pack = loaded
+            .instruction_packs
+            .roles
+            .get(role)
+            .unwrap_or_else(|| panic!("{role} instruction pack should load"));
+
+        let role_prompt = pack
+            .role_prompt
+            .as_ref()
+            .unwrap_or_else(|| panic!("{role} should load AGENTS.md"));
+        assert_eq!(role_prompt.source.role, role);
+        assert!(!role_prompt.content.trim().is_empty());
+        assert!(role_prompt.source.path.ends_with("AGENTS.md"));
+        assert!(!role_prompt.source.content_hash.is_empty());
+
+        let soul = pack
+            .soul
+            .as_ref()
+            .unwrap_or_else(|| panic!("{role} should load SOUL.md"));
+        assert_eq!(soul.source.role, role);
+        assert!(!soul.content.trim().is_empty());
+        assert!(soul.source.path.ends_with("SOUL.md"));
+        assert!(!soul.source.content_hash.is_empty());
+    }
+}
+
+#[test]
+fn sample_fixture_catalog_text_changes_when_role_metadata_changes() {
+    let path = fixture_path();
+    let loaded = WorkflowLoader::from_path(&path)
+        .unwrap_or_else(|e| panic!("failed to load sample fixture at {}: {e}", path.display()));
+
+    let base_catalog = RoleCatalogBuilder {
+        workflow: &loaded.config,
+        instruction_packs: &loaded.instruction_packs,
+        current_role: "platform_lead",
+    }
+    .build()
+    .render_for_prompt();
+
+    assert!(base_catalog.contains("## backend_engineer"));
+    assert!(base_catalog.contains("## frontend_engineer"));
+    assert!(base_catalog.contains("## reviewer"));
+    assert!(base_catalog.contains("## release_operator"));
+    assert!(!base_catalog.contains("## qa"));
+
+    let mut changed_config = loaded.config.clone();
+    changed_config
+        .roles
+        .get_mut("backend_engineer")
+        .expect("backend role should exist")
+        .assignment
+        .owns
+        .push("GraphQL APIs".to_string());
+
+    let changed_catalog = RoleCatalogBuilder {
+        workflow: &changed_config,
+        instruction_packs: &loaded.instruction_packs,
+        current_role: "platform_lead",
+    }
+    .build()
+    .render_for_prompt();
+
+    assert_ne!(base_catalog, changed_catalog);
+    assert!(changed_catalog.contains("GraphQL APIs"));
 }
