@@ -1068,6 +1068,84 @@ mod tests {
     }
 
     #[test]
+    fn incoming_open_blockers_model_specialist_dispatch_eligibility() {
+        let mut db = open();
+        let schema = seed_item(&mut db, "ENG-1");
+        let api = seed_item(&mut db, "ENG-2");
+        let ui = seed_item(&mut db, "ENG-3");
+        let unrelated = seed_item(&mut db, "ENG-4");
+
+        let api_blocker = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: schema,
+                blocked_id: api,
+                reason: "api depends on schema",
+                now: "2026-05-08T00:00:00Z",
+            }])
+            .expect("create api dependency blocker")
+            .pop()
+            .expect("edge should be returned");
+        let ui_blocker = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: api,
+                blocked_id: ui,
+                reason: "ui depends on api",
+                now: "2026-05-08T00:00:01Z",
+            }])
+            .expect("create ui dependency blocker")
+            .pop()
+            .expect("edge should be returned");
+        let _unrelated_open_blocker = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: schema,
+                blocked_id: unrelated,
+                reason: "unrelated depends on schema",
+                now: "2026-05-08T00:00:02Z",
+            }])
+            .expect("create unrelated dependency blocker");
+
+        assert!(
+            db.list_incoming_open_blockers(schema).unwrap().is_empty(),
+            "root child with no incoming blockers remains dispatch-eligible"
+        );
+        assert_eq!(
+            db.list_incoming_open_blockers(api)
+                .unwrap()
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![api_blocker.id],
+            "open decomposition blocker suppresses the blocked child's eligibility"
+        );
+        assert_eq!(
+            db.list_incoming_open_blockers(ui)
+                .unwrap()
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![ui_blocker.id],
+            "downstream child remains suppressed by its own direct prerequisite"
+        );
+
+        db.update_edge_status(api_blocker.id, "resolved")
+            .expect("resolve api blocker");
+
+        assert!(
+            db.list_incoming_open_blockers(api).unwrap().is_empty(),
+            "resolved decomposition blockers no longer suppress eligibility"
+        );
+        assert_eq!(
+            db.list_incoming_open_blockers(ui)
+                .unwrap()
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![ui_blocker.id],
+            "resolving an upstream edge does not clear a different child's blocker"
+        );
+    }
+
+    #[test]
     fn list_decomposition_blockers_with_terminal_blocker_returns_auto_resolvable_edges() {
         let mut db = open();
         let done_schema = seed_item_with_status(&mut db, "ENG-1", "done");

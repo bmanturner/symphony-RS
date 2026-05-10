@@ -27,7 +27,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add repository helper to list incoming open blocker edges for specialist dispatch eligibility.
 - [x] Add repository helper to list decomposition-sourced open blockers whose blocker child is terminal and eligible for auto-resolution.
 - [x] Add repository tests for edge direction: prerequisite child is `parent_id`/blocker, waiting child is `child_id`/blocked.
-- [ ] Add repository tests proving open decomposition blockers suppress blocked-child eligibility and resolved blockers do not.
+- [x] Add repository tests proving open decomposition blockers suppress blocked-child eligibility and resolved blockers do not.
 
 ## Phase 3 — Decomposition Application
 
