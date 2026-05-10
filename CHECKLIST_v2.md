@@ -148,7 +148,7 @@ One unchecked item per implementation iteration. Each item should land with test
 ## Phase 13 — End-to-End Scenarios
 
 - [x] Add deterministic fake test scenario: broad parent decomposes into two child specialist issues, integrates, opens draft PR, passes QA, marks PR ready, closes parent.
-- [ ] Add deterministic test scenario: QA files blocker, blocker routes to specialist, integration reruns, QA passes.
+- [x] Add deterministic test scenario: QA files blocker, blocker routes to specialist, integration reruns, QA passes.
 - [ ] Add deterministic test scenario: specialist files non-blocking follow-up while current work proceeds.
 - [ ] Add deterministic test scenario: dirty/wrong branch blocks agent launch.
 - [ ] Add deterministic test scenario: integration owner cannot close parent with unresolved child.
