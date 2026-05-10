@@ -2841,6 +2841,18 @@ pub enum ConfigValidationError {
         actual: TrackerKind,
     },
 
+    /// `decomposition.dependency_policy.tracker_sync: required` requires
+    /// a tracker with native structural blocker support. SPEC v3 §8.2
+    /// forbids label/comment-only representations from satisfying this.
+    #[error(
+        "decomposition.dependency_policy.tracker_sync = required requires TrackerCapabilities.add_blocker = true (tracker.kind = {actual:?})"
+    )]
+    DependencyTrackerSyncRequiresAddBlocker {
+        /// The configured tracker kind that does not advertise
+        /// structural blocker/dependency creation.
+        actual: TrackerKind,
+    },
+
     /// Workspace strategy and branching policy disagree on shared
     /// branch usage. SPEC v2 §5.9 chooses the safer setting by
     /// rejecting the config rather than silently picking one side.
@@ -2931,6 +2943,7 @@ impl WorkflowConfig {
         self.validate_tracker_states()?;
         self.validate_branching_templates()?;
         self.validate_decomposition_depth()?;
+        self.validate_dependency_policy_tracker_capabilities()?;
         self.validate_pr_provider_pairing()?;
         self.validate_shared_branch_consistency()?;
         self.validate_workspace_default_strategy()?;
@@ -3079,6 +3092,25 @@ impl WorkflowConfig {
             return Err(ConfigValidationError::DecompositionMaxDepthZero(
                 self.decomposition.max_depth,
             ));
+        }
+        Ok(())
+    }
+
+    /// `tracker_sync: required` means the tracker must expose a native
+    /// structural blocker relation. Keep this mapping close to config
+    /// validation so `symphony validate` can fail before runtime adapter
+    /// construction; adapter conformance tests separately ensure the
+    /// concrete adapter capability flags match these product claims.
+    fn validate_dependency_policy_tracker_capabilities(&self) -> Result<(), ConfigValidationError> {
+        if self.decomposition.dependency_policy.tracker_sync
+            == DependencyTrackerSyncPolicy::Required
+            && !self.tracker.kind.supports_structural_blockers()
+        {
+            return Err(
+                ConfigValidationError::DependencyTrackerSyncRequiresAddBlocker {
+                    actual: self.tracker.kind,
+                },
+            );
         }
         Ok(())
     }
@@ -3312,6 +3344,17 @@ impl WorkflowConfig {
             });
         }
         Ok(())
+    }
+}
+
+impl TrackerKind {
+    /// Product-level tracker capability map used by workflow validation.
+    ///
+    /// This mirrors the adapter capability contract without making
+    /// `symphony-config` depend on runtime adapter crates. Linear has
+    /// native issue relations; GitHub Issues and the fixture Mock do not.
+    const fn supports_structural_blockers(self) -> bool {
+        matches!(self, TrackerKind::Linear)
     }
 }
 
@@ -6132,6 +6175,45 @@ hooks:
         cfg.decomposition.enabled = false;
         cfg.decomposition.max_depth = 0;
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_required_dependency_tracker_sync_for_linear() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.decomposition.dependency_policy.tracker_sync = DependencyTrackerSyncPolicy::Required;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_required_dependency_tracker_sync_for_github() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.decomposition.dependency_policy.tracker_sync = DependencyTrackerSyncPolicy::Required;
+        assert_eq!(
+            cfg.validate(),
+            Err(
+                ConfigValidationError::DependencyTrackerSyncRequiresAddBlocker {
+                    actual: TrackerKind::Github,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn validate_rejects_required_dependency_tracker_sync_for_mock() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Mock;
+        cfg.tracker.fixtures = Some(PathBuf::from("issues.yaml"));
+        cfg.decomposition.dependency_policy.tracker_sync = DependencyTrackerSyncPolicy::Required;
+        assert_eq!(
+            cfg.validate(),
+            Err(
+                ConfigValidationError::DependencyTrackerSyncRequiresAddBlocker {
+                    actual: TrackerKind::Mock,
+                }
+            )
+        );
     }
 
     #[test]
