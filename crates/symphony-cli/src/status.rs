@@ -46,6 +46,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::Serialize;
 use symphony_config::{
     ConfigValidationError, LayeredLoadError, LayeredLoader, LoadedWorkflow, TrackerKind,
 };
@@ -239,6 +240,259 @@ pub fn render(outcome: &StatusOutcome) -> i32 {
         }
     }
     outcome.exit_code()
+}
+
+/// JSON-mode counterpart to [`render`]. On the success path, prints a
+/// stable [`StatusJson`] document to stdout; on the failure paths,
+/// prints a `{"error": ...}` envelope to stderr while still returning
+/// the same stable exit code as [`render`]. Tooling can therefore
+/// distinguish "no work" from "could not produce a snapshot" by
+/// looking at exit code first and parsing JSON second.
+pub fn render_json(outcome: &StatusOutcome) -> i32 {
+    match outcome {
+        StatusOutcome::Ok(snap) => {
+            let doc = StatusJson::from_snapshot(snap);
+            // `serde_json` cannot fail on this shape — every field is
+            // a string, bool, integer, or `Vec`. Unwrap is fine; the
+            // alternative is an unreachable error branch.
+            let s = serde_json::to_string_pretty(&doc).unwrap();
+            println!("{s}");
+        }
+        StatusOutcome::LoadFailed(err) => {
+            print_error_json("load_failed", &err.to_string(), None);
+        }
+        StatusOutcome::Invalid(loaded, err) => {
+            print_error_json(
+                "invalid_workflow",
+                &err.to_string(),
+                Some(&loaded.source_path.display().to_string()),
+            );
+        }
+        StatusOutcome::TrackerFailed(loaded, err) => {
+            print_error_json(
+                "tracker_failed",
+                &err.to_string(),
+                Some(&loaded.source_path.display().to_string()),
+            );
+        }
+        StatusOutcome::StateDbFailed(loaded, err) => {
+            print_error_json(
+                "state_db_failed",
+                &err.to_string(),
+                Some(&loaded.source_path.display().to_string()),
+            );
+        }
+    }
+    outcome.exit_code()
+}
+
+fn print_error_json(kind: &str, message: &str, workflow_path: Option<&str>) {
+    let env = ErrorJson {
+        error: kind,
+        message,
+        workflow_path,
+    };
+    let s = serde_json::to_string_pretty(&env).unwrap();
+    eprintln!("{s}");
+}
+
+/// Failure-path JSON envelope. Carrying `error` as a discriminator
+/// keeps the contract honest with the documented exit codes (a
+/// consumer pinning to `error == "tracker_failed"` matches exit code
+/// 3, etc.).
+#[derive(Debug, Serialize)]
+struct ErrorJson<'a> {
+    error: &'a str,
+    message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_path: Option<&'a str>,
+}
+
+/// Stable JSON-mode schema for `symphony status --json`.
+///
+/// The shape is intentionally flat and explicit (no `serde(flatten)`
+/// or untagged enums) so a consumer can write a one-line `jq` filter
+/// against it without referencing Rust types. Field names are
+/// `snake_case` to match the rest of Symphony's persisted payloads.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct StatusJson {
+    /// `"durable"` when `--state-db` was supplied, `"tracker_preview"`
+    /// otherwise. Mirrors the `[mode]` tag the human renderer prints.
+    pub mode: &'static str,
+    /// Absolute or operator-supplied path to the loaded `WORKFLOW.md`.
+    pub workflow_path: String,
+    /// Tracker selection summary derived from the loaded config.
+    pub tracker: TrackerJson,
+    /// Tunables the orchestrator would apply on a `run`.
+    pub config: ConfigJson,
+    /// Durable-mode rows. Empty in tracker-preview mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<DurableRowJson>,
+    /// Tracker-preview rows. Empty in durable mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<TrackerIssueJson>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TrackerJson {
+    /// Lower-case discriminator (`"linear"`, `"github"`, `"mock"`).
+    pub kind: &'static str,
+    /// Best-effort label: `project_slug` for Linear, `repository` for
+    /// GitHub, fixtures path for Mock. Mirrors [`tracker_label`].
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ConfigJson {
+    pub poll_interval_ms: u64,
+    pub max_concurrent_agents: u32,
+    pub agent_kind: String,
+}
+
+/// Durable-mode row in JSON form. Keeps the on-wire field set narrow
+/// — adding fields is a non-breaking change; renaming or removing one
+/// is.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DurableRowJson {
+    pub id: i64,
+    pub tracker_id: String,
+    pub identifier: String,
+    pub title: String,
+    pub status_class: String,
+    pub tracker_status: String,
+    pub assigned_role: Option<String>,
+    pub assigned_agent: Option<String>,
+    pub priority: Option<String>,
+    pub parent_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Latest persisted handoff for this row, if any. The full handoff
+    /// history is reachable via future commands; the `--json` snapshot
+    /// matches the human renderer's "latest only" projection.
+    pub latest_handoff: Option<HandoffJson>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct HandoffJson {
+    pub id: i64,
+    pub run_id: i64,
+    pub ready_for: String,
+    pub summary: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TrackerIssueJson {
+    pub id: String,
+    pub identifier: String,
+    pub title: String,
+    pub state: String,
+    pub priority: Option<i32>,
+    pub branch_name: Option<String>,
+    pub blocked_by: Vec<String>,
+}
+
+impl StatusJson {
+    /// Project a [`StatusSnapshot`] into the stable JSON schema. Pure
+    /// — exposed for tests so they can pin field names without spawning
+    /// the binary.
+    pub fn from_snapshot(snap: &StatusSnapshot) -> StatusJson {
+        let cfg = &snap.loaded.config;
+        let tracker = TrackerJson {
+            kind: tracker_kind_str(cfg.tracker.kind),
+            label: tracker_label(cfg.tracker.kind, cfg),
+        };
+        let config = ConfigJson {
+            poll_interval_ms: cfg.polling.interval_ms,
+            max_concurrent_agents: cfg.agent.max_concurrent_agents,
+            agent_kind: format!("{:?}", cfg.agent.kind),
+        };
+        let workflow_path = snap.loaded.source_path.display().to_string();
+
+        match &snap.view {
+            StatusView::Durable { items } => {
+                let items = items.iter().map(durable_row_to_json).collect();
+                StatusJson {
+                    mode: "durable",
+                    workflow_path,
+                    tracker,
+                    config,
+                    items,
+                    active: Vec::new(),
+                }
+            }
+            StatusView::TrackerPreview { active } => {
+                let active = active.iter().map(tracker_issue_to_json).collect();
+                StatusJson {
+                    mode: "tracker_preview",
+                    workflow_path,
+                    tracker,
+                    config,
+                    items: Vec::new(),
+                    active,
+                }
+            }
+        }
+    }
+}
+
+fn durable_row_to_json(row: &DurableWorkItemRow) -> DurableRowJson {
+    let wi = &row.work_item;
+    DurableRowJson {
+        id: wi.id.0,
+        tracker_id: wi.tracker_id.clone(),
+        identifier: wi.identifier.clone(),
+        title: wi.title.clone(),
+        status_class: wi.status_class.clone(),
+        tracker_status: wi.tracker_status.clone(),
+        assigned_role: wi.assigned_role.clone(),
+        assigned_agent: wi.assigned_agent.clone(),
+        priority: wi.priority.clone(),
+        parent_id: wi.parent_id.map(|p| p.0),
+        created_at: wi.created_at.clone(),
+        updated_at: wi.updated_at.clone(),
+        latest_handoff: row.latest_handoff.as_ref().map(handoff_to_json),
+    }
+}
+
+fn handoff_to_json(h: &HandoffRecord) -> HandoffJson {
+    HandoffJson {
+        id: h.id.0,
+        run_id: h.run_id.0,
+        ready_for: h.ready_for.clone(),
+        summary: h.summary.clone(),
+        created_at: h.created_at.clone(),
+    }
+}
+
+fn tracker_issue_to_json(issue: &Issue) -> TrackerIssueJson {
+    let blocked_by = issue
+        .blocked_by
+        .iter()
+        .map(|b| {
+            b.identifier
+                .clone()
+                .or_else(|| b.id.as_ref().map(|id| id.as_str().to_string()))
+                .unwrap_or_else(|| "?".to_string())
+        })
+        .collect();
+    TrackerIssueJson {
+        id: issue.id.as_str().to_string(),
+        identifier: issue.identifier.clone(),
+        title: issue.title.clone(),
+        state: issue.state.as_str().to_string(),
+        priority: issue.priority,
+        branch_name: issue.branch_name.clone(),
+        blocked_by,
+    }
+}
+
+fn tracker_kind_str(kind: TrackerKind) -> &'static str {
+    match kind {
+        TrackerKind::Linear => "linear",
+        TrackerKind::Github => "github",
+        TrackerKind::Mock => "mock",
+    }
 }
 
 fn render_snapshot(snap: &StatusSnapshot) {
@@ -725,5 +979,152 @@ mod tests {
     fn truncate_handles_max_zero_without_panicking() {
         let out = truncate("abcdefgh", 0);
         assert!(out.chars().count() <= 1);
+    }
+
+    /// Tracker-preview JSON: pin the schema's top-level shape so
+    /// downstream tooling can rely on `mode`, `tracker`, `config`, and
+    /// `active` without reading code.
+    #[tokio::test]
+    async fn json_tracker_preview_schema_is_stable() {
+        let (_dir, path) = ok_workflow();
+        let loaded = LayeredLoader::from_path(&path).unwrap();
+        let tracker = MockTracker::with_active(vec![Issue::minimal(
+            "id-1",
+            "ABC-7",
+            "Add fizz to buzz",
+            "todo",
+        )]);
+        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker)).await;
+        let snap = match &outcome {
+            StatusOutcome::Ok(s) => s,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let doc = StatusJson::from_snapshot(snap);
+        assert_eq!(doc.mode, "tracker_preview");
+        assert_eq!(doc.tracker.kind, "linear");
+        assert_eq!(doc.tracker.label, "ENG");
+        assert!(doc.items.is_empty());
+        assert_eq!(doc.active.len(), 1);
+        let row = &doc.active[0];
+        assert_eq!(row.id, "id-1");
+        assert_eq!(row.identifier, "ABC-7");
+        assert_eq!(row.title, "Add fizz to buzz");
+        assert_eq!(row.state, "todo");
+        assert!(row.priority.is_none());
+        assert!(row.branch_name.is_none());
+        assert!(row.blocked_by.is_empty());
+
+        // serialize and re-parse to lock the on-wire field names.
+        let s = serde_json::to_string(&doc).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mode"], "tracker_preview");
+        assert_eq!(v["tracker"]["kind"], "linear");
+        assert_eq!(v["tracker"]["label"], "ENG");
+        assert_eq!(v["active"][0]["identifier"], "ABC-7");
+        // durable bucket omitted via skip_serializing_if when empty.
+        assert!(v.get("items").is_none());
+    }
+
+    /// Durable JSON: latest handoff projects to the documented shape
+    /// and parent_id round-trips when present.
+    #[tokio::test]
+    async fn json_durable_schema_is_stable() {
+        use symphony_state::handoffs::{HandoffRepository, NewHandoff};
+        use symphony_state::migrations::migrations;
+        use symphony_state::repository::{NewRun, NewWorkItem, RunRepository, WorkItemRepository};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        {
+            let mut db = StateDb::open(&db_path).unwrap();
+            db.migrate(migrations()).unwrap();
+            let wi = db
+                .create_work_item(NewWorkItem {
+                    tracker_id: "linear",
+                    identifier: "ABC-7",
+                    parent_id: None,
+                    title: "Add fizz to buzz",
+                    status_class: "ready",
+                    tracker_status: "todo",
+                    assigned_role: Some("platform_lead"),
+                    assigned_agent: None,
+                    priority: None,
+                    workspace_policy: None,
+                    branch_policy: None,
+                    now: "2026-05-08T00:00:00Z",
+                })
+                .unwrap();
+            let run = db
+                .create_run(NewRun {
+                    work_item_id: wi.id,
+                    role: "platform_lead",
+                    agent: "claude",
+                    status: "running",
+                    workspace_claim_id: None,
+                    now: "2026-05-08T00:00:00Z",
+                })
+                .unwrap();
+            db.create_handoff(NewHandoff {
+                run_id: run.id,
+                work_item_id: wi.id,
+                ready_for: "qa",
+                summary: "ready for QA",
+                changed_files: None,
+                tests_run: None,
+                evidence: None,
+                known_risks: None,
+                now: "2026-05-08T00:00:01Z",
+            })
+            .unwrap();
+        }
+
+        let (_dir, path) = ok_workflow();
+        let outcome = run(&path, Some(&db_path)).await;
+        let snap = match &outcome {
+            StatusOutcome::Ok(s) => s,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let doc = StatusJson::from_snapshot(snap);
+        assert_eq!(doc.mode, "durable");
+        assert_eq!(doc.items.len(), 1);
+        let row = &doc.items[0];
+        assert_eq!(row.identifier, "ABC-7");
+        assert_eq!(row.tracker_id, "linear");
+        assert_eq!(row.status_class, "ready");
+        assert_eq!(row.assigned_role.as_deref(), Some("platform_lead"));
+        let h = row.latest_handoff.as_ref().expect("handoff present");
+        assert_eq!(h.ready_for, "qa");
+        assert_eq!(h.summary, "ready for QA");
+        assert!(doc.active.is_empty());
+
+        let v: serde_json::Value = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["mode"], "durable");
+        assert_eq!(v["items"][0]["latest_handoff"]["ready_for"], "qa");
+        assert!(v.get("active").is_none());
+    }
+
+    /// `render_json` returns the same exit codes as `render` so a CI
+    /// script can switch on `--json` without re-mapping outcomes.
+    #[tokio::test]
+    async fn render_json_exit_codes_match_render() {
+        // Ok path.
+        let (_dir, path) = ok_workflow();
+        let loaded = LayeredLoader::from_path(&path).unwrap();
+        let tracker =
+            MockTracker::with_active(vec![Issue::minimal("id-1", "ABC-7", "Title", "todo")]);
+        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker)).await;
+        assert_eq!(render_json(&outcome), 0);
+
+        // LoadFailed path.
+        let outcome = run(Path::new("/no/such/path/WORKFLOW.md"), None).await;
+        assert_eq!(render_json(&outcome), 1);
+
+        // TrackerFailed path.
+        let (_dir, path) = ok_workflow();
+        let loaded = LayeredLoader::from_path(&path).unwrap();
+        let tracker = MockTracker::new();
+        tracker.enqueue_active_error(TrackerError::Other("boom".into()));
+        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker)).await;
+        assert_eq!(render_json(&outcome), 3);
     }
 }

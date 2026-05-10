@@ -348,6 +348,21 @@ pub struct StatusArgs {
     /// has been persisted yet.
     #[arg(long = "state-db", value_name = "PATH")]
     pub state_db: Option<PathBuf>,
+
+    /// Emit a stable, machine-readable JSON document instead of the
+    /// human-readable table. The schema is documented on
+    /// [`crate::status::StatusJson`]: a top-level object with
+    /// `mode`, `workflow_path`, `tracker`, `config`, and either an
+    /// `items` array (durable mode) or an `active` array (tracker
+    /// preview). Tooling — TUI panels, dashboards, smoke tests — should
+    /// pin to this surface rather than scraping the table.
+    ///
+    /// Errors still go to stderr and still return their stable exit
+    /// code; only the success path changes. Invalid combinations of
+    /// `--json` with other flags are not rejected — the flag is purely
+    /// an output toggle.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
 }
 
 /// Arguments for `symphony run`.

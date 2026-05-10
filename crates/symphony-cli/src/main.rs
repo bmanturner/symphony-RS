@@ -144,7 +144,11 @@ fn main() -> anyhow::Result<ExitCode> {
                 .enable_all()
                 .build()?;
             let outcome = runtime.block_on(status::run(&args.path, args.state_db.as_deref()));
-            let code = status::render(&outcome);
+            let code = if args.json {
+                status::render_json(&outcome)
+            } else {
+                status::render(&outcome)
+            };
             Ok(ExitCode::from(code as u8))
         }
         None => {
