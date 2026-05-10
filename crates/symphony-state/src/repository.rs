@@ -20,8 +20,9 @@
 //!   and the kernel will validate before insert.
 
 use rusqlite::{Connection, OptionalExtension, params};
+use symphony_core::run_status::RunStatus;
 
-use crate::{StateDb, StateResult};
+use crate::{StateDb, StateError, StateResult};
 
 /// Strongly-typed primary key for `work_items`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -200,6 +201,25 @@ pub trait RunRepository {
     /// Update only the run's lifecycle status. Returns `Ok(false)` if the
     /// row does not exist.
     fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool>;
+
+    /// Typed counterpart to [`Self::update_run_status`]: validate the
+    /// transition against [`RunStatus::valid_transition`] before issuing
+    /// the UPDATE.
+    ///
+    /// Behavior:
+    ///
+    /// * Returns `Ok(true)` when the transition is legal and the row was
+    ///   updated.
+    /// * Returns `Ok(false)` when no row matches `id`.
+    /// * Returns `Err(StateError::InvalidRunTransition { from, to })`
+    ///   when the source row's stored label does not allow the requested
+    ///   transition. The row is left untouched. The error's `from` is
+    ///   the row's current label as a string; `to` is `status.as_str()`.
+    /// * Returns `Err(StateError::InvalidRunTransition { from, to })`
+    ///   when the stored label is not a recognized [`RunStatus`] (a
+    ///   tampered or pre-typed-migration row). `from` is the raw stored
+    ///   value verbatim.
+    fn update_run_status_typed(&mut self, id: RunId, status: RunStatus) -> StateResult<bool>;
 
     /// List runs for a work item, ordered by `id` ascending (which is
     /// also creation order under SQLite's autoincrement).
@@ -462,6 +482,43 @@ pub(crate) fn update_run_status_in(
     Ok(updated == 1)
 }
 
+pub(crate) fn update_run_status_typed_in(
+    conn: &Connection,
+    id: RunId,
+    status: RunStatus,
+) -> StateResult<bool> {
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT status FROM runs WHERE id = ?1",
+            params![id.0],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let from = match RunStatus::from_label(&current) {
+        Some(parsed) => parsed,
+        None => {
+            return Err(StateError::InvalidRunTransition {
+                from: current,
+                to: status.as_str().to_string(),
+            });
+        }
+    };
+    if !RunStatus::valid_transition(from, status) {
+        return Err(StateError::InvalidRunTransition {
+            from: from.as_str().to_string(),
+            to: status.as_str().to_string(),
+        });
+    }
+    let updated = conn.execute(
+        "UPDATE runs SET status = ?2 WHERE id = ?1",
+        params![id.0, status.as_str()],
+    )?;
+    Ok(updated == 1)
+}
+
 pub(crate) fn find_expired_leases_in(conn: &Connection, now: &str) -> StateResult<Vec<RunRecord>> {
     let sql = format!(
         "SELECT {RUN_COLUMNS} FROM runs \
@@ -599,6 +656,10 @@ impl RunRepository for StateDb {
 
     fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool> {
         update_run_status_in(self.conn(), id, status)
+    }
+
+    fn update_run_status_typed(&mut self, id: RunId, status: RunStatus) -> StateResult<bool> {
+        update_run_status_typed_in(self.conn(), id, status)
     }
 
     fn list_runs_for_work_item(&self, work_item_id: WorkItemId) -> StateResult<Vec<RunRecord>> {
@@ -835,6 +896,137 @@ mod tests {
         assert!(db.update_run_status(run.id, "running").unwrap());
         assert_eq!(db.get_run(run.id).unwrap().unwrap().status, "running");
         assert!(!db.update_run_status(RunId(123_456), "done").unwrap());
+    }
+
+    fn create_run_with_status(db: &mut StateDb, identifier: &str, status: &str) -> RunId {
+        let wi = db
+            .create_work_item(sample_work_item(identifier, "2026-05-08T00:00:00Z"))
+            .expect("wi");
+        db.create_run(NewRun {
+            work_item_id: wi.id,
+            role: "platform_lead",
+            agent: "claude",
+            status,
+            workspace_claim_id: None,
+            now: "2026-05-08T00:00:00Z",
+        })
+        .expect("run")
+        .id
+    }
+
+    #[test]
+    fn update_run_status_typed_accepts_every_legal_transition() {
+        let legal: &[(RunStatus, RunStatus)] = &[
+            (RunStatus::Queued, RunStatus::Running),
+            (RunStatus::Queued, RunStatus::CancelRequested),
+            (RunStatus::Queued, RunStatus::Cancelled),
+            (RunStatus::Running, RunStatus::Completed),
+            (RunStatus::Running, RunStatus::Failed),
+            (RunStatus::Running, RunStatus::CancelRequested),
+            (RunStatus::Running, RunStatus::Cancelled),
+            (RunStatus::CancelRequested, RunStatus::Cancelled),
+            (RunStatus::CancelRequested, RunStatus::Failed),
+            (RunStatus::CancelRequested, RunStatus::Completed),
+        ];
+        for (idx, &(from, to)) in legal.iter().enumerate() {
+            let mut db = open();
+            let id = create_run_with_status(&mut db, &format!("ENG-{idx}"), from.as_str());
+            let updated = db
+                .update_run_status_typed(id, to)
+                .unwrap_or_else(|e| panic!("legal {from:?} -> {to:?} failed: {e:?}"));
+            assert!(updated, "legal {from:?} -> {to:?} should update one row");
+            assert_eq!(db.get_run(id).unwrap().unwrap().status, to.as_str());
+        }
+    }
+
+    #[test]
+    fn update_run_status_typed_rejects_illegal_transitions_without_mutation() {
+        let legal: std::collections::HashSet<(RunStatus, RunStatus)> = [
+            (RunStatus::Queued, RunStatus::Running),
+            (RunStatus::Queued, RunStatus::CancelRequested),
+            (RunStatus::Queued, RunStatus::Cancelled),
+            (RunStatus::Running, RunStatus::Completed),
+            (RunStatus::Running, RunStatus::Failed),
+            (RunStatus::Running, RunStatus::CancelRequested),
+            (RunStatus::Running, RunStatus::Cancelled),
+            (RunStatus::CancelRequested, RunStatus::Cancelled),
+            (RunStatus::CancelRequested, RunStatus::Failed),
+            (RunStatus::CancelRequested, RunStatus::Completed),
+        ]
+        .into_iter()
+        .collect();
+        let mut idx = 0usize;
+        for &from in &RunStatus::ALL {
+            for &to in &RunStatus::ALL {
+                if legal.contains(&(from, to)) {
+                    continue;
+                }
+                let mut db = open();
+                let id = create_run_with_status(&mut db, &format!("ENG-{idx}"), from.as_str());
+                idx += 1;
+                let err = db
+                    .update_run_status_typed(id, to)
+                    .expect_err("illegal transition must error");
+                match err {
+                    StateError::InvalidRunTransition { from: f, to: t } => {
+                        assert_eq!(f, from.as_str());
+                        assert_eq!(t, to.as_str());
+                    }
+                    other => panic!("expected InvalidRunTransition, got {other:?}"),
+                }
+                // Row stays put.
+                assert_eq!(
+                    db.get_run(id).unwrap().unwrap().status,
+                    from.as_str(),
+                    "illegal {from:?} -> {to:?} must not mutate the row"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_run_status_typed_returns_false_for_missing_row() {
+        let mut db = open();
+        let updated = db
+            .update_run_status_typed(RunId(999_999), RunStatus::Running)
+            .expect("missing row is Ok(false), not an error");
+        assert!(!updated);
+    }
+
+    #[test]
+    fn update_run_status_typed_rejects_unknown_stored_label() {
+        let mut db = open();
+        // Seed the row through the canonical "queued" label, then poke a
+        // junk label directly so we exercise the unparseable-stored-label
+        // branch without depending on a future CHECK migration.
+        let id = create_run_with_status(&mut db, "ENG-1", "queued");
+        // The v2_runs_status_check migration installs a CHECK constraint
+        // on `runs.status`; temporarily bypass it so this test can stage
+        // a tampered/legacy label. `ignore_check_constraints` is a
+        // session-scoped pragma — fine for an in-memory test DB.
+        db.conn()
+            .execute_batch("PRAGMA ignore_check_constraints = 1")
+            .expect("disable check");
+        db.conn()
+            .execute(
+                "UPDATE runs SET status = 'mystery' WHERE id = ?1",
+                params![id.0],
+            )
+            .expect("poke status");
+        db.conn()
+            .execute_batch("PRAGMA ignore_check_constraints = 0")
+            .expect("re-enable check");
+        let err = db
+            .update_run_status_typed(id, RunStatus::Running)
+            .expect_err("unknown label must error");
+        match err {
+            StateError::InvalidRunTransition { from, to } => {
+                assert_eq!(from, "mystery");
+                assert_eq!(to, RunStatus::Running.as_str());
+            }
+            other => panic!("expected InvalidRunTransition, got {other:?}"),
+        }
+        assert_eq!(db.get_run(id).unwrap().unwrap().status, "mystery");
     }
 
     fn set_lease(db: &StateDb, run_id: RunId, owner: Option<&str>, expires_at: Option<&str>) {
