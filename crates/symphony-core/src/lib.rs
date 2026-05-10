@@ -24,6 +24,7 @@ pub mod concurrency_gate;
 pub mod decomposition;
 pub mod decomposition_applier;
 pub mod decomposition_runner;
+pub mod dispatcher_cooperation;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
@@ -113,6 +114,7 @@ pub use decomposition_runner::{
     DecompositionPolicy, DecompositionRunner, DecompositionTriggers, RunnerError, SkipReason,
     TriggerHit,
 };
+pub use dispatcher_cooperation::DispatcherCancellationCheck;
 pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use followup::{
