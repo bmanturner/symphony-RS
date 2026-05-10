@@ -1272,6 +1272,43 @@ async fn link_parent_child_returns_misconfigured_to_match_capability_report() {
 }
 
 #[tokio::test]
+async fn github_structural_dependency_capabilities_stay_false_until_native_edges_exist() {
+    // SPEC v3 depends on this honesty contract: GitHub body text,
+    // labels, and parent footers can be advisory visibility, but they
+    // must not unlock structural dependency orchestration.
+    let server = MockServer::start().await;
+    let tracker = tracker_for(&server);
+    let caps = tracker.capabilities();
+    assert!(!caps.add_blocker);
+    assert!(!caps.link_parent_child);
+
+    let blocker_err = tracker
+        .add_blocker(AddBlockerRequest {
+            blocked: IssueId::new("20"),
+            blocker: IssueId::new("10"),
+            reason: Some("api depends on schema".into()),
+        })
+        .await
+        .expect_err("GitHub must not accept structural blocker mutations");
+    let TrackerError::Misconfigured(blocker_msg) = blocker_err else {
+        panic!("expected Misconfigured from add_blocker");
+    };
+    assert!(blocker_msg.contains("capabilities.add_blocker is false"));
+
+    let parent_err = tracker
+        .link_parent_child(LinkParentChildRequest {
+            parent: IssueId::new("1"),
+            child: IssueId::new("20"),
+        })
+        .await
+        .expect_err("GitHub must not accept structural parent/child mutations");
+    let TrackerError::Misconfigured(parent_msg) = parent_err else {
+        panic!("expected Misconfigured from link_parent_child");
+    };
+    assert!(parent_msg.contains("capabilities.link_parent_child is false"));
+}
+
+#[tokio::test]
 async fn mutations_are_dispatchable_through_arc_dyn_tracker_mutations() {
     // The orchestrator wires mutations as `Arc<dyn TrackerMutations>`.
     // Pin that GitHubTracker can still be erased to that vtable.
