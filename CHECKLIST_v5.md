@@ -76,10 +76,10 @@ mock agent.
 
 ## Phase 6 — `record_qa_verdict` Write Tool
 
-- [ ] Implement `RecordQaVerdictHandler`. Payload deserializes into the existing `QaVerdict` shape.
-- [ ] On `fail` / `inconclusive`, file the corresponding blocker per `CHECKLIST_v2.md:99-100`.
-- [ ] Refuse with `ToolError::CapabilityRefused` when the calling role is not a `qa_gate`.
-- [ ] Add tests covering: pass, fail, inconclusive, waived (waiver role check), wrong role.
+- [x] Implement `RecordQaVerdictHandler`. Payload deserializes into the existing `QaVerdict` shape.
+- [x] On `fail` / `inconclusive`, file the corresponding blocker per `CHECKLIST_v2.md:99-100`.
+- [x] Refuse with `ToolError::CapabilityRefused` when the calling role is not a `qa_gate`.
+- [x] Add tests covering: pass, fail, inconclusive, waived (waiver role check), wrong role.
 
 ## Phase 7 — `file_followup` Write Tool
 

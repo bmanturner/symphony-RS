@@ -9,6 +9,7 @@
 pub mod decomposition_tools;
 pub mod handler;
 pub mod handoff_tools;
+pub mod qa_verdict_tools;
 pub mod read_tools;
 pub mod registry;
 pub mod server;

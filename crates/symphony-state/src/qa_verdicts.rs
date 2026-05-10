@@ -11,7 +11,7 @@
 //! exposes inserts through the transaction helper. This module only
 //! surfaces the typed read.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use crate::repository::{RunId, WorkItemId};
 use crate::{StateDb, StateResult};
@@ -50,6 +50,31 @@ pub struct QaVerdictRecord {
     pub created_at: String,
 }
 
+/// Insertion payload for [`create_qa_verdict_in`].
+#[derive(Debug, Clone)]
+pub struct NewQaVerdict<'a> {
+    /// Work item this verdict gates.
+    pub work_item_id: WorkItemId,
+    /// Run that produced the verdict.
+    pub run_id: RunId,
+    /// Authoring role.
+    pub role: &'a str,
+    /// Stable verdict discriminator.
+    pub verdict: &'a str,
+    /// Waiver authoring role, if this is a waived verdict.
+    pub waiver_role: Option<&'a str>,
+    /// Operator-facing verdict reason.
+    pub reason: Option<&'a str>,
+    /// Raw JSON evidence column.
+    pub evidence: Option<&'a str>,
+    /// Raw JSON acceptance trace column.
+    pub acceptance_trace: Option<&'a str>,
+    /// Raw JSON blocker edge ids filed by QA.
+    pub blockers_created: Option<&'a str>,
+    /// RFC3339 creation timestamp.
+    pub now: &'a str,
+}
+
 /// Read-only view over [`qa_verdicts`](self) rows.
 pub trait QaVerdictRepository {
     /// Return every verdict filed against `work_item_id`, newest first by
@@ -58,6 +83,45 @@ pub trait QaVerdictRepository {
         &self,
         work_item_id: WorkItemId,
     ) -> StateResult<Vec<QaVerdictRecord>>;
+}
+
+/// Insert one QA verdict row.
+pub fn create_qa_verdict_in(
+    conn: &Connection,
+    new: NewQaVerdict<'_>,
+) -> StateResult<QaVerdictRecord> {
+    conn.execute(
+        "INSERT INTO qa_verdicts \
+            (work_item_id, run_id, role, verdict, waiver_role, reason, \
+             evidence, acceptance_trace, blockers_created, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            new.work_item_id.0,
+            new.run_id.0,
+            new.role,
+            new.verdict,
+            new.waiver_role,
+            new.reason,
+            new.evidence,
+            new.acceptance_trace,
+            new.blockers_created,
+            new.now,
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(QaVerdictRecord {
+        id,
+        work_item_id: new.work_item_id,
+        run_id: new.run_id,
+        role: new.role.to_string(),
+        verdict: new.verdict.to_string(),
+        waiver_role: new.waiver_role.map(str::to_string),
+        reason: new.reason.map(str::to_string),
+        evidence: new.evidence.map(str::to_string),
+        acceptance_trace: new.acceptance_trace.map(str::to_string),
+        blockers_created: new.blockers_created.map(str::to_string),
+        created_at: new.now.to_string(),
+    })
 }
 
 impl QaVerdictRepository for StateDb {

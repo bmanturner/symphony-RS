@@ -37,6 +37,7 @@ use crate::handoffs::{HandoffRecord, NewHandoff, create_handoff_in};
 use crate::integration_records::{
     IntegrationRecordRow, NewIntegrationRecord, create_integration_record_in,
 };
+use crate::qa_verdicts::{NewQaVerdict, QaVerdictRecord, create_qa_verdict_in};
 use crate::repository::{
     LeaseAcquisition, NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord,
     acquire_lease_in, create_run_in, create_work_item_in, get_run_in, get_work_item_in,
@@ -239,6 +240,11 @@ impl<'conn> StateTransaction<'conn> {
         new: NewIntegrationRecord<'_>,
     ) -> StateResult<IntegrationRecordRow> {
         create_integration_record_in(&self.tx, new)
+    }
+
+    /// Persist a QA verdict inside this transaction.
+    pub fn create_qa_verdict(&mut self, new: NewQaVerdict<'_>) -> StateResult<QaVerdictRecord> {
+        create_qa_verdict_in(&self.tx, new)
     }
 }
 
