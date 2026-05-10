@@ -128,6 +128,11 @@ decomposition:
   child_issue_policy: create_directly
   max_depth: 2
   require_acceptance_criteria_per_child: true
+  dependency_policy:
+    materialize_edges: true
+    tracker_sync: best_effort
+    dispatch_gate: true
+    auto_resolve_on_terminal: true
 
 workspace:
   root: ./.symphony/workspaces

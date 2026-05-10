@@ -25,9 +25,10 @@ use std::path::PathBuf;
 
 use symphony_config::{
     AgentBackend, AgentProfileConfig, AgentStrategy, BlockerPolicy, ChildIssuePolicy,
-    ConflictPolicy, IntegrationRequirement, MergeStrategy, PrInitialState, PrMarkReadyStage,
-    PrOpenStage, PrProvider, RoleKind, RoutingMatchMode, TandemMode, TrackerKind, WorkflowConfig,
-    WorkflowLoader, WorkspaceCleanupPolicy, WorkspaceStrategyKind,
+    ConflictPolicy, DependencyTrackerSyncPolicy, IntegrationRequirement, MergeStrategy,
+    PrInitialState, PrMarkReadyStage, PrOpenStage, PrProvider, RoleKind, RoutingMatchMode,
+    TandemMode, TrackerKind, WorkflowConfig, WorkflowLoader, WorkspaceCleanupPolicy,
+    WorkspaceStrategyKind,
 };
 
 /// Resolve the fixture path from the crate's manifest dir up to the
@@ -128,6 +129,13 @@ fn sample_fixture_loads_and_validates() {
         cfg.decomposition.child_issue_policy,
         ChildIssuePolicy::CreateDirectly
     );
+    assert!(cfg.decomposition.dependency_policy.materialize_edges);
+    assert_eq!(
+        cfg.decomposition.dependency_policy.tracker_sync,
+        DependencyTrackerSyncPolicy::BestEffort
+    );
+    assert!(cfg.decomposition.dependency_policy.dispatch_gate);
+    assert!(cfg.decomposition.dependency_policy.auto_resolve_on_terminal);
 
     // Workspace — issue worktree + shared integration worktree.
     assert_eq!(

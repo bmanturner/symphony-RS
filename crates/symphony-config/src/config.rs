@@ -1844,6 +1844,15 @@ pub struct DecompositionConfig {
     /// safety behaviour without needing to write the field.
     #[serde(default = "default_true")]
     pub require_acceptance_criteria_per_child: bool,
+
+    /// v3 dependency-orchestration policy for proposal-local
+    /// `depends_on` edges. These controls decide whether dependency
+    /// edges are materialized into durable `blocks` rows, whether those
+    /// rows are mirrored to the tracker, whether they gate specialist
+    /// dispatch, and whether decomposition-sourced blockers auto-resolve
+    /// when their prerequisite child reaches a terminal state.
+    #[serde(default)]
+    pub dependency_policy: DependencyPolicy,
 }
 
 impl Default for DecompositionConfig {
@@ -1855,6 +1864,7 @@ impl Default for DecompositionConfig {
             child_issue_policy: ChildIssuePolicy::default(),
             max_depth: default_decomposition_max_depth(),
             require_acceptance_criteria_per_child: true,
+            dependency_policy: DependencyPolicy::default(),
         }
     }
 }
@@ -1865,6 +1875,58 @@ fn default_decomposition_max_depth() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+/// v3 policy for turning decomposition-local `depends_on` declarations
+/// into durable dependency edges and optional tracker-side blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyPolicy {
+    /// Persist dependency edges as local `blocks` rows. Defaults on
+    /// because local durable state is the enforcement source.
+    #[serde(default = "default_true")]
+    pub materialize_edges: bool,
+
+    /// How aggressively to mirror local dependency edges to the
+    /// configured tracker when it has native structural blocker support.
+    #[serde(default)]
+    pub tracker_sync: DependencyTrackerSyncPolicy,
+
+    /// Gate specialist dispatch on incoming open dependency blockers.
+    /// Defaults on; disabling it makes dependency edges observational.
+    #[serde(default = "default_true")]
+    pub dispatch_gate: bool,
+
+    /// Resolve decomposition-sourced blockers automatically when their
+    /// prerequisite child reaches a workflow-terminal state.
+    #[serde(default = "default_true")]
+    pub auto_resolve_on_terminal: bool,
+}
+
+impl Default for DependencyPolicy {
+    fn default() -> Self {
+        Self {
+            materialize_edges: true,
+            tracker_sync: DependencyTrackerSyncPolicy::default(),
+            dispatch_gate: true,
+            auto_resolve_on_terminal: true,
+        }
+    }
+}
+
+/// Tracker sync policy for v3 decomposition dependency edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyTrackerSyncPolicy {
+    /// Tracker-native blocker creation must succeed or be recorded as
+    /// required retry state before the decomposition can be fully applied.
+    Required,
+    /// Best-effort mirror to the tracker while durable local gating stays
+    /// authoritative. Default.
+    #[default]
+    BestEffort,
+    /// Never call tracker blocker APIs for decomposition dependencies.
+    LocalOnly,
 }
 
 /// Predicate clause for [`DecompositionConfig::triggers`] (SPEC v2 §5.7).
@@ -4765,6 +4827,10 @@ routing:
         );
         assert_eq!(cfg.decomposition.max_depth, 2);
         assert!(cfg.decomposition.require_acceptance_criteria_per_child);
+        assert_eq!(
+            cfg.decomposition.dependency_policy,
+            DependencyPolicy::default()
+        );
     }
 
     #[test]
@@ -4786,6 +4852,10 @@ decomposition:
             parsed.decomposition.child_issue_policy,
             ChildIssuePolicy::ProposeForApproval
         );
+        assert_eq!(
+            parsed.decomposition.dependency_policy,
+            DependencyPolicy::default()
+        );
     }
 
     #[test]
@@ -4804,6 +4874,11 @@ decomposition:
   child_issue_policy: create_directly
   max_depth: 2
   require_acceptance_criteria_per_child: true
+  dependency_policy:
+    materialize_edges: true
+    tracker_sync: required
+    dispatch_gate: true
+    auto_resolve_on_terminal: true
 "#;
         let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
         let d = &parsed.decomposition;
@@ -4822,6 +4897,91 @@ decomposition:
         assert_eq!(d.child_issue_policy, ChildIssuePolicy::CreateDirectly);
         assert_eq!(d.max_depth, 2);
         assert!(d.require_acceptance_criteria_per_child);
+        assert!(d.dependency_policy.materialize_edges);
+        assert_eq!(
+            d.dependency_policy.tracker_sync,
+            DependencyTrackerSyncPolicy::Required
+        );
+        assert!(d.dependency_policy.dispatch_gate);
+        assert!(d.dependency_policy.auto_resolve_on_terminal);
+    }
+
+    #[test]
+    fn decomposition_dependency_policy_defaults_match_v3() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  dependency_policy: {}
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            parsed.decomposition.dependency_policy,
+            DependencyPolicy {
+                materialize_edges: true,
+                tracker_sync: DependencyTrackerSyncPolicy::BestEffort,
+                dispatch_gate: true,
+                auto_resolve_on_terminal: true,
+            }
+        );
+    }
+
+    #[test]
+    fn decomposition_dependency_policy_parses_all_sync_modes() {
+        for (literal, expected) in [
+            ("required", DependencyTrackerSyncPolicy::Required),
+            ("best_effort", DependencyTrackerSyncPolicy::BestEffort),
+            ("local_only", DependencyTrackerSyncPolicy::LocalOnly),
+        ] {
+            let yaml = format!(
+                r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  dependency_policy:
+    tracker_sync: {literal}
+"#
+            );
+            let parsed: WorkflowConfig = serde_yaml::from_str(&yaml).expect("yaml parses");
+            assert_eq!(
+                parsed.decomposition.dependency_policy.tracker_sync,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn decomposition_dependency_policy_rejects_unknown_sync_mode() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  dependency_policy:
+    tracker_sync: eventually
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("eventually") || msg.contains("unknown variant"),
+            "expected unknown-variant error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn decomposition_dependency_policy_rejects_unknown_key() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  dependency_policy:
+    tracker_synk: required
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tracker_synk") || msg.contains("unknown field"),
+            "expected unknown-field error, got: {msg}"
+        );
     }
 
     #[test]
@@ -4907,6 +5067,11 @@ decomposition:
   child_issue_policy: propose_for_approval
   max_depth: 3
   require_acceptance_criteria_per_child: false
+  dependency_policy:
+    materialize_edges: false
+    tracker_sync: local_only
+    dispatch_gate: false
+    auto_resolve_on_terminal: false
 "#;
         let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
         let reserialised = serde_yaml::to_string(&parsed).expect("serialises");

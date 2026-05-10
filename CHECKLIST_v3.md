@@ -10,9 +10,9 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 1 — Workflow Config Schema
 
-- [ ] Extend `DecompositionConfig` with `dependency_policy` containing `materialize_edges`, `tracker_sync`, `dispatch_gate`, and `auto_resolve_on_terminal`.
-- [ ] Add typed `DependencyTrackerSyncPolicy` enum: `required | best_effort | local_only`.
-- [ ] Add defaults matching SPEC v3: materialize edges on, tracker sync best-effort, dispatch gate on, auto-resolve on terminal on.
+- [x] Extend `DecompositionConfig` with `dependency_policy` containing `materialize_edges`, `tracker_sync`, `dispatch_gate`, and `auto_resolve_on_terminal`.
+- [x] Add typed `DependencyTrackerSyncPolicy` enum: `required | best_effort | local_only`.
+- [x] Add defaults matching SPEC v3: materialize edges on, tracker sync best-effort, dispatch gate on, auto-resolve on terminal on.
 - [ ] Add workflow validation: `tracker_sync: required` requires `TrackerCapabilities.add_blocker` for the configured tracker.
 - [ ] Add workflow validation/warning: `dispatch_gate: false` emits a loud warning because dependencies become observability-only.
 - [ ] Add workflow validation for parent/child link policy: structural parent links require tracker support unless local/advisory mode is explicitly allowed.
