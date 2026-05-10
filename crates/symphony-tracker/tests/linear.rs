@@ -700,13 +700,22 @@ async fn add_comment_round_trips_through_comment_create() {
 }
 
 #[tokio::test]
-async fn add_blocker_creates_a_blocks_relation() {
+async fn add_blocker_creates_a_blocks_relation_from_prerequisite_to_waiting_child() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(body_partial_json(json!({
             "operationName": "IssueRelationCreate",
-            // The blocker is the *source* issue, blocked is the related.
-            "variables": { "input": { "type": "blocks", "issueId": "B", "relatedIssueId": "A" } }
+            // Linear's `blocks` relation is source -> target. For v3
+            // decomposition dependencies, the prerequisite child must be
+            // the source `issueId`, and the waiting child must be
+            // `relatedIssueId`.
+            "variables": {
+                "input": {
+                    "type": "blocks",
+                    "issueId": "schema-child",
+                    "relatedIssueId": "api-child"
+                }
+            }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
@@ -721,9 +730,9 @@ async fn add_blocker_creates_a_blocks_relation() {
     let tracker = mutation_tracker(&server.uri(), None);
     let resp = tracker
         .add_blocker(AddBlockerRequest {
-            blocked: IssueId::new("A"),
-            blocker: IssueId::new("B"),
-            reason: Some("regression".into()),
+            blocked: IssueId::new("api-child"),
+            blocker: IssueId::new("schema-child"),
+            reason: Some("api depends on schema".into()),
         })
         .await
         .expect("add_blocker");
