@@ -596,6 +596,24 @@ Consequence: tests and the recovery tick must understand the partial
 state. Operator surface must surface "decomposition partially applied,
 N steps remaining" so a stuck proposal is visible.
 
+### 2026-05-10 — Partially persisted children stay blocked
+
+Context: child tracker issues may be created and committed to local
+`work_items` before dependency edge materialization fails. Rolling those
+rows back loses durable evidence of tracker-side mutations, but releasing
+them as `ready` risks specialist dispatch before sequencing truth exists.
+
+Decision: state persistence commits child `work_items` plus
+`parent_child` edges first with the children in `blocked` status. Only
+after local dependency `blocks` edges materialize successfully does the
+state layer release those children to `ready`. If dependency
+materialization fails, the error carries the persisted children and the
+children remain parked for recovery.
+
+Consequence: recovery can resume from durable child state without
+recreating tracker issues, and scheduler safety does not depend on a
+prompt or convention during partial decomposition application.
+
 ### 2026-05-09 — Dispatch gate is local-edge authoritative under `best_effort`
 
 Context: under `tracker_sync: best_effort`, the local row may be `open`

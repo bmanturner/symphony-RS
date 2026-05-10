@@ -14,9 +14,10 @@ use symphony_core::work_item::WorkItemStatusClass;
 
 use crate::edges::{
     EdgeSource, EdgeType, NewDecompositionBlockerEdge, NewWorkItemEdge, WorkItemEdgeRecord,
+    WorkItemEdgeRepository,
 };
 use crate::repository::{NewWorkItem, WorkItemId, WorkItemRecord};
-use crate::{StateDb, StateError, StateResult};
+use crate::{StateDb, StateError};
 
 /// Child row persisted from one tracker-created decomposition child.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,33 +55,79 @@ impl PersistedAppliedDecomposition {
     }
 }
 
+/// Error from persisting tracker-created decomposition children.
+#[derive(Debug, thiserror::Error)]
+pub enum PersistAppliedDecompositionError {
+    /// The proposal/applied payloads were invalid before any row mutation
+    /// could safely land.
+    #[error(transparent)]
+    State(#[from] StateError),
+    /// Child work items and parent-child edges were committed, but the
+    /// dependency blocker graph failed to materialize.
+    ///
+    /// The children are intentionally left in `blocked` status so
+    /// specialist dispatch cannot race ahead while the dependency graph is
+    /// incomplete. The caller can persist proposal state as partial and
+    /// retry dependency materialization using the returned child ids.
+    #[error("dependency materialization failed after child persistence: {source}")]
+    DependencyMaterializationFailed {
+        /// Children that were durably created before the dependency
+        /// failure. Parent-child edges for these rows were also committed.
+        children: Vec<PersistedAppliedChild>,
+        /// Underlying state-layer failure from creating blocker edges.
+        #[source]
+        source: StateError,
+    },
+    /// Dependency edges materialized, but the final status transition
+    /// that releases children to the specialist queue failed.
+    #[error("releasing persisted decomposition children failed: {source}")]
+    ChildReleaseFailed {
+        /// Fully materialized dependency edges.
+        dependency_edges: Vec<WorkItemEdgeRecord>,
+        /// Children that were persisted and then attempted to release.
+        children: Vec<PersistedAppliedChild>,
+        /// Underlying state-layer failure from the status update.
+        #[source]
+        source: StateError,
+    },
+}
+
+/// Result alias for [`persist_applied_decomposition`].
+pub type PersistAppliedDecompositionResult =
+    Result<PersistedAppliedDecomposition, PersistAppliedDecompositionError>;
+
 /// Persist tracker-created decomposition children and their local graph.
 ///
-/// The operation is atomic: every child `work_items` row, every
-/// `parent_child` edge, and every decomposition dependency `blocks` edge
-/// lands in the same SQLite transaction. If any step fails, no partial
-/// graph is visible to dispatch or integration gates.
+/// The operation is recoverable rather than all-or-nothing: child
+/// `work_items` rows and `parent_child` edges land first with children
+/// parked in `blocked` status. Dependency `blocks` edges then
+/// materialize in their own transaction. On success, children are
+/// released to `ready`; on dependency failure, the partial child state
+/// remains durable and blocked so recovery can resume without recreating
+/// tracker issues or allowing unsafe dispatch.
 pub fn persist_applied_decomposition(
     db: &mut StateDb,
     proposal: &DecompositionProposal,
     applied: &AppliedDecomposition,
     tracker_id: &str,
     now: &str,
-) -> StateResult<PersistedAppliedDecomposition> {
+) -> PersistAppliedDecompositionResult {
     if proposal.status != DecompositionStatus::Approved {
         return Err(StateError::Invariant(format!(
             "decomposition {} must be approved before state persistence (status = {})",
             proposal.id, proposal.status
-        )));
+        ))
+        .into());
     }
     if applied.proposal_id != proposal.id {
         return Err(StateError::Invariant(format!(
             "applied decomposition {} does not match proposal {}",
             applied.proposal_id, proposal.id
-        )));
+        ))
+        .into());
     }
 
-    db.transaction(|tx| {
+    let persisted_children = db.transaction(|tx| {
         let applied_by_key: HashMap<&ChildKey, &AppliedChild> = applied
             .children
             .iter()
@@ -102,8 +149,8 @@ pub fn persist_applied_decomposition(
                 identifier: &applied_child.identifier,
                 parent_id: Some(WorkItemId(proposal.parent.get())),
                 title: &proposal_child.title,
-                status_class: WorkItemStatusClass::Ready.as_str(),
-                tracker_status: "open",
+                status_class: WorkItemStatusClass::Blocked.as_str(),
+                tracker_status: "blocked",
                 assigned_role: Some(proposal_child.assigned_role.as_str()),
                 assigned_agent: None,
                 priority: None,
@@ -127,40 +174,81 @@ pub fn persist_applied_decomposition(
             });
         }
 
-        let mut blockers = Vec::new();
-        for proposal_child in &proposal.children {
-            let blocked_id = *ids_by_key.get(&proposal_child.key).ok_or_else(|| {
-                StateError::Invariant(format!("missing persisted child {}", proposal_child.key))
+        Ok(persisted)
+    })?;
+
+    let ids_by_key: HashMap<ChildKey, WorkItemId> = persisted_children
+        .iter()
+        .map(|child| (child.key.clone(), child.work_item.id))
+        .collect();
+    let mut blockers = Vec::new();
+    for proposal_child in &proposal.children {
+        let blocked_id = *ids_by_key.get(&proposal_child.key).ok_or_else(|| {
+            StateError::Invariant(format!("missing persisted child {}", proposal_child.key))
+        })?;
+        for dependency in &proposal_child.depends_on {
+            let blocker_id = *ids_by_key.get(dependency).ok_or_else(|| {
+                StateError::Invariant(format!(
+                    "missing persisted dependency {dependency} for child {}",
+                    proposal_child.key
+                ))
             })?;
-            for dependency in &proposal_child.depends_on {
-                let blocker_id = *ids_by_key.get(dependency).ok_or_else(|| {
-                    StateError::Invariant(format!(
-                        "missing persisted dependency {dependency} for child {}",
-                        proposal_child.key
-                    ))
-                })?;
-                let reason = format!("{} depends on {}", proposal_child.key, dependency);
-                blockers.push((blocker_id, blocked_id, reason));
-            }
+            let reason = format!("{} depends on {}", proposal_child.key, dependency);
+            blockers.push((blocker_id, blocked_id, reason));
         }
+    }
 
-        let blocker_edges: Vec<NewDecompositionBlockerEdge<'_>> = blockers
-            .iter()
-            .map(
-                |(blocker_id, blocked_id, reason)| NewDecompositionBlockerEdge {
-                    blocker_id: *blocker_id,
-                    blocked_id: *blocked_id,
-                    reason: reason.as_str(),
-                    now,
-                },
-            )
-            .collect();
-        let dependency_edges = tx.create_decomposition_blocker_edges(&blocker_edges)?;
+    let blocker_edges: Vec<NewDecompositionBlockerEdge<'_>> = blockers
+        .iter()
+        .map(
+            |(blocker_id, blocked_id, reason)| NewDecompositionBlockerEdge {
+                blocker_id: *blocker_id,
+                blocked_id: *blocked_id,
+                reason: reason.as_str(),
+                now,
+            },
+        )
+        .collect();
+    let dependency_edges = db
+        .create_decomposition_blocker_edges(&blocker_edges)
+        .map_err(
+            |source| PersistAppliedDecompositionError::DependencyMaterializationFailed {
+                children: persisted_children.clone(),
+                source,
+            },
+        )?;
 
-        Ok(PersistedAppliedDecomposition {
-            children: persisted,
-            dependency_edges,
+    db.transaction(|tx| {
+        for child in &persisted_children {
+            tx.update_work_item_status(
+                child.work_item.id,
+                WorkItemStatusClass::Ready.as_str(),
+                "open",
+                now,
+            )?;
+        }
+        Ok(())
+    })
+    .map_err(
+        |source| PersistAppliedDecompositionError::ChildReleaseFailed {
+            dependency_edges: dependency_edges.clone(),
+            children: persisted_children.clone(),
+            source,
+        },
+    )?;
+
+    let children = persisted_children
+        .into_iter()
+        .map(|mut child| {
+            child.work_item.status_class = WorkItemStatusClass::Ready.as_str().to_string();
+            child.work_item.tracker_status = "open".to_string();
+            child.work_item.updated_at = now.to_string();
+            child
         })
+        .collect();
+    Ok(PersistedAppliedDecomposition {
+        children,
+        dependency_edges,
     })
 }
 
@@ -334,59 +422,47 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_dependency_edge_rolls_back_children_and_parent_links() {
+    fn dependency_materialization_failure_preserves_blocked_children_and_parent_links() {
         let mut db = open();
         let parent = seed_parent(&mut db);
         let proposal = proposal(parent);
 
-        let a = db
-            .create_work_item(NewWorkItem {
-                tracker_id: "github",
-                identifier: "OWNER/REPO#100",
-                parent_id: Some(parent),
-                title: "preexisting duplicate",
-                status_class: "ready",
-                tracker_status: "open",
-                assigned_role: None,
-                assigned_agent: None,
-                priority: None,
-                workspace_policy: None,
-                branch_policy: None,
-                now: NOW,
-            })
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_decomposition_blocks
+                 BEFORE INSERT ON work_item_edges
+                 WHEN NEW.edge_type = 'blocks'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'dependency edge write failed');
+                 END;",
+            )
             .unwrap();
-        let b = db
-            .create_work_item(NewWorkItem {
-                tracker_id: "github",
-                identifier: "OWNER/REPO#101",
-                parent_id: Some(parent),
-                title: "preexisting duplicate",
-                status_class: "ready",
-                tracker_status: "open",
-                assigned_role: None,
-                assigned_agent: None,
-                priority: None,
-                workspace_policy: None,
-                branch_policy: None,
-                now: NOW,
-            })
-            .unwrap();
-        db.create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
-            blocker_id: a.id,
-            blocked_id: b.id,
-            reason: "preexisting",
-            now: NOW,
-        }])
-        .unwrap();
 
         let err = persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
-            .expect_err("duplicate natural key rolls back");
-        assert!(matches!(err, StateError::Sqlite(_)));
-        assert_eq!(
-            db.list_outgoing(parent, EdgeType::ParentChild)
-                .unwrap()
-                .len(),
-            0
-        );
+            .expect_err("dependency write fails after children");
+
+        let PersistAppliedDecompositionError::DependencyMaterializationFailed { children, source } =
+            err
+        else {
+            panic!("expected partial dependency failure");
+        };
+        assert!(matches!(source, StateError::Sqlite(_)));
+        assert_eq!(children.len(), 3);
+        assert!(children.iter().all(|child| {
+            child.work_item.status_class == WorkItemStatusClass::Blocked.as_str()
+                && child.work_item.tracker_status == "blocked"
+        }));
+
+        let parent_children = db.list_outgoing(parent, EdgeType::ParentChild).unwrap();
+        assert_eq!(parent_children.len(), 3);
+        let child_ids: Vec<WorkItemId> = children.iter().map(|child| child.work_item.id).collect();
+        for child in children {
+            let stored = db.get_work_item(child.work_item.id).unwrap().unwrap();
+            assert_eq!(stored.status_class, WorkItemStatusClass::Blocked.as_str());
+            assert_eq!(stored.tracker_status, "blocked");
+        }
+        for child_id in child_ids {
+            assert!(db.list_incoming_open_blockers(child_id).unwrap().is_empty());
+        }
     }
 }
