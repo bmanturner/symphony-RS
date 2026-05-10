@@ -95,7 +95,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 10 — Documentation
 
-- [ ] Document dependency edge direction and examples in `docs/workflow.md`.
-- [ ] Document Linear vs GitHub dependency capability behavior.
-- [ ] Document `decomposition.dependency_policy` defaults and failure modes.
-- [ ] Document operator interpretation of dependency graph/status output.
+- [x] Document dependency edge direction and examples in `docs/workflow.md`.
+- [x] Document Linear vs GitHub dependency capability behavior.
+- [x] Document `decomposition.dependency_policy` defaults and failure modes.
+- [x] Document operator interpretation of dependency graph/status output.

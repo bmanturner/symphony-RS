@@ -157,6 +157,11 @@ decomposition:
   # keeps parent links advisory/local-only instead of pretending they
   # are tracker-native.
   child_issue_policy: propose_for_approval
+  dependency_policy:
+    materialize_edges: true
+    tracker_sync: best_effort
+    dispatch_gate: true
+    auto_resolve_on_terminal: true
   max_depth: 2
   require_acceptance_criteria_per_child: true
 
@@ -300,6 +305,31 @@ Work from the structured run context. Specialists own scoped child work, the int
 `routing` maps normalized work items to roles. `first_match` uses file order. `priority` chooses the matching rule with the highest `priority`.
 
 `decomposition` controls when broad issues become child issues. The `owner_role` must be an `integration_owner` when decomposition is enabled. `child_issue_policy` is either `create_directly` or `propose_for_approval`.
+
+`decomposition.dependency_policy` controls how `ChildProposal.depends_on` becomes durable sequencing. Defaults are:
+
+```yaml
+dependency_policy:
+  materialize_edges: true
+  tracker_sync: best_effort
+  dispatch_gate: true
+  auto_resolve_on_terminal: true
+```
+
+Edge direction is always prerequisite to dependent. If a proposal says `api depends_on: [schema]`, Symphony stores an open `blocks` edge with `parent_id = schema_work_item_id`, `child_id = api_work_item_id`, `source = decomposition`, and reason similar to `api depends on schema`. While that edge is open, the specialist queue parks `api`; root children with no incoming open blockers can dispatch in parallel. When `schema` reaches a terminal status class and tracker state does not contradict local state, reconciliation resolves the decomposition edge and `api` becomes eligible on the next tick.
+
+`tracker_sync` accepts `required`, `best_effort`, or `local_only`. `required` fails workflow validation unless the tracker advertises structural blocker support. `best_effort` keeps local Symphony blockers authoritative and records failed tracker syncs as retryable state. `local_only` skips tracker blocker mutation entirely and uses the durable local graph as the sequencing source.
+
+Linear can create native blocker relations, so Linear workflows may use `tracker_sync: required` when native tracker enforcement is desired. Standard GitHub Issues does not have structural parent/child or blocker edges in this implementation; labels, body text, and comments are advisory only. GitHub workflows that need sequencing should use `best_effort` or `local_only`, with Symphony's local `work_item_edges` enforcing dispatch order.
+
+Operators can inspect dependency state with:
+
+```bash
+cargo run -p symphony-cli -- issue graph <work_item_id> --state-db symphony.sqlite3
+cargo run -p symphony-cli -- issue graph <work_item_id> --state-db symphony.sqlite3 --json
+```
+
+For each blocker edge, `issue graph` shows the peer issue, reason, source, local edge status, tracker sync status, and next action. Failed dependency syncs surface as `tracker_sync_status = failed` with `next_action = retry_tracker_sync`; local-only edges show `next_action = wait_for_local_resolution`.
 
 `workspace` declares named workspace strategies. `git_worktree` creates isolated worktrees. `existing_worktree` reuses a known path and verifies its branch. `shared_branch` is only legal when `branching.allow_same_branch_for_children` is true.
 
