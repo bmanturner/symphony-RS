@@ -83,9 +83,9 @@ mock agent.
 
 ## Phase 7 — `file_followup` Write Tool
 
-- [ ] Implement `FileFollowupHandler` mirroring the `followups_created_or_proposed` block of the canonical handoff.
-- [ ] Honor the workflow's follow-up policy (`SPEC_v2.md` §6).
-- [ ] Add tests covering: direct creation when policy allows, proposal-for-approval when policy requires.
+- [x] Implement `FileFollowupHandler` mirroring the `followups_created_or_proposed` block of the canonical handoff.
+- [x] Honor the workflow's follow-up policy (`SPEC_v2.md` §6).
+- [x] Add tests covering: direct creation when policy allows, proposal-for-approval when policy requires.
 
 ## Phase 8 — `add_issue_comment` Write Tool and `agent_comments` Table
 
