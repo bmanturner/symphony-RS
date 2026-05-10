@@ -397,16 +397,16 @@ On restart, expired leases become recoverable work.
 
 ### 7.3 Concurrency
 
-Concurrency limits apply at multiple levels:
+Concurrency limits apply at multiple levels. v2 ships with four scopes:
 
 - global;
 - role;
-- agent backend;
-- tracker/project;
-- repository/workspace;
-- integration branch.
+- agent backend (`AgentProfile`);
+- repository/workspace.
 
-Integration-owner roles should default to low concurrency, often `1`, because split-brain integration is worse than slow integration.
+Two further conceptual scopes — `tracker/project` and `integration branch` — are deferred pending product signal; see ADR "ConcurrencyGate ships with four scopes, not six" below for rationale.
+
+Integration-owner roles should default to low concurrency, often `1`, because split-brain integration is worse than slow integration. The role cap subsumes per-integration-branch capping in the default workflow.
 
 ## 8. Prompt and Tool Contract
 
@@ -553,6 +553,17 @@ Context: Phase 11's ancillary-runner gate-wiring decomposition asked whether `Re
 Decision: `RecoveryRunner` does not depend on `ConcurrencyGate`. Recovery passes consume only the runner-local semaphore (max-concurrent reconciliations) and the durable lease store; they do not call `ConcurrencyGate::try_acquire`. Downstream dispatches re-enter the gate through the gated runner that picks up the re-routed work item, so scope caps still bind end-to-end without recovery double-booking permits. This is enforced by recovery_runner's module-level "Concurrency-gate exemption" comment and by `recovery_pass_does_not_consume_scope_permits` plus `downstream_dispatch_still_acquires_permits_after_recovery_pass`.
 
 Consequence: A noisy reconciliation storm (e.g. a wave of expired leases) cannot stall on a saturated role cap that recovery itself is trying to drain — recovery is the unblocker, not another permit-holder. The trade-off is that operators cannot directly cap "recovery throughput" via `ConcurrencyConfig`; the runner's `max_concurrent` knob and the durable lease store are the only bounds. If a future workflow needs to cap recovery throughput per repository (e.g. to avoid hammering a single Git host), it should be added as a recovery-runner-local knob rather than wired through `ConcurrencyGate`, to preserve the no-double-booking invariant.
+
+### 2026-05-09 — `ConcurrencyGate` ships with four scopes, not six
+
+Context: §7.3 above enumerates six conceptual concurrency scopes (global, role, agent backend, tracker/project, repository/workspace, integration branch). Phase 11's `ConcurrencyConfig` and `ConcurrencyGate` ship with four: `Global`, `Role`, `AgentProfile`, `Repository`. The two missing scopes (`tracker/project`, `integration branch`) need an explicit decision so the gap is not read as an unfinished checklist item.
+
+Decision: Treat the four-scope surface as the intended product surface for v2. Justification per scope:
+
+- **Tracker/project** is a deployment-shape concern, not a workflow-shape concern. A given Symphony deployment typically targets one tracker project at a time; multi-tracker deployments are out of scope for v2 and have no current product signal. If a future deployment needs to bound traffic per tracker project, it can be added as a fifth scope without breaking the existing `ScopeKind` enum or any persisted `ScopeCapReached` events.
+- **Integration branch** is functionally subsumed by the existing `Role` scope. Integration-owner roles default to `max_concurrent: 1` precisely so split-brain integration is impossible (§7.3 final paragraph). A separate per-integration-branch cap would only matter in workflows that run multiple integration owners against the same repository in parallel, which the role-cap=1 default already forbids. Workflows that intentionally allow concurrent integration on disjoint branches can rely on the existing `Repository` scope.
+
+Consequence: `ScopeKind` stays at four variants; `ConcurrencyConfig` does not need to grow. If a real workflow surfaces the need for either scope, it lands as a focused additive change with its own ADR. The §7.3 enumeration is updated to reflect this — the two omitted scopes are noted there as deferred pending product signal.
 
 ### 2026-05-09 — `ScopeCapReached` events are deduplicated per contention episode
 
