@@ -262,6 +262,10 @@ pub struct IssueGraphArgs {
     #[arg(value_name = "ID")]
     pub id: i64,
 
+    /// Emit a stable machine-readable dependency graph document.
+    #[arg(long = "json")]
+    pub json: bool,
+
     /// Path to the durable state SQLite database. Must already exist —
     /// `issue graph` is a read-only command and refuses to create a
     /// database on demand for the same reason `symphony cancel` does:

@@ -80,11 +80,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 8 — Observability and Operator Surface
 
-- [ ] Extend `symphony issue graph <id>` / status output to show parent/child/dependency blocker graph.
-- [ ] Show for each blocked child: blocker identifier/title, reason, source, local edge status, tracker sync status, and next action.
-- [ ] Surface failed dependency-edge sync as durable, visible, retryable state.
-- [ ] Add JSON output for dependency graph status.
-- [ ] Add tests/snapshots for the SPEC v3 sample graph display.
+- [x] Extend `symphony issue graph <id>` / status output to show parent/child/dependency blocker graph.
+- [x] Show for each blocked child: blocker identifier/title, reason, source, local edge status, tracker sync status, and next action.
+- [x] Surface failed dependency-edge sync as durable, visible, retryable state.
+- [x] Add JSON output for dependency graph status.
+- [x] Add tests/snapshots for the SPEC v3 sample graph display.
 
 ## Phase 9 — End-to-End Scenarios
 

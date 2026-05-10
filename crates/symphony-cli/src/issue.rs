@@ -32,6 +32,7 @@
 
 use std::path::PathBuf;
 
+use serde::Serialize;
 use symphony_state::edges::{EdgeType, WorkItemEdgeRecord, WorkItemEdgeRepository};
 use symphony_state::repository::{WorkItemId, WorkItemRecord, WorkItemRepository};
 use symphony_state::{StateDb, StateError};
@@ -42,18 +43,32 @@ use crate::cli::{IssueCommand, IssueGraphArgs};
 #[derive(Debug)]
 pub enum GraphOutcome {
     /// Root and edges were fetched.
-    Ok(Box<GraphSnapshot>),
+    Ok {
+        /// Snapshot to render.
+        snapshot: Box<GraphSnapshot>,
+        /// Output format requested by the operator.
+        format: GraphRenderFormat,
+    },
     /// The requested `<ID>` does not exist in `work_items`.
     NotFound { id: WorkItemId, db_path: PathBuf },
     /// The state database could not be opened or queried.
     StateDbFailed { db_path: PathBuf, error: StateError },
 }
 
+/// Output format for `symphony issue graph`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphRenderFormat {
+    /// Human-readable terminal output.
+    Human,
+    /// Stable machine-readable JSON.
+    Json,
+}
+
 impl GraphOutcome {
     /// Stable exit code; see module docs.
     pub fn exit_code(&self) -> i32 {
         match self {
-            GraphOutcome::Ok(_) => 0,
+            GraphOutcome::Ok { .. } => 0,
             GraphOutcome::NotFound { .. } => 1,
             GraphOutcome::StateDbFailed { .. } => 2,
         }
@@ -112,7 +127,10 @@ pub fn run(cmd: &IssueCommand) -> GraphOutcome {
 /// return the caller's exit code.
 pub fn render(outcome: &GraphOutcome) -> i32 {
     match outcome {
-        GraphOutcome::Ok(snap) => render_snapshot(snap),
+        GraphOutcome::Ok { snapshot, format } => match format {
+            GraphRenderFormat::Human => render_snapshot(snapshot),
+            GraphRenderFormat::Json => render_snapshot_json(snapshot),
+        },
         GraphOutcome::NotFound { id, db_path } => {
             eprintln!(
                 "error: work item id {} not found in {}",
@@ -143,7 +161,14 @@ pub fn run_graph(args: &IssueGraphArgs) -> GraphOutcome {
     };
     let id = WorkItemId(args.id);
     match build_snapshot(&db, id) {
-        Ok(Some(snap)) => GraphOutcome::Ok(Box::new(snap)),
+        Ok(Some(snap)) => GraphOutcome::Ok {
+            snapshot: Box::new(snap),
+            format: if args.json {
+                GraphRenderFormat::Json
+            } else {
+                GraphRenderFormat::Human
+            },
+        },
         Ok(None) => GraphOutcome::NotFound {
             id,
             db_path: args.state_db.clone(),
@@ -287,6 +312,103 @@ fn render_snapshot(snap: &GraphSnapshot) {
     section("relates_to (incoming)", &snap.relates_to_in, ArrowDir::From);
 }
 
+fn render_snapshot_json(snap: &GraphSnapshot) {
+    let doc = GraphJson::from_snapshot(snap);
+    let s = serde_json::to_string_pretty(&doc).expect("graph JSON is serializable");
+    println!("{s}");
+}
+
+#[derive(Debug, Serialize)]
+struct GraphJson {
+    root: WorkItemJson,
+    parents: Vec<EdgeJson>,
+    children: Vec<EdgeJson>,
+    blocked_by: Vec<EdgeJson>,
+    blocks: Vec<EdgeJson>,
+    followup_origin: Vec<EdgeJson>,
+    followups: Vec<EdgeJson>,
+    relates_to_out: Vec<EdgeJson>,
+    relates_to_in: Vec<EdgeJson>,
+}
+
+impl GraphJson {
+    fn from_snapshot(snap: &GraphSnapshot) -> Self {
+        Self {
+            root: WorkItemJson::from_record(&snap.root),
+            parents: edges_json(&snap.parents),
+            children: edges_json(&snap.children),
+            blocked_by: edges_json(&snap.blocked_by),
+            blocks: edges_json(&snap.blocks),
+            followup_origin: edges_json(&snap.followup_origin),
+            followups: edges_json(&snap.followups),
+            relates_to_out: edges_json(&snap.relates_to_out),
+            relates_to_in: edges_json(&snap.relates_to_in),
+        }
+    }
+}
+
+fn edges_json(edges: &[EdgeWithPeer]) -> Vec<EdgeJson> {
+    edges.iter().map(EdgeJson::from_edge).collect()
+}
+
+#[derive(Debug, Serialize)]
+struct WorkItemJson {
+    id: i64,
+    tracker_id: String,
+    identifier: String,
+    title: String,
+    status_class: String,
+    tracker_status: String,
+}
+
+impl WorkItemJson {
+    fn from_record(row: &WorkItemRecord) -> Self {
+        Self {
+            id: row.id.0,
+            tracker_id: row.tracker_id.clone(),
+            identifier: row.identifier.clone(),
+            title: row.title.clone(),
+            status_class: row.status_class.clone(),
+            tracker_status: row.tracker_status.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EdgeJson {
+    edge_id: i64,
+    edge_type: String,
+    source: String,
+    local_edge_status: String,
+    reason: Option<String>,
+    tracker_edge_id: Option<String>,
+    tracker_sync_status: Option<String>,
+    tracker_sync_last_error: Option<String>,
+    tracker_sync_attempts: i64,
+    tracker_sync_last_attempt_at: Option<String>,
+    next_action: String,
+    peer: WorkItemJson,
+}
+
+impl EdgeJson {
+    fn from_edge(edge: &EdgeWithPeer) -> Self {
+        Self {
+            edge_id: edge.edge.id.0,
+            edge_type: edge.edge.edge_type.as_str().to_string(),
+            source: edge.edge.source.as_str().to_string(),
+            local_edge_status: edge.edge.status.clone(),
+            reason: edge.edge.reason.clone(),
+            tracker_edge_id: edge.edge.tracker_edge_id.clone(),
+            tracker_sync_status: edge.edge.tracker_sync_status.clone(),
+            tracker_sync_last_error: edge.edge.tracker_sync_last_error.clone(),
+            tracker_sync_attempts: edge.edge.tracker_sync_attempts,
+            tracker_sync_last_attempt_at: edge.edge.tracker_sync_last_attempt_at.clone(),
+            next_action: next_action(&edge.edge).to_string(),
+            peer: WorkItemJson::from_record(&edge.peer),
+        }
+    }
+}
+
 #[derive(Copy, Clone)]
 enum ArrowDir {
     /// Edge points away from the root (`root → peer`).
@@ -319,15 +441,33 @@ fn section(title: &str, edges: &[EdgeWithPeer], dir: ArrowDir) {
             .map(|r| format!("  ({r})"))
             .unwrap_or_default();
         println!(
-            "    {arrow} {}  [{}]  [{}]  {}/{}  {}{}",
+            "    {arrow} {}  [{}]  [{}]  source={} sync={} next={}  {}/{}  {}{}",
             peer.id.0,
             e.edge.status,
             peer.status_class,
+            e.edge.source.as_str(),
+            e.edge
+                .tracker_sync_status
+                .as_deref()
+                .unwrap_or("unattempted"),
+            next_action(&e.edge),
             peer.tracker_id,
             peer.identifier,
             peer.title,
             reason,
         );
+    }
+}
+
+fn next_action(edge: &WorkItemEdgeRecord) -> &'static str {
+    if edge.edge_type != EdgeType::Blocks || edge.status != "open" {
+        return "observe";
+    }
+    match edge.tracker_sync_status.as_deref() {
+        Some("failed") => "retry_tracker_sync",
+        Some("local_only") => "wait_for_local_resolution",
+        Some("synced") => "wait_for_blocker_resolution",
+        _ => "record_tracker_sync_state",
     }
 }
 
@@ -394,6 +534,7 @@ mod tests {
         let (_dir, path) = fresh_db();
         let outcome = run_graph(&IssueGraphArgs {
             id: 99_999,
+            json: false,
             state_db: path.clone(),
         });
         match outcome {
@@ -409,6 +550,7 @@ mod tests {
     fn unreadable_state_db_yields_state_db_failed() {
         let outcome = run_graph(&IssueGraphArgs {
             id: 1,
+            json: false,
             state_db: PathBuf::from("/no/such/dir/state.db"),
         });
         match outcome {
@@ -427,10 +569,11 @@ mod tests {
         };
         let outcome = run_graph(&IssueGraphArgs {
             id: id.0,
+            json: false,
             state_db: path,
         });
         let snap = match outcome {
-            GraphOutcome::Ok(s) => s,
+            GraphOutcome::Ok { snapshot, .. } => snapshot,
             other => panic!("expected Ok, got {other:?}"),
         };
         assert_eq!(snap.root.identifier, "ENG-1");
@@ -528,10 +671,11 @@ mod tests {
 
         let outcome = run_graph(&IssueGraphArgs {
             id: root.0,
+            json: false,
             state_db: path,
         });
         let snap = match outcome {
-            GraphOutcome::Ok(s) => s,
+            GraphOutcome::Ok { snapshot, .. } => snapshot,
             other => panic!("expected Ok, got {other:?}"),
         };
 
@@ -564,8 +708,60 @@ mod tests {
         };
         let outcome = run_graph(&IssueGraphArgs {
             id: id.0,
+            json: false,
             state_db: path,
         });
         assert_eq!(render(&outcome), 0);
+    }
+
+    #[test]
+    fn graph_json_includes_dependency_status_and_next_action() {
+        let (_dir, path) = fresh_db();
+        let root;
+        let blocker;
+        {
+            let mut db = StateDb::open(&path).unwrap();
+            root = seed(&mut db, "ENG-1", "api", "blocked");
+            blocker = seed(&mut db, "ENG-2", "schema", "done");
+            let edge = db
+                .create_edge(NewWorkItemEdge {
+                    parent_id: blocker,
+                    child_id: root,
+                    edge_type: EdgeType::Blocks,
+                    reason: Some("api depends on schema"),
+                    status: "open",
+                    source: EdgeSource::Decomposition,
+                    now: "2026-05-08T00:00:00Z",
+                })
+                .unwrap();
+            db.record_tracker_edge_sync_failure(symphony_state::edges::TrackerEdgeSyncFailure {
+                edge_id: edge.id,
+                error: "Linear unavailable",
+                attempted_at: "2026-05-08T00:01:00Z",
+            })
+            .unwrap();
+        }
+
+        let outcome = run_graph(&IssueGraphArgs {
+            id: root.0,
+            json: true,
+            state_db: path,
+        });
+        let snap = match outcome {
+            GraphOutcome::Ok { snapshot, format } => {
+                assert_eq!(format, GraphRenderFormat::Json);
+                snapshot
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let doc = GraphJson::from_snapshot(&snap);
+        let value = serde_json::to_value(doc).unwrap();
+
+        assert_eq!(value["root"]["identifier"], "ENG-1");
+        assert_eq!(value["blocked_by"][0]["source"], "decomposition");
+        assert_eq!(value["blocked_by"][0]["local_edge_status"], "open");
+        assert_eq!(value["blocked_by"][0]["tracker_sync_status"], "failed");
+        assert_eq!(value["blocked_by"][0]["next_action"], "retry_tracker_sync");
+        assert_eq!(value["blocked_by"][0]["peer"]["identifier"], "ENG-2");
     }
 }
