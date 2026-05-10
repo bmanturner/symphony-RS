@@ -506,7 +506,7 @@ mod tests {
     fn dependency_materialization_failure_preserves_blocked_children_and_parent_links() {
         let mut db = open();
         let parent = seed_parent(&mut db);
-        let proposal = proposal(parent);
+        let mut proposal = proposal(parent);
 
         db.conn()
             .execute_batch(
@@ -537,6 +537,34 @@ mod tests {
         let parent_children = db.list_outgoing(parent, EdgeType::ParentChild).unwrap();
         assert_eq!(parent_children.len(), 3);
         let child_ids: Vec<WorkItemId> = children.iter().map(|child| child.work_item.id).collect();
+        let created_ids = children
+            .iter()
+            .map(|child| {
+                (
+                    child.key.clone(),
+                    symphony_core::work_item::WorkItemId::new(child.work_item.id.0),
+                )
+            })
+            .collect();
+        let apply_err = proposal
+            .mark_applied(
+                created_ids,
+                DependencyApplicationEvidence {
+                    persisted_edge_count: 0,
+                    tracker_sync_required: false,
+                    tracker_sync_record_count: 0,
+                },
+            )
+            .expect_err("missing dependency evidence keeps proposal non-terminal");
+        assert_eq!(
+            apply_err,
+            symphony_core::decomposition::DecompositionError::MissingDependencyEdges {
+                expected: 2,
+                actual: 0
+            }
+        );
+        assert_eq!(proposal.status, DecompositionStatus::Approved);
+
         for child in children {
             let stored = db.get_work_item(child.work_item.id).unwrap().unwrap();
             assert_eq!(stored.status_class, WorkItemStatusClass::Blocked.as_str());

@@ -37,7 +37,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Prevent a decomposition proposal from being marked fully applied until dependency edges are persisted and, when required, tracker sync state is recorded.
 - [x] Add tests for successful `A -> B -> C` child creation plus local `blocks` edge materialization.
 - [x] Add tests for mixed parallel/sequential graph materialization.
-- [ ] Add tests for partial failure: child issue created, dependency edge creation fails, decomposition remains partial/blocked and no unsafe child dispatch occurs.
+- [x] Add tests for partial failure: child issue created, dependency edge creation fails, decomposition remains partial/blocked and no unsafe child dispatch occurs.
 
 ## Phase 4 — Tracker Dependency Sync
 
