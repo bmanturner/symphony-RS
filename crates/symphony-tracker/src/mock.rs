@@ -32,7 +32,7 @@ use crate::TrackerRead;
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use symphony_core::tracker::{Issue, IssueId, IssueState};
+use symphony_core::tracker::{Issue, IssueComment, IssueId, IssueState, RelatedIssues};
 use symphony_core::tracker_trait::{TrackerError, TrackerResult};
 
 /// One recorded invocation against a [`MockTracker`].
@@ -86,6 +86,8 @@ struct MockState {
     terminal_errors: VecDeque<TrackerError>,
     /// Recorded invocation log, in arrival order.
     calls: Vec<MockCall>,
+    comments: HashMap<String, Vec<IssueComment>>,
+    related: HashMap<String, RelatedIssues>,
 }
 
 /// Programmable in-memory tracker.
@@ -143,6 +145,18 @@ impl MockTracker {
     /// held it"; this setter exists so tests can model that transition.
     pub fn set_state_lookup(&self, issue: Issue) {
         self.lock().by_id.insert(issue.id.clone(), issue);
+    }
+
+    /// Set comments returned by `list_comments` for an id or identifier.
+    pub fn set_comments(&self, id_or_identifier: impl Into<String>, comments: Vec<IssueComment>) {
+        self.lock()
+            .comments
+            .insert(id_or_identifier.into(), comments);
+    }
+
+    /// Set related issues returned by `get_related` for an id or identifier.
+    pub fn set_related(&self, id_or_identifier: impl Into<String>, related: RelatedIssues) {
+        self.lock().related.insert(id_or_identifier.into(), related);
     }
 
     /// Push a transport-style error to the front of the `fetch_active`
@@ -233,6 +247,40 @@ impl TrackerRead for MockTracker {
             .cloned()
             .collect();
         Ok(filtered)
+    }
+
+    async fn get_issue(&self, id_or_identifier: &str) -> TrackerResult<Issue> {
+        let g = self.lock();
+        g.by_id
+            .get(&IssueId::new(id_or_identifier))
+            .cloned()
+            .or_else(|| {
+                g.by_id
+                    .values()
+                    .find(|issue| issue.identifier == id_or_identifier)
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                TrackerError::Other(format!("mock issue `{id_or_identifier}` not found"))
+            })
+    }
+
+    async fn list_comments(&self, id_or_identifier: &str) -> TrackerResult<Vec<IssueComment>> {
+        Ok(self
+            .lock()
+            .comments
+            .get(id_or_identifier)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn get_related(&self, id_or_identifier: &str) -> TrackerResult<RelatedIssues> {
+        Ok(self
+            .lock()
+            .related
+            .get(id_or_identifier)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

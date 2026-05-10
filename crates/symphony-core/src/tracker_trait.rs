@@ -50,7 +50,7 @@
 //! "log_debug('keep workers running')" — so adapters should *not* panic
 //! or wrap unrelated errors as misconfiguration.
 
-use crate::tracker::{Issue, IssueId, IssueState};
+use crate::tracker::{Issue, IssueComment, IssueId, IssueState, RelatedIssues};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -93,6 +93,11 @@ pub enum TrackerError {
     /// variants above. Used sparingly; prefer the specific variants.
     #[error("tracker error: {0}")]
     Other(String),
+
+    /// Optional read/mutation capability is not implemented by this
+    /// adapter.
+    #[error("tracker capability unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Convenience alias used throughout the trait surface.
@@ -253,6 +258,27 @@ pub trait TrackerRead: Send + Sync {
         &self,
         terminal_states: &[IssueState],
     ) -> TrackerResult<Vec<Issue>>;
+
+    /// Fetch a single issue by tracker id or human identifier.
+    async fn get_issue(&self, _id_or_identifier: &str) -> TrackerResult<Issue> {
+        Err(TrackerError::Unsupported(
+            "get_issue_details is not supported by this tracker".into(),
+        ))
+    }
+
+    /// Return tracker comments for an issue.
+    async fn list_comments(&self, _id_or_identifier: &str) -> TrackerResult<Vec<IssueComment>> {
+        Err(TrackerError::Unsupported(
+            "list_comments is not supported by this tracker".into(),
+        ))
+    }
+
+    /// Return full parent/children/blocker context for an issue.
+    async fn get_related(&self, _id_or_identifier: &str) -> TrackerResult<RelatedIssues> {
+        Err(TrackerError::Unsupported(
+            "get_related_issues is not supported by this tracker".into(),
+        ))
+    }
 
     /// Report the adapter's mutation capability bag (SPEC v2 §7.2).
     ///

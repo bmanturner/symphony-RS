@@ -143,6 +143,31 @@ pub struct BlockerRef {
     pub state: Option<IssueState>,
 }
 
+/// Minimal tracker comment shape returned by v5 read tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueComment {
+    /// Tracker-native comment id.
+    pub id: String,
+    /// Display name or login of the author.
+    pub author: String,
+    /// Comment body, usually Markdown.
+    pub body: String,
+    /// Tracker-created timestamp, when exposed.
+    pub created_at: Option<String>,
+}
+
+/// Full related-issue context returned by the v5 `get_related_issues`
+/// read tool.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RelatedIssues {
+    /// Structural parent, if known.
+    pub parent: Option<Issue>,
+    /// Structural children, if known.
+    pub children: Vec<Issue>,
+    /// Issues that block the requested issue.
+    pub blockers: Vec<Issue>,
+}
+
 /// Normalized issue record exchanged between trackers and the orchestrator.
 ///
 /// This is the canonical representation defined in SPEC §4.1.1. Construct

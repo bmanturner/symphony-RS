@@ -42,16 +42,16 @@ mock agent.
 
 ## Phase 3 — Read Tools
 
-- [ ] Extend `TrackerRead` (in `crates/symphony-core/src/tracker_trait.rs`) with `list_comments` and `get_related` default-implemented methods returning `TrackerError::Unsupported`.
+- [x] Extend `TrackerRead` (in `crates/symphony-core/src/tracker_trait.rs`) with `list_comments` and `get_related` default-implemented methods returning `TrackerError::Unsupported`.
 - [ ] Implement `list_comments` on the Linear and GitHub adapters.
 - [ ] Implement `get_related` on the Linear and GitHub adapters.
-- [ ] Add the `IssueComment` typed shape (author, body, created_at, id) and the `RelatedIssues` typed shape (parent, children, blockers) to `symphony-core::tracker`.
-- [ ] Implement `get_issue_details` MCP handler — pure pass-through to `TrackerRead::get_issue`.
-- [ ] Implement `list_comments` MCP handler.
-- [ ] Implement `get_related_issues` MCP handler.
-- [ ] Implement `list_available_roles` MCP handler — calls `RoleCatalogBuilder::build` (v4) for the live workflow and returns the typed `RoleCatalog`.
-- [ ] Add tests proving each read handler returns the expected shape against fixture trackers.
-- [ ] Add a tests proving capability-gated read handlers refuse with `ToolError::CapabilityUnsupported` when the adapter does not advertise the capability.
+- [x] Add the `IssueComment` typed shape (author, body, created_at, id) and the `RelatedIssues` typed shape (parent, children, blockers) to `symphony-core::tracker`.
+- [x] Implement `get_issue_details` MCP handler — pure pass-through to `TrackerRead::get_issue`.
+- [x] Implement `list_comments` MCP handler.
+- [x] Implement `get_related_issues` MCP handler.
+- [x] Implement `list_available_roles` MCP handler — calls `RoleCatalogBuilder::build` (v4) for the live workflow and returns the typed `RoleCatalog`.
+- [x] Add tests proving each read handler returns the expected shape against fixture trackers.
+- [x] Add a tests proving capability-gated read handlers refuse with `ToolError::CapabilityUnsupported` when the adapter does not advertise the capability.
 
 ## Phase 4 — `propose_decomposition` Write Tool
 

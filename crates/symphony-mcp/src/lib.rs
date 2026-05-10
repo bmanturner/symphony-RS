@@ -7,6 +7,7 @@
 //! tools land.
 
 pub mod handler;
+pub mod read_tools;
 pub mod registry;
 pub mod server;
 
