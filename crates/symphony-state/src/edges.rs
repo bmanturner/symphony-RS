@@ -762,6 +762,54 @@ mod tests {
     }
 
     #[test]
+    fn decomposition_blocker_direction_is_visible_from_repository_queries() {
+        let mut db = open();
+        let migration = seed_item(&mut db, "ENG-1");
+        let api = seed_item(&mut db, "ENG-2");
+
+        let edge = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: migration,
+                blocked_id: api,
+                reason: "api depends on migration",
+                now: "2026-05-08T00:00:00Z",
+            }])
+            .expect("create dependency blocker")
+            .pop()
+            .expect("edge should be returned");
+
+        assert_eq!(edge.parent_id, migration);
+        assert_eq!(edge.child_id, api);
+
+        assert_eq!(
+            db.list_outgoing(migration, EdgeType::Blocks)
+                .unwrap()
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![edge.id]
+        );
+        assert_eq!(
+            db.list_incoming(api, EdgeType::Blocks)
+                .unwrap()
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![edge.id]
+        );
+        assert!(
+            db.list_incoming(migration, EdgeType::Blocks)
+                .unwrap()
+                .is_empty(),
+            "the prerequisite child must not appear blocked by its dependent"
+        );
+        assert!(
+            db.list_outgoing(api, EdgeType::Blocks).unwrap().is_empty(),
+            "the waiting child must not appear to block its prerequisite"
+        );
+    }
+
+    #[test]
     fn create_decomposition_blocker_edges_rolls_back_whole_batch_on_failure() {
         let mut db = open();
         let schema = seed_item(&mut db, "ENG-1");
