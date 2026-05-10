@@ -317,7 +317,7 @@ mod tests {
             work_item_id: work_item,
             role: "platform_lead",
             agent: "claude",
-            status: "succeeded",
+            status: "completed",
             workspace_claim_id: None,
             now,
         })

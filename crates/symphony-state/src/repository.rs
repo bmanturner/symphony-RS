@@ -779,6 +779,28 @@ mod tests {
     }
 
     #[test]
+    fn create_run_round_trips_completed_status_label() {
+        let mut db = open();
+        let work_item = db
+            .create_work_item(sample_work_item("ENG-1", "2026-05-08T00:00:00Z"))
+            .expect("work item");
+        let run = db
+            .create_run(NewRun {
+                work_item_id: work_item.id,
+                role: "platform_lead",
+                agent: "claude",
+                status: "completed",
+                workspace_claim_id: None,
+                now: "2026-05-08T00:00:00Z",
+            })
+            .expect("run");
+
+        let fetched = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(fetched.status, "completed");
+        assert_eq!(fetched, run);
+    }
+
+    #[test]
     fn create_run_rejects_orphan_work_item() {
         let mut db = open();
         let err = db

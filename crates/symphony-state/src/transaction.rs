@@ -632,7 +632,7 @@ mod tests {
 
         db.transaction(|tx| {
             assert!(tx.release_lease(run.id)?);
-            assert!(tx.update_run_status(run.id, "succeeded")?);
+            assert!(tx.update_run_status(run.id, "completed")?);
             tx.append_event(NewEvent {
                 event_type: "run.completed",
                 work_item_id: Some(wi.id),
@@ -645,7 +645,7 @@ mod tests {
         .expect("commit");
 
         let after = db.get_run(run.id).unwrap().unwrap();
-        assert_eq!(after.status, "succeeded");
+        assert_eq!(after.status, "completed");
         assert!(after.lease_owner.is_none());
         assert!(after.lease_expires_at.is_none());
         assert!(
@@ -681,7 +681,7 @@ mod tests {
         let _ = db
             .transaction::<_, ()>(|tx| {
                 tx.release_lease(run.id)?;
-                tx.update_run_status(run.id, "succeeded")?;
+                tx.update_run_status(run.id, "completed")?;
                 tx.append_event(NewEvent {
                     event_type: "run.completed",
                     work_item_id: Some(wi.id),
