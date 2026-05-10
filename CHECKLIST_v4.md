@@ -45,17 +45,17 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 4 — Production Prompt Assembly
 
-- [ ] Replace production legacy issue-only `run.rs::render_prompt` path with the richer `symphony-core::prompt::PromptContext` renderer or an equivalent strict v2/v4 renderer.
-- [ ] Add explicit prompt section types: global workflow instructions, role prompt, role SOUL, agent system prompt, issue context, parent/child graph, blockers, workspace/branch, acceptance criteria, output schema.
-- [ ] Ensure unknown prompt placeholders fail loud in v2/v4 production paths rather than being left silently unresolved.
-- [ ] Ensure transient issue context is kept separate from durable role doctrine in prompt construction and run metadata.
-- [ ] Add tests proving prompt assembly order is deterministic.
-- [ ] Add tests proving agent profile `system_prompt` is included but does not replace role instructions or SOUL.
-- [ ] Add tests proving prompt section provenance is included in run metadata.
-- [ ] Extend `PromptIssue` with the SPEC v4 §5.1 required fields: `labels`, `priority`, `created_at`, `updated_at`, and a `blocked_by` summary (count + identifiers). Surface them in every prompt that includes an `IssueContext` section.
-- [ ] Add tests proving `labels` reaches the platform-lead prompt so the agent can see what triggered decomposition (`DecompositionTriggers.labels_any`).
-- [ ] Add tests proving `blocked_by` summary appears in `IssueContext` and is distinct from kernel-tracked `PromptBlocker[]` entries.
-- [ ] Document the deferred-context contract: comments, assignee/reporter, attachments, and other tracker fields beyond §5.1 are NOT in the prompt and will be fetched on-demand via the `SPEC_v5.md` MCP read tools.
+- [x] Replace production legacy issue-only `run.rs::render_prompt` path with the richer `symphony-core::prompt::PromptContext` renderer or an equivalent strict v2/v4 renderer.
+- [x] Add explicit prompt section types: global workflow instructions, role prompt, role SOUL, agent system prompt, issue context, parent/child graph, blockers, workspace/branch, acceptance criteria, output schema.
+- [x] Ensure unknown prompt placeholders fail loud in v2/v4 production paths rather than being left silently unresolved.
+- [x] Ensure transient issue context is kept separate from durable role doctrine in prompt construction and run metadata.
+- [x] Add tests proving prompt assembly order is deterministic.
+- [x] Add tests proving agent profile `system_prompt` is included but does not replace role instructions or SOUL.
+- [x] Add tests proving prompt section provenance is included in run metadata.
+- [x] Extend `PromptIssue` with the SPEC v4 §5.1 required fields: `labels`, `priority`, `created_at`, `updated_at`, and a `blocked_by` summary (count + identifiers). Surface them in every prompt that includes an `IssueContext` section.
+- [x] Add tests proving `labels` reaches the platform-lead prompt so the agent can see what triggered decomposition (`DecompositionTriggers.labels_any`).
+- [x] Add tests proving `blocked_by` summary appears in `IssueContext` and is distinct from kernel-tracked `PromptBlocker[]` entries.
+- [x] Document the deferred-context contract: comments, assignee/reporter, attachments, and other tracker fields beyond §5.1 are NOT in the prompt and will be fetched on-demand via the `SPEC_v5.md` MCP read tools.
 
 ## Phase 5 — Role-Scoped Runtime Profile Resolution
 

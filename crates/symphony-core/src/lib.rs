@@ -175,8 +175,9 @@ pub use logical_queue::{LogicalQueue, QueueTickOutcome};
 pub use parent_close::{ChildSnapshot, ParentCloseError, check_parent_can_close};
 pub use poll_loop::{Dispatcher, PollLoop, PollLoopConfig, TickReport};
 pub use prompt::{
-    PromptBlocker, PromptChild, PromptContext, PromptIssue, PromptParent, PromptWorkspace,
-    RenderError, default_handoff_output_schema, render as render_prompt,
+    PromptAssembly, PromptBlockedBySummary, PromptBlocker, PromptChild, PromptContext, PromptIssue,
+    PromptParent, PromptSection, PromptSectionKind, PromptSectionMetadata, PromptSectionProvenance,
+    PromptWorkspace, RenderError, default_handoff_output_schema, render as render_prompt,
 };
 pub use pull_request::{
     PullRequestProvider, PullRequestRecord, PullRequestRecordError, PullRequestRecordId,

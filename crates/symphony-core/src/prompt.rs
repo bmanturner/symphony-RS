@@ -29,7 +29,10 @@
 //! missing):
 //!
 //! * `{{identifier}}`, `{{title}}`, `{{description}}`, `{{state}}`,
-//!   `{{branch_name}}`, `{{url}}` — from [`PromptIssue`].
+//!   `{{labels}}`, `{{priority}}`, `{{created_at}}`,
+//!   `{{updated_at}}`, `{{branch_name}}`, `{{url}}`,
+//!   `{{blocked_by}}`, `{{blocked_by.count}}`,
+//!   `{{blocked_by.identifiers}}` — from [`PromptIssue`].
 //! * `{{role.name}}`, `{{role.kind}}`, `{{role.authority}}` — from
 //!   [`PromptContext::role`]. `role.authority` renders as a sorted,
 //!   comma-separated list of the granted authority flags.
@@ -57,7 +60,7 @@ use std::path::PathBuf;
 
 use crate::blocker::{BlockerId, BlockerSeverity};
 use crate::role::{RoleAuthority, RoleContext};
-use crate::tracker::Issue;
+use crate::tracker::{BlockerRef, Issue};
 use crate::work_item::WorkItemId;
 
 /// Issue fields the prompt renderer needs.
@@ -75,10 +78,29 @@ pub struct PromptIssue {
     pub description: Option<String>,
     /// Raw tracker state string (e.g. `Todo`).
     pub state: String,
+    /// Lowercase-normalized tracker labels.
+    pub labels: Vec<String>,
+    /// Tracker priority, when exposed by the source backend.
+    pub priority: Option<i32>,
     /// Suggested branch name, when the tracker provides one.
     pub branch_name: Option<String>,
     /// Tracker-facing URL, when known.
     pub url: Option<String>,
+    /// Tracker-created timestamp, when exposed.
+    pub created_at: Option<String>,
+    /// Tracker-updated timestamp, when exposed.
+    pub updated_at: Option<String>,
+    /// Compact summary of tracker-sourced blocker relations.
+    pub blocked_by: PromptBlockedBySummary,
+}
+
+/// Compact tracker-sourced `blocked_by` summary for issue context.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptBlockedBySummary {
+    /// Number of tracker-sourced blockers.
+    pub count: usize,
+    /// Human-readable blocker identifiers, when available.
+    pub identifiers: Vec<String>,
 }
 
 impl PromptIssue {
@@ -89,9 +111,182 @@ impl PromptIssue {
             title: issue.title.clone(),
             description: issue.description.clone(),
             state: issue.state.to_string(),
+            labels: issue.labels.clone(),
+            priority: issue.priority,
             branch_name: issue.branch_name.clone(),
             url: issue.url.clone(),
+            created_at: issue.created_at.clone(),
+            updated_at: issue.updated_at.clone(),
+            blocked_by: PromptBlockedBySummary::from_blockers(&issue.blocked_by),
         }
+    }
+}
+
+impl PromptBlockedBySummary {
+    fn from_blockers(blockers: &[BlockerRef]) -> Self {
+        Self {
+            count: blockers.len(),
+            identifiers: blockers
+                .iter()
+                .filter_map(|blocker| {
+                    blocker
+                        .identifier
+                        .clone()
+                        .or_else(|| blocker.id.as_ref().map(ToString::to_string))
+                })
+                .collect(),
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.count == 0 {
+            return "0 blockers".to_string();
+        }
+        if self.identifiers.is_empty() {
+            return format!("{} blocker(s)", self.count);
+        }
+        format!("{} blocker(s): {}", self.count, self.identifiers.join(", "))
+    }
+}
+
+/// Prompt section kind used by v4 assembly and provenance metadata.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PromptSectionKind {
+    /// Global workflow prompt after strict placeholder rendering.
+    GlobalWorkflowInstructions,
+    /// Current role's loaded `role_prompt` file.
+    RolePrompt,
+    /// Current role's loaded `soul` file.
+    RoleSoul,
+    /// Agent profile `system_prompt`.
+    AgentSystemPrompt,
+    /// Current issue context.
+    IssueContext,
+    /// Parent/child graph context.
+    ParentChildGraph,
+    /// Open blocker context.
+    Blockers,
+    /// Workspace and branch context.
+    WorkspaceBranch,
+    /// Acceptance criteria.
+    AcceptanceCriteria,
+    /// Required output schema.
+    OutputSchema,
+    /// Generated platform-lead role catalog.
+    RoleCatalog,
+    /// Decomposition policy summary.
+    DecompositionPolicy,
+}
+
+impl PromptSectionKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::GlobalWorkflowInstructions => "Global Workflow Instructions",
+            Self::RolePrompt => "Role Instructions",
+            Self::RoleSoul => "Role Soul",
+            Self::AgentSystemPrompt => "Agent System Prompt",
+            Self::IssueContext => "Issue Context",
+            Self::ParentChildGraph => "Parent/Child Graph",
+            Self::Blockers => "Blockers",
+            Self::WorkspaceBranch => "Workspace/Branch",
+            Self::AcceptanceCriteria => "Acceptance Criteria",
+            Self::OutputSchema => "Output Schema",
+            Self::RoleCatalog => "Role Catalog",
+            Self::DecompositionPolicy => "Decomposition Policy",
+        }
+    }
+}
+
+/// Where a prompt section came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSectionProvenance {
+    /// Human-readable source, such as `WORKFLOW.md` or a role file path.
+    pub source: String,
+    /// Optional content hash for file-backed sections.
+    pub content_hash: Option<String>,
+}
+
+/// One typed prompt section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSection {
+    /// Section kind.
+    pub kind: PromptSectionKind,
+    /// Section body. Empty sections are skipped by [`PromptAssembly::render`].
+    pub content: String,
+    /// Source metadata for run/debug surfaces.
+    pub provenance: Option<PromptSectionProvenance>,
+}
+
+impl PromptSection {
+    /// Build a section with the canonical title for its kind.
+    pub fn new(kind: PromptSectionKind, content: impl Into<String>) -> Self {
+        Self {
+            kind,
+            content: content.into(),
+            provenance: None,
+        }
+    }
+
+    /// Attach provenance metadata.
+    pub fn with_provenance(mut self, provenance: PromptSectionProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+}
+
+/// Prompt section metadata suitable for run metadata/debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSectionMetadata {
+    /// Section kind.
+    pub kind: PromptSectionKind,
+    /// Section source, when known.
+    pub source: Option<String>,
+    /// Section content hash, when known.
+    pub content_hash: Option<String>,
+}
+
+/// Ordered prompt assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptAssembly {
+    /// Ordered prompt sections.
+    pub sections: Vec<PromptSection>,
+}
+
+impl PromptAssembly {
+    /// Construct from already-ordered sections.
+    pub fn new(sections: Vec<PromptSection>) -> Self {
+        Self { sections }
+    }
+
+    /// Render sections in order with deterministic headings.
+    pub fn render(&self) -> String {
+        self.sections
+            .iter()
+            .filter(|section| !section.content.trim().is_empty())
+            .map(|section| {
+                format!(
+                    "## {}\n{}",
+                    section.kind.title(),
+                    section.content.trim_end()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Metadata emitted alongside the run/debug surface.
+    pub fn section_metadata(&self) -> Vec<PromptSectionMetadata> {
+        self.sections
+            .iter()
+            .map(|section| PromptSectionMetadata {
+                kind: section.kind,
+                source: section.provenance.as_ref().map(|p| p.source.clone()),
+                content_hash: section
+                    .provenance
+                    .as_ref()
+                    .and_then(|p| p.content_hash.clone()),
+            })
+            .collect()
     }
 }
 
@@ -320,8 +515,19 @@ fn resolve_path(ctx: &PromptContext, path: &str) -> Result<String, RenderError> 
         ("title", []) => Ok(ctx.issue.title.clone()),
         ("description", []) => Ok(ctx.issue.description.clone().unwrap_or_default()),
         ("state", []) => Ok(ctx.issue.state.clone()),
+        ("labels", []) => Ok(ctx.issue.labels.join(", ")),
+        ("priority", []) => Ok(ctx
+            .issue
+            .priority
+            .map(|p| p.to_string())
+            .unwrap_or_default()),
         ("branch_name", []) => Ok(ctx.issue.branch_name.clone().unwrap_or_default()),
         ("url", []) => Ok(ctx.issue.url.clone().unwrap_or_default()),
+        ("created_at", []) => Ok(ctx.issue.created_at.clone().unwrap_or_default()),
+        ("updated_at", []) => Ok(ctx.issue.updated_at.clone().unwrap_or_default()),
+        ("blocked_by", []) => Ok(ctx.issue.blocked_by.render()),
+        ("blocked_by", ["count"]) => Ok(ctx.issue.blocked_by.count.to_string()),
+        ("blocked_by", ["identifiers"]) => Ok(ctx.issue.blocked_by.identifiers.join(", ")),
         ("output_schema", []) => Ok(ctx.output_schema.clone().unwrap_or_default()),
         ("role", [field]) => {
             let role = ctx.role.as_ref();
@@ -418,8 +624,17 @@ mod tests {
     fn issue() -> Issue {
         let mut i = Issue::minimal("id-1", "ENG-7", "Add fizz to buzz", "Todo");
         i.description = Some("steps:\n1. fizz\n2. buzz".into());
+        i.priority = Some(2);
+        i.labels = vec!["backend".into(), "epic".into()];
         i.branch_name = Some("feature/eng-7".into());
         i.url = Some("https://example.test/eng-7".into());
+        i.created_at = Some("2026-05-01T00:00:00Z".into());
+        i.updated_at = Some("2026-05-02T00:00:00Z".into());
+        i.blocked_by = vec![BlockerRef {
+            id: None,
+            identifier: Some("ENG-1".into()),
+            state: None,
+        }];
         i
     }
 
@@ -433,6 +648,36 @@ mod tests {
         assert!(out.contains("Branch: feature/eng-7"));
         assert!(out.contains("URL: https://example.test/eng-7"));
         assert!(out.contains("1. fizz"));
+    }
+
+    #[test]
+    fn issue_context_fields_include_labels_dates_priority_and_blocked_by_summary() {
+        let ctx = PromptContext::for_issue(&issue());
+        let tpl = "\
+labels={{labels}}
+priority={{priority}}
+created={{created_at}}
+updated={{updated_at}}
+blocked={{blocked_by}}
+blocked_count={{blocked_by.count}}
+blocked_ids={{blocked_by.identifiers}}";
+        let out = render(tpl, &ctx).unwrap();
+        assert!(out.contains("labels=backend, epic"));
+        assert!(out.contains("priority=2"));
+        assert!(out.contains("created=2026-05-01T00:00:00Z"));
+        assert!(out.contains("updated=2026-05-02T00:00:00Z"));
+        assert!(out.contains("blocked=1 blocker(s): ENG-1"));
+        assert!(out.contains("blocked_count=1"));
+        assert!(out.contains("blocked_ids=ENG-1"));
+    }
+
+    #[test]
+    fn labels_are_visible_to_platform_lead_prompt_context() {
+        let role = RoleContext::from_kind("platform_lead", RoleKind::IntegrationOwner);
+        let ctx = PromptContext::for_issue(&issue()).with_role(role);
+        let out = render("role={{role.name}}\nlabels={{labels}}", &ctx).unwrap();
+        assert!(out.contains("role=platform_lead"));
+        assert!(out.contains("labels=backend, epic"));
     }
 
     #[test]
@@ -606,6 +851,7 @@ mod tests {
             out,
             "blockers:\n- [high] schema not approved\n- [medium] vendor outage"
         );
+        assert_eq!(ctx.issue.blocked_by.render(), "1 blocker(s): ENG-1");
     }
 
     #[test]
@@ -735,5 +981,108 @@ Output schema:
         assert!(out.contains("- [critical] vendor outage"));
         assert!(out.contains("- tests pass"));
         assert!(out.contains("Output schema:\nSCHEMA"));
+    }
+
+    #[test]
+    fn prompt_assembly_renders_sections_in_declared_order() {
+        let assembly = PromptAssembly::new(vec![
+            PromptSection::new(PromptSectionKind::GlobalWorkflowInstructions, "global"),
+            PromptSection::new(PromptSectionKind::RolePrompt, "role prompt"),
+            PromptSection::new(PromptSectionKind::RoleSoul, "soul"),
+            PromptSection::new(PromptSectionKind::AgentSystemPrompt, "system"),
+            PromptSection::new(PromptSectionKind::IssueContext, "issue"),
+            PromptSection::new(PromptSectionKind::ParentChildGraph, "graph"),
+            PromptSection::new(PromptSectionKind::Blockers, "blockers"),
+            PromptSection::new(PromptSectionKind::WorkspaceBranch, "workspace"),
+            PromptSection::new(PromptSectionKind::AcceptanceCriteria, "acceptance"),
+            PromptSection::new(PromptSectionKind::OutputSchema, "schema"),
+        ]);
+
+        let rendered = assembly.render();
+        let expected_order = [
+            "## Global Workflow Instructions",
+            "## Role Instructions",
+            "## Role Soul",
+            "## Agent System Prompt",
+            "## Issue Context",
+            "## Parent/Child Graph",
+            "## Blockers",
+            "## Workspace/Branch",
+            "## Acceptance Criteria",
+            "## Output Schema",
+        ];
+        let mut last = 0;
+        for marker in expected_order {
+            let idx = rendered.find(marker).expect(marker);
+            assert!(idx >= last, "{marker} rendered out of order");
+            last = idx;
+        }
+    }
+
+    #[test]
+    fn agent_system_prompt_does_not_replace_role_doctrine_sections() {
+        let assembly = PromptAssembly::new(vec![
+            PromptSection::new(PromptSectionKind::RolePrompt, "Backend role prompt"),
+            PromptSection::new(PromptSectionKind::RoleSoul, "Backend soul"),
+            PromptSection::new(PromptSectionKind::AgentSystemPrompt, "Use concise output"),
+        ]);
+        let rendered = assembly.render();
+        assert!(rendered.contains("Backend role prompt"));
+        assert!(rendered.contains("Backend soul"));
+        assert!(rendered.contains("Use concise output"));
+    }
+
+    #[test]
+    fn prompt_section_provenance_is_available_for_run_metadata() {
+        let assembly = PromptAssembly::new(vec![
+            PromptSection::new(PromptSectionKind::RolePrompt, "Backend role prompt")
+                .with_provenance(PromptSectionProvenance {
+                    source: ".symphony/roles/backend/AGENTS.md".into(),
+                    content_hash: Some("abc123".into()),
+                }),
+            PromptSection::new(PromptSectionKind::IssueContext, "Issue ENG-7").with_provenance(
+                PromptSectionProvenance {
+                    source: "tracker".into(),
+                    content_hash: None,
+                },
+            ),
+        ]);
+        let metadata = assembly.section_metadata();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0].kind, PromptSectionKind::RolePrompt);
+        assert_eq!(
+            metadata[0].source.as_deref(),
+            Some(".symphony/roles/backend/AGENTS.md")
+        );
+        assert_eq!(metadata[0].content_hash.as_deref(), Some("abc123"));
+        assert_eq!(metadata[1].kind, PromptSectionKind::IssueContext);
+        assert_eq!(metadata[1].source.as_deref(), Some("tracker"));
+        assert_eq!(metadata[1].content_hash, None);
+    }
+
+    #[test]
+    fn issue_context_and_role_doctrine_remain_separate_sections() {
+        let assembly = PromptAssembly::new(vec![
+            PromptSection::new(PromptSectionKind::RolePrompt, "Durable backend doctrine")
+                .with_provenance(PromptSectionProvenance {
+                    source: ".symphony/roles/backend/AGENTS.md".into(),
+                    content_hash: Some("rolehash".into()),
+                }),
+            PromptSection::new(PromptSectionKind::IssueContext, "Transient issue ENG-7")
+                .with_provenance(PromptSectionProvenance {
+                    source: "tracker".into(),
+                    content_hash: None,
+                }),
+        ]);
+
+        let rendered = assembly.render();
+        assert!(rendered.contains("## Role Instructions\nDurable backend doctrine"));
+        assert!(rendered.contains("## Issue Context\nTransient issue ENG-7"));
+
+        let metadata = assembly.section_metadata();
+        assert_eq!(metadata[0].kind, PromptSectionKind::RolePrompt);
+        assert_eq!(metadata[0].content_hash.as_deref(), Some("rolehash"));
+        assert_eq!(metadata[1].kind, PromptSectionKind::IssueContext);
+        assert_eq!(metadata[1].source.as_deref(), Some("tracker"));
     }
 }

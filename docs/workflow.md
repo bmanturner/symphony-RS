@@ -314,6 +314,15 @@ metadata. Do not create parallel per-role `ASSIGNMENT.md` files for
 normal operation; they drift from the routing contract and are not the
 catalog source of truth.
 
+Prompt issue context is intentionally bounded. Every issue prompt can
+see `identifier`, `title`, `description`, `state`, `labels`,
+`priority`, `created_at`, `updated_at`, `branch_name`, `url`, and a
+compact `blocked_by` summary with count plus identifiers. Comments,
+assignee/reporter details, attachments, full blocker chains, and other
+tracker-native fields are deferred context; agents should fetch them
+on demand through the v5 MCP read tools instead of expecting them in
+the durable prompt.
+
 `decomposition` controls when broad issues become child issues. The `owner_role` must be an `integration_owner` when decomposition is enabled. `child_issue_policy` is either `create_directly` or `propose_for_approval`.
 
 `decomposition.dependency_policy` controls how `ChildProposal.depends_on` becomes durable sequencing. Defaults are:

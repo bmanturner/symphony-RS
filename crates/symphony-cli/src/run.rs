@@ -87,6 +87,9 @@ use symphony_config::{AgentKind, LayeredLoader, TrackerKind, WorkflowConfig};
 use symphony_core::agent::{AgentEvent, AgentRunner, CompletionReason, StartSessionParams};
 use symphony_core::event_bus::EventBus;
 use symphony_core::poll_loop::Dispatcher;
+use symphony_core::prompt::{
+    PromptContext, RenderError, default_handoff_output_schema, render as render_core_prompt,
+};
 use symphony_core::state_machine::ReleaseReason;
 use symphony_core::tracker::Issue;
 use symphony_core::tracker_trait::TrackerRead;
@@ -663,7 +666,7 @@ impl SymphonyDispatcher {
             .await
             .with_context(|| format!("before_run hook for {identifier}"))?;
 
-        let initial_prompt = render_prompt(&self.prompt_template, &issue);
+        let initial_prompt = render_prompt(&self.prompt_template, &issue)?;
         let issue_label = Some(format!("{}: {}", issue.identifier, issue.title));
 
         let session = self
@@ -750,36 +753,14 @@ fn release_for(reason: CompletionReason) -> ReleaseReason {
 // Prompt rendering
 // ---------------------------------------------------------------------------
 
-/// Substitute `{{var}}` placeholders in `template` against `issue`.
-///
-/// Deliberately tiny: SPEC §10.2 names a Tera-like template engine but
-/// that's not a v1 requirement, and the placeholders we emit here are
-/// the ones every fixture exercises (`identifier`, `title`,
-/// `description`, `state`, `branch_name`, `url`). A future checklist
-/// item can swap in a real templating crate; the call surface here
-/// (`(template, issue) -> String`) won't change.
-pub(crate) fn render_prompt(template: &str, issue: &Issue) -> String {
-    let mut out = template.to_string();
-    let pairs: [(&str, &str); 6] = [
-        ("{{identifier}}", issue.identifier.as_str()),
-        ("{{title}}", issue.title.as_str()),
-        (
-            "{{description}}",
-            issue.description.as_deref().unwrap_or(""),
-        ),
-        ("{{state}}", issue.state.as_str()),
-        (
-            "{{branch_name}}",
-            issue.branch_name.as_deref().unwrap_or(""),
-        ),
-        ("{{url}}", issue.url.as_deref().unwrap_or("")),
-    ];
-    for (k, v) in pairs {
-        if out.contains(k) {
-            out = out.replace(k, v);
-        }
-    }
-    out
+/// Strictly substitute `{{path}}` placeholders in `template` against
+/// the v4 [`PromptContext`] issue surface.
+pub(crate) fn render_prompt(
+    template: &str,
+    issue: &Issue,
+) -> std::result::Result<String, RenderError> {
+    let ctx = PromptContext::for_issue(issue).with_output_schema(default_handoff_output_schema());
+    render_core_prompt(template, &ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +783,7 @@ mod tests {
     #[test]
     fn render_prompt_substitutes_known_fields() {
         let tpl = "Issue {{identifier}}: {{title}}\nState: {{state}}\nBranch: {{branch_name}}\n{{description}}";
-        let out = render_prompt(tpl, &issue());
+        let out = render_prompt(tpl, &issue()).unwrap();
         assert!(out.contains("Issue ABC-7: Add fizz to buzz"));
         assert!(out.contains("State: Todo"));
         assert!(out.contains("Branch: feature/abc-7"));
@@ -810,11 +791,9 @@ mod tests {
     }
 
     #[test]
-    fn render_prompt_leaves_unknown_placeholders_alone() {
-        // We only substitute the small known set. A future templating
-        // engine swap should not silently delete unknown placeholders.
-        let out = render_prompt("hello {{nope}}", &issue());
-        assert_eq!(out, "hello {{nope}}");
+    fn render_prompt_rejects_unknown_placeholders() {
+        let err = render_prompt("hello {{nope}}", &issue()).unwrap_err();
+        assert_eq!(err, RenderError::UnknownPath("nope".into()));
     }
 
     #[test]
@@ -823,8 +802,27 @@ mod tests {
         i.description = None;
         i.branch_name = None;
         i.url = None;
-        let out = render_prompt("[{{description}}][{{branch_name}}][{{url}}]", &i);
+        let out = render_prompt("[{{description}}][{{branch_name}}][{{url}}]", &i).unwrap();
         assert_eq!(out, "[][][]");
+    }
+
+    #[test]
+    fn render_prompt_surfaces_labels_and_blocked_by_summary() {
+        let mut i = issue();
+        i.labels = vec!["epic".into(), "backend".into()];
+        i.blocked_by = vec![symphony_core::tracker::BlockerRef {
+            id: None,
+            identifier: Some("ABC-1".into()),
+            state: None,
+        }];
+        let out = render_prompt(
+            "labels={{labels}}\nblocked={{blocked_by}}\ncount={{blocked_by.count}}",
+            &i,
+        )
+        .unwrap();
+        assert!(out.contains("labels=epic, backend"));
+        assert!(out.contains("blocked=1 blocker(s): ABC-1"));
+        assert!(out.contains("count=1"));
     }
 
     #[test]
