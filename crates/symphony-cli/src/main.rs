@@ -15,6 +15,7 @@ mod cancel;
 mod cli;
 mod issue;
 mod logging;
+mod qa;
 mod run;
 mod scheduler;
 mod sse;
@@ -95,6 +96,15 @@ fn main() -> anyhow::Result<ExitCode> {
                     Ok(ExitCode::from(1))
                 }
             }
+        }
+        Some(Command::Qa(args)) => {
+            // `qa verdict` is read-only and synchronous: it opens the
+            // durable SQLite store, joins one work item with its
+            // verdict history, and prints the result. No tokio runtime
+            // needed.
+            let outcome = qa::run(&args.command);
+            let code = qa::render(&outcome);
+            Ok(ExitCode::from(code as u8))
         }
         Some(Command::Issue(args)) => {
             // `issue graph` is read-only and synchronous: it opens the

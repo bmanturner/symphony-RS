@@ -3691,6 +3691,7 @@ dependencies = [
  "predicates",
  "ratatui",
  "reqwest 0.12.28",
+ "rusqlite",
  "secrecy",
  "serde",
  "serde_json",

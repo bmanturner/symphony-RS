@@ -139,7 +139,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Persist every event before broadcasting.
 - [x] Update `symphony status` to read durable state, not only tracker snapshot.
 - [x] Add `symphony issue graph <id>` for parent/child/blocker graph.
-- [ ] Add `symphony qa verdict <id>` for QA evidence.
+- [x] Add `symphony qa verdict <id>` for QA evidence.
 - [ ] Add `symphony recover` CLI command that reconciles durable state with tracker/workspaces (per ARCHITECTURE_v2.md §4.7), surfacing reaped expired leases and orphaned workspace claims.
 - [ ] Add JSON output mode for status commands.
 - [ ] Move current `status` config under `observability.sse`, preserving bind and replay buffer, and stream from the durable event tail.

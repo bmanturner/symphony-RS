@@ -98,6 +98,60 @@ pub enum Command {
     /// edges without writing SQL — this group of subcommands serves that
     /// need.
     Issue(IssueArgs),
+
+    /// QA evidence inspection commands (SPEC v2 §4.9 / §5.12 / Phase 12).
+    ///
+    /// The QA gate writes one durable `qa_verdicts` row per dispatch with
+    /// the verdict, role authorship, optional waiver metadata, evidence,
+    /// and acceptance-criteria trace. This namespace lets operators read
+    /// those rows back without SQL — useful for audit ("what did QA
+    /// decide on ENG-101?") and for debugging gate decisions.
+    Qa(QaArgs),
+}
+
+/// Arguments for `symphony qa`.
+///
+/// Parallels [`IssueArgs`] in shape: the namespace exists so future
+/// QA-adjacent inspection commands (e.g. `qa queue`, `qa runs`) can land
+/// alongside `qa verdict` without reshuffling the top-level parser.
+#[derive(Debug, clap::Args)]
+pub struct QaArgs {
+    /// The chosen `qa` subcommand.
+    #[command(subcommand)]
+    pub command: QaCommand,
+}
+
+/// Concrete `symphony qa` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum QaCommand {
+    /// Print every QA verdict filed against a given work item, newest
+    /// first, by reading the durable `qa_verdicts` table.
+    Verdict(QaVerdictArgs),
+}
+
+/// Arguments for `symphony qa verdict`.
+///
+/// The positional id is the durable `work_items.id` — the same
+/// identifier shape that `symphony cancel --issue` and `symphony issue
+/// graph` accept. Tracker-identifier resolution is a future concern
+/// (see [`IssueGraphArgs`]).
+#[derive(Debug, clap::Args)]
+pub struct QaVerdictArgs {
+    /// Numeric `work_items.id` whose verdicts to list.
+    #[arg(value_name = "ID")]
+    pub id: i64,
+
+    /// Path to the durable state SQLite database. Must already exist —
+    /// `qa verdict` is a read-only command and refuses to create a
+    /// database on demand for the same reason `symphony cancel` and
+    /// `symphony issue graph` do: mutating an unrecognised file is a
+    /// footgun.
+    #[arg(
+        long = "state-db",
+        value_name = "PATH",
+        default_value = "symphony.sqlite3"
+    )]
+    pub state_db: PathBuf,
 }
 
 /// Arguments for `symphony issue`.
