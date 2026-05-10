@@ -99,6 +99,16 @@ pub enum Command {
     /// need.
     Issue(IssueArgs),
 
+    /// Reconcile durable orchestrator state with on-disk / tracker
+    /// reality (ARCHITECTURE v2 §4.7 / Phase 12).
+    ///
+    /// Surfaces (and, with `--apply`, reaps) two classes of stale rows:
+    /// expired durable leases on `runs`, and orphaned `workspace_claims`
+    /// — i.e. claims no live run references whose `claim_status` is not
+    /// already terminal. Read-only by default; the `--apply` flag is
+    /// required to mutate the database.
+    Recover(RecoverArgs),
+
     /// QA evidence inspection commands (SPEC v2 §4.9 / §5.12 / Phase 12).
     ///
     /// The QA gate writes one durable `qa_verdicts` row per dispatch with
@@ -107,6 +117,41 @@ pub enum Command {
     /// those rows back without SQL — useful for audit ("what did QA
     /// decide on ENG-101?") and for debugging gate decisions.
     Qa(QaArgs),
+}
+
+/// Arguments for `symphony recover`.
+///
+/// Defaults are deliberately read-only: the command is dry-run unless
+/// `--apply` is passed. The `--at` override exists for tests and for
+/// operators who want to reproduce a recovery decision against a frozen
+/// timestamp; production use omits it and the command derives a
+/// second-precision RFC3339 `now` from the system clock, matching
+/// [`crate::cancel`]'s clock plumbing.
+#[derive(Debug, clap::Args)]
+pub struct RecoverArgs {
+    /// Path to the durable state SQLite database. The file must already
+    /// exist — `recover` refuses to create one because mutating an
+    /// unrecognised file is a footgun. Same default and rationale as
+    /// `symphony cancel`.
+    #[arg(
+        long = "state-db",
+        value_name = "PATH",
+        default_value = "symphony.sqlite3"
+    )]
+    pub state_db: PathBuf,
+
+    /// Override the RFC3339 `now` used for the expired-lease query. The
+    /// kernel's lease comparison is `lease_expires_at < now`. Tests pass
+    /// a fixed value; production omits this and the command derives `now`
+    /// from the system clock.
+    #[arg(long = "at", value_name = "RFC3339")]
+    pub at: Option<String>,
+
+    /// Promote the sweep from dry-run to a write. Without this flag the
+    /// command surfaces what *would* be reaped and exits zero without
+    /// touching the database.
+    #[arg(long = "apply")]
+    pub apply: bool,
 }
 
 /// Arguments for `symphony qa`.

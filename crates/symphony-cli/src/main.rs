@@ -16,6 +16,7 @@ mod cli;
 mod issue;
 mod logging;
 mod qa;
+mod recover;
 mod run;
 mod scheduler;
 mod sse;
@@ -113,6 +114,16 @@ fn main() -> anyhow::Result<ExitCode> {
             // runtime needed.
             let outcome = issue::run(&args.command);
             let code = issue::render(&outcome);
+            Ok(ExitCode::from(code as u8))
+        }
+        Some(Command::Recover(args)) => {
+            // `recover` is a synchronous one-shot reconciliation: it
+            // opens the durable SQLite database, reads (and optionally
+            // mutates) a small number of stale rows, prints a summary,
+            // and exits. No tokio runtime needed — every call site is
+            // a synchronous repository method.
+            let outcome = recover::run(&args);
+            let code = recover::render(&outcome);
             Ok(ExitCode::from(code as u8))
         }
         Some(Command::Cancel(args)) => {

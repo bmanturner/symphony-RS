@@ -26,6 +26,7 @@ pub mod recovery_queue_source;
 pub mod repository;
 pub mod run_lease_store;
 pub mod transaction;
+pub mod workspace_claims;
 
 use std::path::Path;
 
