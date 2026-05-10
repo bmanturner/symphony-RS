@@ -19,7 +19,9 @@ pub mod budget_exceeded;
 pub mod budget_pause_runner;
 pub mod budget_pause_tick;
 pub mod cancellation;
+pub mod cancellation_event_log;
 pub mod cancellation_observer;
+pub mod cancellation_propagator;
 pub mod concurrency_gate;
 pub mod decomposition;
 pub mod decomposition_applier;
@@ -96,7 +98,12 @@ pub use budget_pause_tick::{
     BudgetPauseQueueError, BudgetPauseQueueSource, BudgetPauseQueueTick, BudgetPauseStatus,
 };
 pub use cancellation::{CancelRequest, CancelSubject, CancellationQueue};
+pub use cancellation_event_log::CancellationEventLog;
 pub use cancellation_observer::{CancellationDecision, observe_for_run, observe_for_run_or_parent};
+pub use cancellation_propagator::{
+    ActiveRunSource, CancellationPropagator, CascadeOutcome, PropagationError,
+    WorkItemDescendantSource,
+};
 pub use concurrency_gate::{
     ConcurrencyGate, DispatchTriple, RunnerScopes, Scope, ScopeAvailability, ScopeContended,
     ScopeKind, ScopePermitSet,

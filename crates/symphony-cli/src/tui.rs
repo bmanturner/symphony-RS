@@ -665,6 +665,22 @@ impl AppState {
                     Some(identifier.clone()),
                 );
             }
+            OrchestratorEvent::RunCancelled {
+                run_id,
+                identifier,
+                reason,
+                requested_by,
+                ..
+            } => {
+                let label = identifier
+                    .clone()
+                    .unwrap_or_else(|| format!("run#{run_id}"));
+                self.push_recent(
+                    "run_cancelled",
+                    format!("{label} cancelled by {requested_by}: {reason}"),
+                    identifier.clone(),
+                );
+            }
         }
     }
 

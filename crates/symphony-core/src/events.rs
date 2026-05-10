@@ -295,6 +295,51 @@ pub enum OrchestratorEvent {
         /// Configured cap, in the same units as `observed`.
         cap: f64,
     },
+
+    /// A run was cancelled — emitted once per `runs.id` lifecycle.
+    ///
+    /// Fired on the leading edge of a run's cancellation: the kernel
+    /// observes a pending [`crate::cancellation::CancelRequest`] for the
+    /// run (or cascades one in via
+    /// [`crate::cancellation_propagator::CancellationPropagator`]) and
+    /// transitions the run toward [`crate::run_status::RunStatus::Cancelled`].
+    /// Per-run dedup lives in
+    /// [`crate::cancellation_event_log::CancellationEventLog`]: a run
+    /// cannot cancel twice, so the log emits the first observation and
+    /// suppresses repeats.
+    ///
+    /// The wire fields mirror the shape of `CancelRequest` plus the
+    /// durable run row id so consumers can correlate without joining
+    /// against the `cancel_requests` table. `identifier` is best-effort
+    /// — operator-issued cancels at the CLI carry a tracker id, while a
+    /// cascade from a parent work item may not. The `subject` field
+    /// preserves whether the cancel originated at the run level or
+    /// cascaded from a work-item-level request.
+    RunCancelled {
+        /// Durable run row that cancelled.
+        run_id: i64,
+        /// Tracker-facing identifier of the work item the run is
+        /// against, when known. `None` when the cancel originated from
+        /// a propagation step that did not snapshot the identifier.
+        #[serde(default)]
+        identifier: Option<String>,
+        /// Originating subject of the cancel (run-targeted vs.
+        /// work-item-targeted cascade). Mirrors the durable
+        /// `cancel_requests.subject_kind` so consumers can distinguish
+        /// "operator cancelled this dispatch" from "operator cancelled
+        /// the whole work item and this child got swept along".
+        subject: crate::cancellation::CancelSubject,
+        /// Operator-supplied reason from the originating
+        /// [`crate::cancellation::CancelRequest`].
+        reason: String,
+        /// Identity that requested the cancel (e.g. `$USER` from the
+        /// CLI, or `"cascade:work_item:42"` for a propagated child
+        /// cancel).
+        requested_by: String,
+        /// RFC3339-style timestamp the cancel was first requested at.
+        /// Opaque text — the kernel does not parse it.
+        requested_at: String,
+    },
 }
 
 impl OrchestratorEvent {
@@ -315,7 +360,8 @@ impl OrchestratorEvent {
             | OrchestratorEvent::Released { issue, .. } => Some(issue),
             OrchestratorEvent::Reconciled { .. }
             | OrchestratorEvent::ScopeCapReached { .. }
-            | OrchestratorEvent::BudgetExceeded { .. } => None,
+            | OrchestratorEvent::BudgetExceeded { .. }
+            | OrchestratorEvent::RunCancelled { .. } => None,
         }
     }
 
@@ -334,6 +380,7 @@ impl OrchestratorEvent {
             OrchestratorEvent::Released { .. } => "released",
             OrchestratorEvent::ScopeCapReached { .. } => "scope_cap_reached",
             OrchestratorEvent::BudgetExceeded { .. } => "budget_exceeded",
+            OrchestratorEvent::RunCancelled { .. } => "run_cancelled",
         }
     }
 }
@@ -625,6 +672,71 @@ mod tests {
         let s = serde_json::to_string(&ev).unwrap();
         let back: OrchestratorEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn run_cancelled_serialises_with_type_tag_and_subject_discriminator() {
+        use crate::blocker::RunRef;
+        use crate::cancellation::CancelSubject;
+
+        let ev = OrchestratorEvent::RunCancelled {
+            run_id: 42,
+            identifier: Some("ENG-9".into()),
+            subject: CancelSubject::run(RunRef::new(42)),
+            reason: "operator cancel".into(),
+            requested_by: "alice".into(),
+            requested_at: "2026-05-09T00:00:00Z".into(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "run_cancelled");
+        assert_eq!(v["run_id"], 42);
+        assert_eq!(v["identifier"], "ENG-9");
+        assert_eq!(v["subject"]["kind"], "run");
+        assert_eq!(v["subject"]["run_id"], 42);
+        assert_eq!(v["reason"], "operator cancel");
+        assert_eq!(v["requested_by"], "alice");
+        assert_eq!(v["requested_at"], "2026-05-09T00:00:00Z");
+        assert!(ev.issue().is_none());
+        assert_eq!(ev.kind(), "run_cancelled");
+    }
+
+    #[test]
+    fn run_cancelled_round_trips_for_work_item_cascade_subject() {
+        use crate::cancellation::CancelSubject;
+        use crate::work_item::WorkItemId;
+
+        let ev = OrchestratorEvent::RunCancelled {
+            run_id: 7,
+            identifier: None,
+            subject: CancelSubject::work_item(WorkItemId::new(11)),
+            reason: "parent cancelled".into(),
+            requested_by: "cascade:work_item:11".into(),
+            requested_at: "2026-05-09T00:00:00Z".into(),
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: OrchestratorEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn run_cancelled_deserialises_with_default_identifier() {
+        let raw = r#"{"type":"run_cancelled","run_id":3,"subject":{"kind":"run","run_id":3},"reason":"r","requested_by":"u","requested_at":"2026-05-09T00:00:00Z"}"#;
+        let ev: OrchestratorEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            OrchestratorEvent::RunCancelled {
+                run_id,
+                identifier,
+                reason,
+                requested_by,
+                ..
+            } => {
+                assert_eq!(run_id, 3);
+                assert!(identifier.is_none());
+                assert_eq!(reason, "r");
+                assert_eq!(requested_by, "u");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]
