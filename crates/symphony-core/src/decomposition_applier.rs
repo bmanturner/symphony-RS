@@ -75,6 +75,18 @@ pub struct AppliedDecomposition {
     pub children: Vec<AppliedChild>,
 }
 
+/// Tracker-side mirror created for one decomposition dependency edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncedDependencyBlocker {
+    /// Proposal-local key of the prerequisite child.
+    pub blocker: ChildKey,
+    /// Proposal-local key of the waiting child.
+    pub blocked: ChildKey,
+    /// Tracker-native blocker/dependency relation id, when the adapter
+    /// exposes addressable relation rows.
+    pub tracker_edge_id: Option<String>,
+}
+
 /// Tracker-side policy for mirroring decomposition dependency blockers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyTrackerSyncMode {
@@ -251,15 +263,15 @@ pub async fn sync_decomposition_dependency_blockers(
     tracker: &dyn TrackerMutations,
     capabilities: TrackerCapabilities,
     mode: DependencyTrackerSyncMode,
-) -> Result<(), ApplyError> {
+) -> Result<Vec<SyncedDependencyBlocker>, ApplyError> {
     if mode == DependencyTrackerSyncMode::LocalOnly {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if !capabilities.add_blocker {
         return if mode == DependencyTrackerSyncMode::Required {
             Err(ApplyError::AddBlockerUnsupported)
         } else {
-            Ok(())
+            Ok(Vec::new())
         };
     }
 
@@ -268,6 +280,7 @@ pub async fn sync_decomposition_dependency_blockers(
         .iter()
         .map(|child| (&child.key, &child.tracker_id))
         .collect();
+    let mut synced = Vec::new();
 
     for child in &proposal.children {
         let Some(blocked_tracker_id) = tracker_ids.get(&child.key).copied() else {
@@ -288,7 +301,7 @@ pub async fn sync_decomposition_dependency_blockers(
                     )),
                 });
             };
-            tracker
+            let response = tracker
                 .add_blocker(AddBlockerRequest {
                     blocked: blocked_tracker_id.clone(),
                     blocker: blocker_tracker_id.clone(),
@@ -300,10 +313,15 @@ pub async fn sync_decomposition_dependency_blockers(
                     blocked: child.key.clone(),
                     source,
                 })?;
+            synced.push(SyncedDependencyBlocker {
+                blocker: dependency.clone(),
+                blocked: child.key.clone(),
+                tracker_edge_id: response.edge_id,
+            });
         }
     }
 
-    Ok(())
+    Ok(synced)
 }
 
 /// Render a child's tracker body from its scope, description, and
@@ -760,7 +778,7 @@ mod tests {
         .await
         .unwrap();
 
-        sync_decomposition_dependency_blockers(
+        let synced = sync_decomposition_dependency_blockers(
             &proposal,
             &applied,
             &tracker,
@@ -781,6 +799,14 @@ mod tests {
         assert_eq!(blocker.blocker.as_str(), "1000");
         assert_eq!(blocker.blocked.as_str(), "1001");
         assert_eq!(blocker.reason.as_deref(), Some("b depends on a"));
+        assert_eq!(
+            synced,
+            vec![SyncedDependencyBlocker {
+                blocker: ChildKey::new("a"),
+                blocked: ChildKey::new("b"),
+                tracker_edge_id: Some("edge-1".to_string()),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -807,7 +833,7 @@ mod tests {
             ],
         };
 
-        sync_decomposition_dependency_blockers(
+        let synced = sync_decomposition_dependency_blockers(
             &proposal,
             &applied,
             &tracker,
@@ -818,6 +844,7 @@ mod tests {
         .unwrap();
 
         assert!(tracker.calls().is_empty());
+        assert!(synced.is_empty());
     }
 
     #[tokio::test]
@@ -852,7 +879,7 @@ mod tests {
             proposal_id: proposal.id,
             children: Vec::new(),
         };
-        sync_decomposition_dependency_blockers(
+        let synced = sync_decomposition_dependency_blockers(
             &proposal,
             &applied,
             &tracker,
@@ -866,5 +893,6 @@ mod tests {
         .await
         .unwrap();
         assert!(tracker.calls().is_empty());
+        assert!(synced.is_empty());
     }
 }

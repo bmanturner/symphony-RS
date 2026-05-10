@@ -160,6 +160,15 @@ impl<'conn> StateTransaction<'conn> {
         update_edge_status_in(&self.tx, id, status)
     }
 
+    /// Record a successful tracker mirror for an edge inside this
+    /// transaction.
+    pub fn record_tracker_edge_sync_success(
+        &mut self,
+        success: crate::edges::TrackerEdgeSyncSuccess<'_>,
+    ) -> StateResult<bool> {
+        crate::edges::record_tracker_edge_sync_success_in(&self.tx, success)
+    }
+
     /// Propagation query: every open `blocks` edge that gates `target`
     /// either directly or via `parent_child` descendants.
     pub fn list_open_blockers_for_subtree(
