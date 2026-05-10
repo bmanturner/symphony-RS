@@ -156,7 +156,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 14 — Documentation and Productization
 
-- [ ] Write `docs/workflow.md` with full schema examples.
+- [x] Write `docs/workflow.md` with full schema examples.
 - [ ] Write `docs/roles.md` explaining integration owner, QA gate, and configurable specialists.
 - [ ] Write `docs/workspaces.md` explaining worktree/shared-branch policies.
 - [ ] Write `docs/qa.md` explaining verdicts, blockers, evidence, and waivers.
