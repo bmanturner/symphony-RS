@@ -53,6 +53,26 @@
 //!    [`JoinSet`]; the spawned future holds the owned permit until the
 //!    dispatcher returns, so capacity is automatically restored on
 //!    completion.
+//!
+//! # Concurrency-gate exemption
+//!
+//! Unlike the specialist / integration / QA / follow-up-approval /
+//! budget-pause runners, [`RecoveryRunner`] is **intentionally exempt**
+//! from [`crate::concurrency_gate::ConcurrencyGate`] acquisition. A
+//! recovery pass never invokes a specialist agent on its own — it
+//! reconciles a durable lease or workspace claim and (where applicable)
+//! re-routes the underlying work item back into intake. The follow-up
+//! dispatch that re-runs the work is itself a fresh run dispatched by
+//! the appropriate gated runner (specialist, integration, QA, or
+//! approval), which acquires its own `{Global, Role, AgentProfile?,
+//! Repository?}` permits at that point. Gating recovery here would
+//! double-book scope capacity (recovery permit + downstream dispatch
+//! permit) for a single user-visible unit of work and could deadlock
+//! recovery against a saturated role cap that recovery is itself trying
+//! to drain.
+//!
+//! The corresponding ADR lives in `ARCHITECTURE_v2.md`
+//! (2026-05-09 — Recovery dispatch is exempt from `ConcurrencyGate`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1614,5 +1634,111 @@ mod tests {
         assert_eq!(store.release_calls().await, vec![RunRef::new(42)]);
         assert!(store.snapshot(RunRef::new(42)).await.is_none());
         assert_eq!(runner.heartbeat_count().await, 0);
+    }
+
+    /// Recovery passes never call [`ConcurrencyGate::try_acquire`], so a
+    /// gate sitting alongside the runner observes zero `in_flight` for
+    /// every scope before, during, and after a fully-drained recovery
+    /// pass. See the module-level "Concurrency-gate exemption" note and
+    /// the ADR in `ARCHITECTURE_v2.md`.
+    #[tokio::test]
+    async fn recovery_pass_does_not_consume_scope_permits() {
+        use crate::concurrency_gate::{ConcurrencyGate, Scope, ScopeAvailability};
+
+        // A gate caps every scope at 1 — if recovery acquired any
+        // permit, the assertions below would observe in_flight == 1.
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Global, 1);
+        gate.set_cap(Scope::Role("platform_lead".into()), 1);
+        gate.set_cap(Scope::AgentProfile("default".into()), 1);
+        gate.set_cap(Scope::Repository("acme/widgets".into()), 1);
+
+        let scopes = [
+            Scope::Global,
+            Scope::Role("platform_lead".into()),
+            Scope::AgentProfile("default".into()),
+            Scope::Repository("acme/widgets".into()),
+        ];
+
+        let queue = Arc::new(RecoveryDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        let runner = RecoveryRunner::new(queue.clone(), dispatcher.clone(), 4);
+
+        // Pre-condition: nothing in flight.
+        for s in &scopes {
+            assert_eq!(gate.available(s).in_flight(), 0);
+        }
+
+        queue.enqueue(lease_req(1, 100));
+        queue.enqueue(orphan_req(2, 200));
+
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 2);
+
+        // Drain the in-flight outcomes.
+        let outcomes = wait_for_outcomes(&runner, 2).await;
+        assert_eq!(outcomes.len(), 2);
+
+        // Post-condition: gate is still pristine.
+        for s in &scopes {
+            match gate.available(s) {
+                ScopeAvailability::Bounded {
+                    cap,
+                    in_flight,
+                    available,
+                } => {
+                    assert_eq!(in_flight, 0, "recovery pass leaked a permit on {s:?}");
+                    assert_eq!(available, cap);
+                }
+                other => panic!("expected Bounded availability, got {other:?}"),
+            }
+        }
+    }
+
+    /// A gate shared between the recovery runner and a downstream gated
+    /// caller behaves as if recovery never touched it: the downstream
+    /// `try_acquire` succeeds at full capacity, and once held it
+    /// correctly contests fresh acquirers — proving recovery did not
+    /// hold (and silently release) a phantom permit.
+    #[tokio::test]
+    async fn downstream_dispatch_still_acquires_permits_after_recovery_pass() {
+        use crate::concurrency_gate::{ConcurrencyGate, Scope};
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Global, 2);
+        gate.set_cap(Scope::Role("specialist".into()), 2);
+
+        let queue = Arc::new(RecoveryDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(RecoveryDispatchReason::Reconciled));
+        let runner = RecoveryRunner::new(queue.clone(), dispatcher.clone(), 4);
+
+        queue.enqueue(lease_req(1, 100));
+        let report = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(report.spawned, 1);
+        let outcomes = wait_for_outcomes(&runner, 1).await;
+        assert_eq!(outcomes.len(), 1);
+
+        // Now imagine the dispatched recovery target re-routes work
+        // back through the gated specialist runner: that downstream
+        // dispatch acquires its own `{Global, Role}` permits via the
+        // same gate, and they contend independently.
+        let scopes = [Scope::Global, Scope::Role("specialist".into())];
+        let p1 = gate.try_acquire(&scopes).expect("first downstream permit");
+        let p2 = gate.try_acquire(&scopes).expect("second downstream permit");
+        // Cap=2 is now fully held by the downstream pair, *not* by
+        // recovery. A third acquisition must contend.
+        let err = gate
+            .try_acquire(&scopes)
+            .expect_err("third downstream acquisition should contend");
+        assert_eq!(err.cap, 2);
+        assert_eq!(err.in_flight, 2);
+
+        drop(p1);
+        drop(p2);
+        // After the downstream pair release, the gate is back to fully
+        // unheld — confirming recovery never registered a permit.
+        for s in &scopes {
+            assert_eq!(gate.available(s).in_flight(), 0);
+        }
     }
 }
