@@ -203,6 +203,13 @@ pub struct WorkflowConfig {
     /// working unchanged.
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
+
+    /// Per-issue and per-run budget caps that the orchestrator enforces
+    /// as hard ceilings. SPEC v2 §5.15. Defaults match the SPEC example
+    /// (6 parallel runs, $10/issue, 20 turns/run, 3 retries,
+    /// `block_work_item`).
+    #[serde(default)]
+    pub budgets: BudgetsConfig,
 }
 
 /// The only `schema_version` accepted by this build. Bumped only when
@@ -236,6 +243,7 @@ impl Default for WorkflowConfig {
             qa: QaConfig::default(),
             followups: FollowupConfig::default(),
             concurrency: ConcurrencyConfig::default(),
+            budgets: BudgetsConfig::default(),
         }
     }
 }
@@ -286,6 +294,105 @@ pub struct ConcurrencyConfig {
     /// and zero values are rejected at validate time.
     #[serde(default)]
     pub per_repository: BTreeMap<String, u32>,
+}
+
+// ---------------------------------------------------------------------------
+// budgets
+// ---------------------------------------------------------------------------
+
+/// Per-issue and per-run budget caps. Mirrors SPEC v2 §5.15.
+///
+/// The orchestrator enforces these caps as hard ceilings: when one is
+/// exceeded the offending work item or run is parked into a durable
+/// budget pause (driven by the existing `BudgetPauseDispatchQueue`) and
+/// an `OrchestratorEvent::BudgetExceeded` is broadcast and persisted.
+/// They never silently fail the work or spin retries — see the
+/// "Budget exhaustion MUST" sentence in SPEC §5.15.
+///
+/// The defaults match SPEC §5.15 verbatim and are tuned for an
+/// out-of-the-box workflow: 6 parallel runs, $10/issue, 20 turns/run,
+/// 3 retries, and `block_work_item` as the pause scope.
+///
+/// Zero on any numeric cap is rejected at validate time. A zero cap
+/// would either deadlock the gate (no work could proceed) or, in the
+/// `max_retries` case, contradict the operator's opt-in to a non-zero
+/// retry policy elsewhere in the config — fail loudly instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetsConfig {
+    /// Cap on simultaneously running dispatches across the orchestrator.
+    /// Conceptually overlaps with [`ConcurrencyConfig::global_max`] but
+    /// the budgets surface owns the user-facing knob; the kernel may
+    /// reconcile the two in a future subtask. SPEC v2 §5.15.
+    #[serde(default = "default_budgets_max_parallel_runs")]
+    pub max_parallel_runs: u32,
+
+    /// Cumulative cost ceiling per work item, in USD. Crossed when
+    /// agent providers report spend that pushes the running total over
+    /// this cap. SPEC v2 §5.15.
+    #[serde(default = "default_budgets_max_cost_per_issue_usd")]
+    pub max_cost_per_issue_usd: f64,
+
+    /// Maximum number of agent turns allowed in a single run before
+    /// the run is parked. SPEC v2 §5.15.
+    #[serde(default = "default_budgets_max_turns_per_run")]
+    pub max_turns_per_run: u32,
+
+    /// Maximum retry attempts before further retries are refused with a
+    /// `BudgetExceeded` decision. Mirrored by `RetryPolicyDecision`
+    /// in `symphony-core::retry` (added in a follow-up subtask). SPEC
+    /// v2 §5.15.
+    #[serde(default = "default_budgets_max_retries")]
+    pub max_retries: u32,
+
+    /// Whether budget exhaustion blocks the entire work item or only
+    /// the offending run. SPEC v2 §5.15.
+    #[serde(default)]
+    pub pause_policy: BudgetPausePolicy,
+}
+
+impl Default for BudgetsConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_runs: default_budgets_max_parallel_runs(),
+            max_cost_per_issue_usd: default_budgets_max_cost_per_issue_usd(),
+            max_turns_per_run: default_budgets_max_turns_per_run(),
+            max_retries: default_budgets_max_retries(),
+            pause_policy: BudgetPausePolicy::default(),
+        }
+    }
+}
+
+fn default_budgets_max_parallel_runs() -> u32 {
+    6
+}
+
+fn default_budgets_max_cost_per_issue_usd() -> f64 {
+    10.00
+}
+
+fn default_budgets_max_turns_per_run() -> u32 {
+    20
+}
+
+fn default_budgets_max_retries() -> u32 {
+    3
+}
+
+/// Scope of a durable budget pause. SPEC v2 §5.15 names the two
+/// variants explicitly; the wire format uses `snake_case` to match
+/// the YAML in the SPEC example.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetPausePolicy {
+    /// Pause every run associated with the offending work item until
+    /// an operator changes policy or approves continuation. The SPEC
+    /// default and the safer setting.
+    #[default]
+    BlockWorkItem,
+    /// Pause only the offending run; sibling runs on the same work
+    /// item keep going.
+    BlockRun,
 }
 
 // ---------------------------------------------------------------------------
@@ -2680,6 +2787,20 @@ pub enum ConfigValidationError {
         /// Human-readable description of which two settings disagree.
         detail: String,
     },
+
+    /// A `budgets.*` numeric cap is zero. SPEC v2 §5.15 budgets are
+    /// hard ceilings; a zero ceiling would either deadlock the
+    /// dispatcher or contradict the operator's opt-in to a non-zero
+    /// retry policy. Rejected at load time rather than wedge a running
+    /// orchestrator. The `field` carries the dotted path
+    /// (e.g. `budgets.max_parallel_runs`) so operators can fix it
+    /// without grepping.
+    #[error("{field} must be > 0 (got 0)")]
+    BudgetZero {
+        /// Dotted-path locator of the offending field, e.g.
+        /// `budgets.max_parallel_runs` or `budgets.max_cost_per_issue_usd`.
+        field: String,
+    },
 }
 
 impl WorkflowConfig {
@@ -2754,6 +2875,36 @@ impl WorkflowConfig {
         self.validate_role_and_agent_references()?;
         self.validate_required_role_kinds()?;
         self.validate_concurrency()?;
+        self.validate_budgets()?;
+        Ok(())
+    }
+
+    /// Validate the typed [`BudgetsConfig`] block. Every numeric cap
+    /// must be strictly positive; SPEC v2 §5.15 documents these as
+    /// hard ceilings, and a zero ceiling cannot be enforced
+    /// meaningfully. `pause_policy` is an enum and parses or fails
+    /// at deserialise time, so it does not need a runtime check.
+    fn validate_budgets(&self) -> Result<(), ConfigValidationError> {
+        if self.budgets.max_parallel_runs == 0 {
+            return Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_parallel_runs".to_string(),
+            });
+        }
+        if self.budgets.max_cost_per_issue_usd <= 0.0 {
+            return Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_cost_per_issue_usd".to_string(),
+            });
+        }
+        if self.budgets.max_turns_per_run == 0 {
+            return Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_turns_per_run".to_string(),
+            });
+        }
+        if self.budgets.max_retries == 0 {
+            return Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_retries".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -6587,6 +6738,182 @@ concurrency:
             cfg.validate(),
             Err(ConfigValidationError::UnknownConcurrencyRepository {
                 repository: "foglet-io/something-else".into(),
+            }),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // budgets
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn budgets_defaults_match_spec_5_15() {
+        // The SPEC v2 §5.15 example block is the documented contract.
+        // If any of these defaults drift, operators reading the SPEC
+        // will get a different runtime than the doc promises — pin
+        // them down here.
+        let cfg = BudgetsConfig::default();
+        assert_eq!(cfg.max_parallel_runs, 6);
+        assert_eq!(cfg.max_cost_per_issue_usd, 10.00);
+        assert_eq!(cfg.max_turns_per_run, 20);
+        assert_eq!(cfg.max_retries, 3);
+        assert_eq!(cfg.pause_policy, BudgetPausePolicy::BlockWorkItem);
+    }
+
+    #[test]
+    fn budgets_omitted_block_is_default() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.budgets, BudgetsConfig::default());
+        assert_eq!(parsed.validate(), Ok(()));
+    }
+
+    #[test]
+    fn budgets_block_roundtrips_with_overrides() {
+        // Per-field override + pause_policy round-trip in one fixture.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+budgets:
+  max_parallel_runs: 12
+  max_cost_per_issue_usd: 25.5
+  max_turns_per_run: 40
+  max_retries: 5
+  pause_policy: block_run
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.budgets.max_parallel_runs, 12);
+        assert_eq!(parsed.budgets.max_cost_per_issue_usd, 25.5);
+        assert_eq!(parsed.budgets.max_turns_per_run, 40);
+        assert_eq!(parsed.budgets.max_retries, 5);
+        assert_eq!(parsed.budgets.pause_policy, BudgetPausePolicy::BlockRun);
+        assert_eq!(parsed.validate(), Ok(()));
+        let reserialised = serde_yaml::to_string(&parsed).expect("serialises");
+        let reparsed: WorkflowConfig = serde_yaml::from_str(&reserialised).expect("re-parses");
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn budgets_pause_policy_block_work_item_roundtrips() {
+        // The default variant on its own — explicitly set so we
+        // exercise the `block_work_item` arm of the snake_case rename.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+budgets:
+  pause_policy: block_work_item
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            parsed.budgets.pause_policy,
+            BudgetPausePolicy::BlockWorkItem
+        );
+        let reserialised = serde_yaml::to_string(&parsed.budgets).expect("serialises");
+        assert!(
+            reserialised.contains("block_work_item"),
+            "expected snake_case wire form, got: {reserialised}"
+        );
+    }
+
+    #[test]
+    fn budgets_unknown_nested_key_is_rejected() {
+        // `deny_unknown_fields` coverage: typos under `budgets:` must
+        // surface, not silently default.
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+budgets:
+  maxretries: 5
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("maxretries") || err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn budgets_unknown_pause_policy_is_rejected() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+budgets:
+  pause_policy: pause_everything
+"#;
+        let err = serde_yaml::from_str::<WorkflowConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("pause_everything")
+                || err.to_string().to_lowercase().contains("unknown variant"),
+            "expected unknown-variant error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn budgets_zero_max_parallel_runs_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.budgets.max_parallel_runs = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_parallel_runs".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn budgets_zero_max_cost_per_issue_usd_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.budgets.max_cost_per_issue_usd = 0.0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_cost_per_issue_usd".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn budgets_negative_max_cost_per_issue_usd_is_rejected() {
+        // f64 lets the deserialiser admit negatives; validate() must
+        // catch them since a negative ceiling cannot be enforced.
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.budgets.max_cost_per_issue_usd = -1.5;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_cost_per_issue_usd".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn budgets_zero_max_turns_per_run_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.budgets.max_turns_per_run = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_turns_per_run".into(),
+            }),
+        );
+    }
+
+    #[test]
+    fn budgets_zero_max_retries_is_rejected() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.budgets.max_retries = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::BudgetZero {
+                field: "budgets.max_retries".into(),
             }),
         );
     }
