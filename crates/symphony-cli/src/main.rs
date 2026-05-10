@@ -11,6 +11,7 @@
 //! `symphony_core::Orchestrator`. Nothing here should contain business
 //! logic — anything that looks like policy belongs in a library crate.
 
+mod cancel;
 mod cli;
 mod logging;
 mod run;
@@ -93,6 +94,16 @@ fn main() -> anyhow::Result<ExitCode> {
                     Ok(ExitCode::from(1))
                 }
             }
+        }
+        Some(Command::Cancel(args)) => {
+            // `cancel` is a synchronous one-shot: it opens the durable
+            // SQLite database, mutates one (and at most a small number
+            // of cascaded) rows, prints a one-line summary, and exits.
+            // No tokio runtime needed — the durable cancel surface is
+            // sync, and the kernel's propagator is pure.
+            let outcome = cancel::run(&args);
+            let code = cancel::render(&outcome);
+            Ok(ExitCode::from(code as u8))
         }
         Some(Command::Status(args)) => {
             // `status` performs a single tracker fetch, so it builds a

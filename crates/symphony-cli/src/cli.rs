@@ -72,6 +72,79 @@ pub enum Command {
     /// stdout/stderr surface with `ratatui`; the SSE plumbing itself is
     /// stable from this iteration on.
     Watch(WatchArgs),
+
+    /// Cooperatively cancel an in-flight run or work item (SPEC v2 §4.5
+    /// / Phase 11.5).
+    ///
+    /// Enqueues a [`symphony_core::cancellation::CancelRequest`] in the
+    /// durable `cancel_requests` table — runners observe pending entries
+    /// at safe points (pre-lease and between agent steps) and transition
+    /// the target to `RunStatus::Cancelled`. For work-item subjects, the
+    /// command additionally cascades the cancel across the
+    /// `parent_child` graph and enqueues per-run requests for every
+    /// in-flight descendant run.
+    ///
+    /// Re-running the command for the same subject is idempotent: the
+    /// partial unique index on `(subject_kind, subject_id) WHERE state =
+    /// 'pending'` collapses duplicates to an in-place payload replace.
+    /// The summary line distinguishes the first enqueue from a nudge.
+    Cancel(CancelArgs),
+}
+
+/// Arguments for `symphony cancel`.
+///
+/// Either `--run` or `--issue` must be supplied (clap's `ArgGroup`
+/// enforces exactly-one). The numeric id is the durable `runs.id` /
+/// `work_items.id`; resolving tracker identifiers (e.g. `ENG-101`) to
+/// durable ids is a future enhancement that lands with the
+/// observability commands in Phase 12.
+#[derive(Debug, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("subject").required(true).args(["run", "issue"]),
+))]
+pub struct CancelArgs {
+    /// Cancel a specific durable run by `runs.id`. Mutually exclusive
+    /// with `--issue`.
+    #[arg(long, value_name = "RUN_ID")]
+    pub run: Option<i64>,
+
+    /// Cancel a work item by `work_items.id`; the kernel-side propagator
+    /// fans the cancel out to every in-flight descendant run via
+    /// `parent_child` edges. Mutually exclusive with `--run`.
+    #[arg(long, value_name = "WORK_ITEM_ID")]
+    pub issue: Option<i64>,
+
+    /// Operator-visible reason recorded in the durable
+    /// `cancel_requests` row and propagated to every cascaded child
+    /// request. Required so the audit trail always carries a why.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: String,
+
+    /// Identity recorded as `requested_by`. Defaults to `$USER` when
+    /// unset, falling back to `"unknown"`. Cascaded child requests
+    /// always overwrite this with `cascade:work_item:<id>` so the audit
+    /// row distinguishes a direct operator cancel from a propagated
+    /// one.
+    #[arg(long, value_name = "WHO")]
+    pub requested_by: Option<String>,
+
+    /// Path to the durable state SQLite database. The file must already
+    /// exist (the orchestrator creates it on first run); `cancel`
+    /// refuses to create one because mutating an unrecognised database
+    /// is a footgun.
+    #[arg(
+        long = "state-db",
+        value_name = "PATH",
+        default_value = "symphony.sqlite3"
+    )]
+    pub state_db: PathBuf,
+
+    /// Override the `requested_at` RFC3339 timestamp written to the
+    /// durable row. Tests pass a fixed value; production omits this and
+    /// the command derives a UTC second-precision RFC3339 string from
+    /// the system clock.
+    #[arg(long = "at", value_name = "RFC3339")]
+    pub at: Option<String>,
 }
 
 /// Arguments for `symphony watch`.

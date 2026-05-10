@@ -162,6 +162,19 @@ pub trait WorkItemEdgeRepository {
         &self,
         target: WorkItemId,
     ) -> StateResult<Vec<WorkItemEdgeRecord>>;
+
+    /// Walk every work item reachable from `root` via outgoing
+    /// `parent_child` edges and return their ids, **inclusive of `root`
+    /// itself**. Order is `id ASC` so callers (notably the kernel-side
+    /// [`symphony_core::cancellation_propagator::CancellationPropagator`])
+    /// see a deterministic traversal regardless of edge insertion order.
+    ///
+    /// Cycles are not possible by contract (decomposition forms a forest),
+    /// but the recursion is bounded by the finite row set anyway. A leaf
+    /// with no outgoing edges still returns `[root]` — the cancel cascade
+    /// must reach the parent's own runs, and an empty result would silently
+    /// drop them.
+    fn list_descendants_via_parent_child(&self, root: WorkItemId) -> StateResult<Vec<WorkItemId>>;
 }
 
 const EDGE_COLUMNS: &str = "id, parent_id, child_id, edge_type, reason, status, created_at";
@@ -330,6 +343,32 @@ impl WorkItemEdgeRepository for StateDb {
     ) -> StateResult<Vec<WorkItemEdgeRecord>> {
         list_open_blockers_for_subtree_in(self.conn(), target)
     }
+
+    fn list_descendants_via_parent_child(&self, root: WorkItemId) -> StateResult<Vec<WorkItemId>> {
+        list_descendants_via_parent_child_in(self.conn(), root)
+    }
+}
+
+pub(crate) fn list_descendants_via_parent_child_in(
+    conn: &Connection,
+    root: WorkItemId,
+) -> StateResult<Vec<WorkItemId>> {
+    let sql = "WITH RECURSIVE descendants(id) AS ( \
+                   SELECT ?1 \
+                   UNION \
+                   SELECT e.child_id \
+                     FROM work_item_edges e \
+                     JOIN descendants d ON e.parent_id = d.id \
+                    WHERE e.edge_type = 'parent_child' \
+               ) \
+               SELECT id FROM descendants ORDER BY id ASC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![root.0], |row| row.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(WorkItemId(row?));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -703,5 +742,82 @@ mod tests {
         // The parse helper is the only way an unknown value can reach
         // user code; verify it refuses.
         assert!(EdgeType::parse("from_the_future").is_none());
+    }
+
+    #[test]
+    fn list_descendants_via_parent_child_includes_root_for_lone_leaf() {
+        let mut db = open();
+        let only = seed_item(&mut db, "ENG-1");
+        let descendants = db.list_descendants_via_parent_child(only).unwrap();
+        assert_eq!(descendants, vec![only]);
+    }
+
+    #[test]
+    fn list_descendants_via_parent_child_walks_full_subtree() {
+        // Tree:
+        //   parent (id1)
+        //   ├── child_a (id2)
+        //   │   └── grand (id4)
+        //   └── child_b (id3)
+        let mut db = open();
+        let parent = seed_item(&mut db, "ENG-1");
+        let child_a = seed_item(&mut db, "ENG-2");
+        let child_b = seed_item(&mut db, "ENG-3");
+        let grand = seed_item(&mut db, "ENG-4");
+        db.create_edge(new_edge(
+            parent,
+            child_a,
+            EdgeType::ParentChild,
+            "linked",
+            None,
+        ))
+        .unwrap();
+        db.create_edge(new_edge(
+            parent,
+            child_b,
+            EdgeType::ParentChild,
+            "linked",
+            None,
+        ))
+        .unwrap();
+        db.create_edge(new_edge(
+            child_a,
+            grand,
+            EdgeType::ParentChild,
+            "linked",
+            None,
+        ))
+        .unwrap();
+
+        let descendants = db.list_descendants_via_parent_child(parent).unwrap();
+        // Order is `id ASC` and our ids are seeded in BFS order; the
+        // contract is "inclusive of root, sorted by id".
+        assert_eq!(descendants, vec![parent, child_a, child_b, grand]);
+    }
+
+    #[test]
+    fn list_descendants_via_parent_child_ignores_other_edge_kinds() {
+        // A `blocks` or `relates_to` edge between `parent` and `other`
+        // must NOT make `other` show up as a descendant — cancellation
+        // cascades over ownership, not over gates.
+        let mut db = open();
+        let parent = seed_item(&mut db, "ENG-1");
+        let other = seed_item(&mut db, "ENG-2");
+        let real_child = seed_item(&mut db, "ENG-3");
+        db.create_edge(new_edge(parent, other, EdgeType::Blocks, "open", Some("x")))
+            .unwrap();
+        db.create_edge(new_edge(parent, other, EdgeType::RelatesTo, "open", None))
+            .unwrap();
+        db.create_edge(new_edge(
+            parent,
+            real_child,
+            EdgeType::ParentChild,
+            "linked",
+            None,
+        ))
+        .unwrap();
+
+        let descendants = db.list_descendants_via_parent_child(parent).unwrap();
+        assert_eq!(descendants, vec![parent, real_child]);
     }
 }

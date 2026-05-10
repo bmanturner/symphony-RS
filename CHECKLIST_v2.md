@@ -131,7 +131,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Wire pre-lease cancellation observation into the QA, follow-up approval, and budget-pause runners under the same contract used by specialist + integration.
 - [x] Add Dispatcher-level cooperation point for between-agent-step cancellation checks in long-running dispatches.
 - [x] Add `OrchestratorEvent::RunCancelled` with kernel-side `CancellationEventLog` dedup, and a `CancellationPropagator` that cascades work-item cancellation across `WorkItemEdge::ParentChild` to in-flight child runs.
-- [ ] Add `symphony cancel <id>` CLI subcommand with `--reason`, `--run` / `--issue` flags, idempotent re-runs, and a one-line summary of cascaded targets.
+- [x] Add `symphony cancel <id>` CLI subcommand with `--reason`, `--run` / `--issue` flags, idempotent re-runs, and a one-line summary of cascaded targets.
 
 ## Phase 12 — Observability and Operator Surfaces
 
