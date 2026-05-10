@@ -12,6 +12,8 @@ const UPGRADE_DOC: &str = include_str!("../../../docs/upgrade.md");
 const README_DOC: &str = include_str!("../../../README.md");
 const SEQUENTIAL_DECOMPOSITION_SCENARIO: &str =
     include_str!("../../../tests/fixtures/decomposition-sequential/SCENARIO.md");
+const PARALLEL_SEQUENTIAL_DECOMPOSITION_SCENARIO: &str =
+    include_str!("../../../tests/fixtures/decomposition-parallel-sequential/SCENARIO.md");
 
 #[test]
 fn complete_workflow_example_in_docs_loads_and_validates() {
@@ -371,6 +373,61 @@ fn sequential_decomposition_fixture_documents_canonical_dependency_chain() {
     assert_eq!(
         parsed.dispatch_order.blocked_until_terminal.get("C"),
         Some(&vec!["B".to_string()])
+    );
+
+    for child in &parsed.children {
+        assert!(!child.title.trim().is_empty());
+        assert!(!child.role.trim().is_empty());
+        assert!(!child.scope.trim().is_empty());
+        assert!(!child.acceptance_criteria.is_empty());
+    }
+    for edge in &parsed.expected_blocks_edges {
+        assert!(
+            edge.reason
+                .contains(&format!("{} depends on {}", edge.blocked, edge.blocker)),
+            "edge reason should keep the dependency direction visible"
+        );
+    }
+    assert!(!parsed.parent.title.trim().is_empty());
+}
+
+#[test]
+fn parallel_sequential_decomposition_fixture_documents_mixed_dependency_graph() {
+    let scenario = extract_marked_yaml(
+        PARALLEL_SEQUENTIAL_DECOMPOSITION_SCENARIO,
+        "decomposition-scenario",
+    );
+    let parsed: DecompositionScenario = serde_yaml::from_str(scenario)
+        .expect("parallel plus sequential decomposition scenario should parse");
+
+    assert_eq!(parsed.parent.key, "parent");
+    assert_eq!(parsed.parent.integration_owner, "platform_lead");
+    assert_eq!(
+        parsed
+            .children
+            .iter()
+            .map(|c| (c.key.clone(), c.depends_on.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("A".to_string(), Vec::<String>::new()),
+            ("B".to_string(), Vec::<String>::new()),
+            ("C".to_string(), vec!["A".to_string(), "B".to_string()]),
+        ],
+        "fixture should encode two parallel roots and one dependent child"
+    );
+    assert_eq!(
+        parsed
+            .expected_blocks_edges
+            .iter()
+            .map(|edge| (edge.blocker.as_str(), edge.blocked.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("A", "C"), ("B", "C")],
+        "both roots should block the waiting child"
+    );
+    assert_eq!(parsed.dispatch_order.initially_eligible, vec!["A", "B"]);
+    assert_eq!(
+        parsed.dispatch_order.blocked_until_terminal.get("C"),
+        Some(&vec!["A".to_string(), "B".to_string()])
     );
 
     for child in &parsed.children {
