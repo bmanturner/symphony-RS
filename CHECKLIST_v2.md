@@ -206,6 +206,12 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [ ] Add `CancelRequest` model, durable `cancel_requests` table, and `CancellationQueue` primitive (in-memory dispatch surface backed by repository writes; hydrate pending+observed at startup; idempotent re-enqueue at DB and memory layers).
 - [ ] Wire cancellation observation into all dispatch runners (specialist, integration, QA, follow-up approval, budget pause): observe pending cancel before lease acquisition and between agent steps; on observe, release lease + scope permits + workspace claim and mark the run `Cancelled` via the typed status API.
+  - [x] Add a pure `cancellation_observer` primitive (`CancellationDecision` + `observe_for_run` + `observe_for_run_or_parent`) that turns a `CancellationQueue` lookup into an abort/proceed decision. Run-keyspace wins over parent work-item keyspace; lookups are non-consuming so `drain_for_*` happens after the runner has released its lease/scopes/workspace and recorded the typed status transition. Landed as `crates/symphony-core/src/cancellation_observer.rs` [1841 tests].
+  - [ ] Wire the specialist runner to call `observe_for_run_or_parent` before lease acquisition and between agent steps; on `Abort`, release scope permits + lease guard, mark the run `Cancelled` via the typed status gate, and `drain_for_run` only after release.
+  - [ ] Wire the integration runner to the same primitive (parent context = the integration's parent work-item id).
+  - [ ] Wire the QA runner to the same primitive (parent context = the QA target's parent work-item id).
+  - [ ] Wire the follow-up approval runner to the same primitive; the subject is the follow-up identifier, so use `observe_for_run` (no parent fallback) until the follow-up keyspace is unified with `WorkItem`.
+  - [ ] Wire the budget pause runner to `observe_for_run` (no parent fallback — budget pauses do not carry a stable parent work-item id at observation time).
 - [ ] Add `OrchestratorEvent::RunCancelled` with kernel-side `CancellationEventLog` dedup, and a `CancellationPropagator` that cascades work-item cancellation across `WorkItemEdge::ParentChild` to in-flight child runs.
 - [ ] Add `symphony cancel <id>` CLI subcommand with `--reason`, `--run` / `--issue` flags, idempotent re-runs, and a one-line summary of cascaded targets.
 
