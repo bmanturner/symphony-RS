@@ -53,6 +53,7 @@ use crate::run_lease::{
     HeartbeatPulseObservation, LeaseAcquireOutcome, LeaseHeartbeat, RunLeaseGuard, RunLeaseStore,
     pulse_observed,
 };
+use crate::scope_contention_broadcaster::{ScopeContentionEventBroadcaster, ScopeFields};
 
 /// Final outcome of one follow-up approval dispatch.
 ///
@@ -195,6 +196,15 @@ impl ScopeContendedObservation {
             cap: contended.cap,
         }
     }
+
+    fn fields(&self) -> ScopeFields {
+        ScopeFields {
+            scope_kind: self.scope_kind,
+            scope_key: self.scope_key.clone(),
+            in_flight: self.in_flight,
+            cap: self.cap,
+        }
+    }
 }
 
 /// Per-pulse heartbeat observation surfaced by
@@ -253,6 +263,18 @@ pub struct FollowupApprovalRunner {
     /// `followups.approval_role` by convention — producers populate
     /// `role` from that config.
     concurrency_gate: Option<ConcurrencyGate>,
+    /// Optional durable scope-contention broadcaster. When `Some`, every
+    /// `run_pending` pass — including idle passes — feeds the runner's
+    /// per-pass [`ScopeContendedObservation`]s into the shared dedup
+    /// log so exactly one
+    /// [`crate::events::OrchestratorEvent::ScopeCapReached`] event is
+    /// broadcast on the bus and persisted via the configured sink per
+    /// contention episode. Follow-up approval does not reserve a
+    /// `runs.id` row, so emitted events carry `identifier`
+    /// (`followup_id` formatted as a decimal string) rather than
+    /// `run_id`. When `None`, observations remain on the run report
+    /// only.
+    scope_contention_broadcaster: Option<Arc<ScopeContentionEventBroadcaster>>,
 }
 
 /// Bundle holding the lease store, owner identity, TTL/renewal config,
@@ -283,7 +305,32 @@ impl FollowupApprovalRunner {
             leasing: None,
             heartbeats: Arc::new(Mutex::new(HashMap::new())),
             concurrency_gate: None,
+            scope_contention_broadcaster: None,
         }
+    }
+
+    /// Wire a [`ScopeContentionEventBroadcaster`] into the runner.
+    ///
+    /// After every [`Self::run_pending`] pass — including idle passes
+    /// with zero contentions — the runner forwards its per-request
+    /// observations to the broadcaster. The broadcaster's per-pass
+    /// dedup log is what enforces the "one
+    /// [`crate::events::OrchestratorEvent::ScopeCapReached`] per
+    /// contention episode" invariant on the bus and the persistence
+    /// sink. Idle passes with no current contentions are required to
+    /// terminate stale episodes from the prior pass; the runner therefore
+    /// always invokes the broadcaster when wiring is configured.
+    ///
+    /// Follow-up approval dispatches do not reserve a `runs.id` row, so
+    /// emitted events use [`crate::scope_contention_broadcaster::ContentionSubject::Identifier`]
+    /// keyed on the decimal-formatted `followup_id` and carry
+    /// `identifier` (not `run_id`).
+    pub fn with_scope_contention_broadcaster(
+        mut self,
+        broadcaster: Arc<ScopeContentionEventBroadcaster>,
+    ) -> Self {
+        self.scope_contention_broadcaster = Some(broadcaster);
+        self
     }
 
     /// Wire a [`ConcurrencyGate`] into the runner.
@@ -355,6 +402,12 @@ impl FollowupApprovalRunner {
         work.extend(self.queue.drain());
 
         if work.is_empty() {
+            // Even on an idle pass we must notify the broadcaster so any
+            // episodes that were active in a prior pass get terminated
+            // (the dedup log treats absence as "episode ended"). Without
+            // this, a parked dispatch that drains terminally would leave
+            // a stale episode in the log forever.
+            self.broadcast_pass_observations(&[]);
             return FollowupApprovalRunReport::default();
         }
 
@@ -494,7 +547,23 @@ impl FollowupApprovalRunner {
             *deferred = new_deferred;
         }
 
+        // Feed this pass's contentions into the durable broadcaster
+        // (when wired). Always called — a pass with zero contentions
+        // ends any episodes that were active last pass.
+        self.broadcast_pass_observations(&report.scope_contentions);
+
         report
+    }
+
+    fn broadcast_pass_observations(&self, observations: &[ScopeContendedObservation]) {
+        let Some(bx) = self.scope_contention_broadcaster.as_ref() else {
+            return;
+        };
+        bx.observe_identifier_pass(
+            observations
+                .iter()
+                .map(|obs| (obs.followup_id.to_string(), obs.fields())),
+        );
     }
 
     /// Attempt to acquire scope permits for `req` against the configured
@@ -1767,6 +1836,228 @@ mod tests {
         let report = runner.run_pending(CancellationToken::new()).await;
         assert_eq!(report.spawned, 1, "report = {report:?}");
         assert!(report.scope_contentions.is_empty());
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    // ---- Scope-contention broadcaster wiring (CHECKLIST_v2 Phase 11
+    //      §195 follow-up-approval subtask) -------------------------------
+
+    use crate::event_bus::EventBus;
+    use crate::events::OrchestratorEvent;
+    use crate::scope_contention_broadcaster::{
+        ScopeContentionEventBroadcaster, ScopeContentionEventSink, ScopeContentionSinkError,
+    };
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: StdMutex<Vec<OrchestratorEvent>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn snapshot(&self) -> Vec<OrchestratorEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ScopeContentionEventSink for RecordingSink {
+        fn append_scope_cap_reached(
+            &self,
+            event: &OrchestratorEvent,
+        ) -> Result<i64, ScopeContentionSinkError> {
+            assert!(matches!(event, OrchestratorEvent::ScopeCapReached { .. }));
+            self.events.lock().unwrap().push(event.clone());
+            Ok(self.events.lock().unwrap().len() as i64)
+        }
+    }
+
+    /// N consecutive contended passes for the same dispatch produce
+    /// exactly one durable `ScopeCapReached` event, and the event carries
+    /// `identifier` (the decimal-formatted `followup_id`) — not `run_id`,
+    /// because follow-up approval does not reserve a `runs.id` row.
+    #[tokio::test]
+    async fn followup_broadcaster_dedups_repeated_contention_to_one_event_per_episode() {
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("platform_lead".into()), 1);
+
+        let bus = EventBus::default();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus.clone(),
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster);
+
+        // FU-1 spawns; FU-2 contends on the Role scope every pass.
+        queue.enqueue(req_full(1, 100, "a", "platform_lead", None, None));
+        queue.enqueue(req_full(2, 100, "b", "platform_lead", None, None));
+
+        for _ in 0..5 {
+            let _ = runner.run_pending(CancellationToken::new()).await;
+        }
+
+        let persisted = sink.snapshot();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "5 contended passes must produce 1 durable event, got {persisted:?}",
+        );
+        match &persisted[0] {
+            OrchestratorEvent::ScopeCapReached {
+                run_id,
+                identifier,
+                scope_kind,
+                scope_key,
+                ..
+            } => {
+                assert!(
+                    run_id.is_none(),
+                    "follow-up approval has no runs.id; run_id must be None",
+                );
+                assert_eq!(
+                    identifier.as_deref(),
+                    Some("2"),
+                    "identifier must be the decimal followup_id",
+                );
+                assert_eq!(*scope_kind, ScopeKind::Role);
+                assert_eq!(scope_key, "platform_lead");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    /// Bus subscribers see the same event stream the persistence sink
+    /// receives.
+    #[tokio::test]
+    async fn followup_broadcaster_emits_on_bus_in_lockstep_with_persistence() {
+        use futures::StreamExt;
+
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+        dispatcher.enable_gate();
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("platform_lead".into()), 1);
+
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus.clone(),
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster);
+
+        queue.enqueue(req_full(1, 100, "a", "platform_lead", None, None));
+        queue.enqueue(req_full(2, 100, "b", "platform_lead", None, None));
+
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        let bus_event = rx.next().await.expect("event").expect("not lagged");
+        let persisted = sink.snapshot();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(bus_event, persisted[0]);
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+    }
+
+    /// An idle pass after a contention episode terminates the episode in
+    /// the dedup log so a fresh contention re-emits.
+    #[tokio::test]
+    async fn followup_idle_pass_terminates_episode_and_re_contention_re_emits() {
+        let queue = Arc::new(FollowupApprovalDispatchQueue::new());
+        let dispatcher = Arc::new(RecordingDispatcher::new(
+            FollowupApprovalDispatchReason::Approved,
+        ));
+
+        let gate = ConcurrencyGate::new();
+        gate.set_cap(Scope::Role("platform_lead".into()), 1);
+
+        let bus = EventBus::default();
+        let sink = RecordingSink::new();
+        let broadcaster = Arc::new(ScopeContentionEventBroadcaster::new(
+            bus,
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        ));
+
+        let runner = FollowupApprovalRunner::new(queue.clone(), dispatcher.clone(), 4)
+            .with_concurrency_gate(gate)
+            .with_scope_contention_broadcaster(broadcaster);
+
+        // Episode 1: FU-1 holds the Role permit, FU-2 contends.
+        dispatcher.enable_gate();
+        queue.enqueue(req_full(1, 100, "a", "platform_lead", None, None));
+        queue.enqueue(req_full(2, 100, "b", "platform_lead", None, None));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // Drain FU-1 so the Role permit frees; next pass spawns FU-2
+        // (no contention → episode ends).
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // A truly idle pass while FU-2 is in flight: still no new event.
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // Episode 2: FU-2 still in flight; enqueue FU-3 against the
+        // still-held Role permit and observe a fresh event for "3".
+        queue.enqueue(req_full(3, 100, "c", "platform_lead", None, None));
+        let _ = runner.run_pending(CancellationToken::new()).await;
+
+        let persisted = sink.snapshot();
+        assert_eq!(
+            persisted.len(),
+            2,
+            "second episode must re-emit after the first ended; got {persisted:?}",
+        );
+        match &persisted[1] {
+            OrchestratorEvent::ScopeCapReached {
+                run_id, identifier, ..
+            } => {
+                assert!(run_id.is_none());
+                assert_eq!(identifier.as_deref(), Some("3"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        dispatcher.release_gate();
+        let _ = wait_for_outcomes(&runner, 1).await;
+        dispatcher.enable_gate();
+        let _ = runner.run_pending(CancellationToken::new()).await;
+        dispatcher.release_gate();
         let _ = wait_for_outcomes(&runner, 1).await;
     }
 }
