@@ -131,6 +131,34 @@ pub struct ScheduleRequest<'a> {
     pub now: Instant,
 }
 
+/// Outcome of [`RetryQueue::schedule_with_policy`].
+///
+/// Splits the "schedule a retry" path into the two SPEC §5.15 outcomes:
+/// the requested attempt is within the configured `max_retries` budget
+/// and was inserted into the queue, or the attempt is over budget and
+/// the caller must instead enqueue a budget-pause / emit
+/// `OrchestratorEvent::BudgetExceeded`. The over-cap variant carries
+/// `observed`/`cap` as `f64` for symmetry with the rest of the budget
+/// surface (cost is `f64`, retries are integers — both flow through the
+/// same event payload as `f64`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetryPolicyDecision {
+    /// The retry was inserted; carries an owned copy of the entry just
+    /// scheduled. The entry is also retrievable via
+    /// [`RetryQueue::get`].
+    ScheduleRetry(RetryEntry),
+    /// The configured `max_retries` cap was exceeded; nothing was
+    /// inserted into the queue. `observed` is `attempt as f64`, `cap`
+    /// is `max_retries as f64`.
+    BudgetExceeded {
+        /// The attempt number that tripped the cap, as a float for
+        /// event-payload symmetry with cost budgets.
+        observed: f64,
+        /// The configured `max_retries` cap, as a float.
+        cap: f64,
+    },
+}
+
 /// Pure scheduling table: at most one [`RetryEntry`] per issue.
 ///
 /// Owned by the poll loop. Not `Sync`-friendly (no interior
@@ -174,7 +202,51 @@ impl RetryQueue {
     /// same issue: the orchestrator owns at most one in-flight timer
     /// per issue. Replacement is silent — if you need to know whether
     /// an entry was overwritten, call [`Self::get`] first.
+    ///
+    /// This method ignores the `max_retries` budget; it is preserved as
+    /// a thin wrapper for callers that have not yet migrated to
+    /// [`Self::schedule_with_policy`]. New code should prefer the
+    /// policy-aware variant.
     pub fn schedule(&mut self, req: ScheduleRequest<'_>, cfg: &RetryConfig) -> &RetryEntry {
+        let id = req.id.clone();
+        match self.schedule_with_policy(req, cfg, u32::MAX) {
+            RetryPolicyDecision::ScheduleRetry(_) => {
+                // unwrap-safe: schedule_with_policy inserted under id.
+                &self.entries[&id]
+            }
+            RetryPolicyDecision::BudgetExceeded { .. } => {
+                // Unreachable: u32::MAX cannot be exceeded by a u32 attempt.
+                unreachable!("schedule() passed u32::MAX cap; cannot exceed")
+            }
+        }
+    }
+
+    /// Schedule (or replace) a retry for `id` *subject to a
+    /// `max_retries` budget*.
+    ///
+    /// Returns [`RetryPolicyDecision::ScheduleRetry`] with an owned
+    /// copy of the inserted entry when `attempt <= max_retries`, or
+    /// [`RetryPolicyDecision::BudgetExceeded`] when `attempt >
+    /// max_retries`. In the over-cap case the queue is **not** mutated
+    /// — no entry is inserted, and any prior entry for the same issue
+    /// is left untouched. This lets the caller decide whether to leave
+    /// the existing timer running, cancel it, or replace it via a
+    /// separate call.
+    ///
+    /// `attempt` is 1-based per SPEC §4.1.7. With `max_retries = 3` the
+    /// allowed attempts are 1, 2, and 3; attempt 4 trips the cap.
+    pub fn schedule_with_policy(
+        &mut self,
+        req: ScheduleRequest<'_>,
+        cfg: &RetryConfig,
+        max_retries: u32,
+    ) -> RetryPolicyDecision {
+        if req.attempt > max_retries {
+            return RetryPolicyDecision::BudgetExceeded {
+                observed: f64::from(req.attempt),
+                cap: f64::from(max_retries),
+            };
+        }
         let ScheduleRequest {
             id,
             identifier,
@@ -191,9 +263,8 @@ impl RetryQueue {
             error,
             reason,
         };
-        self.entries.insert(id.clone(), entry);
-        // unwrap-safe: we just inserted.
-        &self.entries[&id]
+        self.entries.insert(id, entry.clone());
+        RetryPolicyDecision::ScheduleRetry(entry)
     }
 
     /// Cancel a scheduled retry. Returns `true` iff one was removed.
@@ -462,6 +533,124 @@ mod tests {
         assert_eq!(due[1].0, iid("A"));
         assert!(due[0].1.due_at <= due[1].1.due_at);
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn schedule_with_policy_under_cap_inserts_and_returns_schedule_retry() {
+        let mut q = RetryQueue::new();
+        let now = Instant::now();
+        let c = cfg();
+        let decision = q.schedule_with_policy(
+            req("ENG-1", "ENG-1", 1, RetryReason::Failure, None, now),
+            &c,
+            3,
+        );
+        match decision {
+            RetryPolicyDecision::ScheduleRetry(entry) => {
+                assert_eq!(entry.attempt, 1);
+                assert_eq!(entry.due_at, now + Duration::from_millis(10_000));
+                // Returned entry mirrors the queued entry.
+                assert_eq!(q.get(&iid("ENG-1")), Some(&entry));
+            }
+            other => panic!("expected ScheduleRetry, got {other:?}"),
+        }
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn schedule_with_policy_at_cap_inserts_normally() {
+        // attempt == max_retries is *within* budget (1-based).
+        let mut q = RetryQueue::new();
+        let now = Instant::now();
+        let c = cfg();
+        let decision = q.schedule_with_policy(
+            req("ENG-1", "ENG-1", 3, RetryReason::Failure, None, now),
+            &c,
+            3,
+        );
+        assert!(matches!(decision, RetryPolicyDecision::ScheduleRetry(_)));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.get(&iid("ENG-1")).unwrap().attempt, 3);
+    }
+
+    #[test]
+    fn schedule_with_policy_over_cap_returns_budget_exceeded_and_does_not_insert() {
+        let mut q = RetryQueue::new();
+        let now = Instant::now();
+        let c = cfg();
+        let decision = q.schedule_with_policy(
+            req("ENG-1", "ENG-1", 4, RetryReason::Failure, None, now),
+            &c,
+            3,
+        );
+        assert_eq!(
+            decision,
+            RetryPolicyDecision::BudgetExceeded {
+                observed: 4.0,
+                cap: 3.0,
+            }
+        );
+        assert!(q.is_empty());
+        assert!(q.get(&iid("ENG-1")).is_none());
+    }
+
+    #[test]
+    fn schedule_with_policy_over_cap_does_not_disturb_prior_entry() {
+        let mut q = RetryQueue::new();
+        let now = Instant::now();
+        let c = cfg();
+        // Land a legitimate prior entry at attempt=2.
+        q.schedule_with_policy(
+            req("ENG-1", "ENG-1", 2, RetryReason::Failure, None, now),
+            &c,
+            3,
+        );
+        let prior = q.get(&iid("ENG-1")).cloned().unwrap();
+
+        // Over-cap call must not mutate the queue.
+        let decision = q.schedule_with_policy(
+            req("ENG-1", "ENG-1", 5, RetryReason::Failure, None, now),
+            &c,
+            3,
+        );
+        assert!(matches!(
+            decision,
+            RetryPolicyDecision::BudgetExceeded { .. }
+        ));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.get(&iid("ENG-1")), Some(&prior));
+
+        // Repeated over-cap calls are also no-ops on the queue.
+        for attempt in [4, 6, 100, u32::MAX] {
+            let _ = q.schedule_with_policy(
+                req("ENG-1", "ENG-1", attempt, RetryReason::Failure, None, now),
+                &c,
+                3,
+            );
+            assert_eq!(q.len(), 1);
+            assert_eq!(q.get(&iid("ENG-1")), Some(&prior));
+        }
+    }
+
+    #[test]
+    fn schedule_wrapper_ignores_cap_and_preserves_legacy_semantics() {
+        // The pre-existing schedule() wrapper must keep behaving as a
+        // cap-less insert, matching the migration note in the
+        // checklist: callers that have not migrated keep their current
+        // semantics.
+        let mut q = RetryQueue::new();
+        let now = Instant::now();
+        let c = cfg();
+        // attempt=999 would trip any sane cap, but schedule() ignores it.
+        let entry = q
+            .schedule(
+                req("ENG-1", "ENG-1", 999, RetryReason::Failure, None, now),
+                &c,
+            )
+            .clone();
+        assert_eq!(entry.attempt, 999);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.get(&iid("ENG-1")).unwrap().attempt, 999);
     }
 
     #[test]
