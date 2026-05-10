@@ -15,6 +15,7 @@ pub mod advisory;
 pub mod agent;
 pub mod blocker;
 pub mod blocker_gate;
+pub mod budget_exceeded;
 pub mod budget_pause_runner;
 pub mod budget_pause_tick;
 pub mod concurrency_gate;
@@ -76,6 +77,11 @@ pub use blocker::{
 };
 pub use blocker_gate::{
     BlockerGateError, GateOperation, OpenBlockerSnapshot, check_no_open_blockers, collect_open,
+};
+pub use budget_exceeded::{
+    BudgetExceededBridge, BudgetExceededEventLog, BudgetExceededEventSink,
+    BudgetExceededObservation, BudgetExceededSinkError, MAX_RETRIES_BUDGET_KIND,
+    RetryBudgetBridgeRequest,
 };
 pub use budget_pause_runner::{
     BudgetPauseDispatchOutcome, BudgetPauseDispatchReason, BudgetPauseDispatcher,
