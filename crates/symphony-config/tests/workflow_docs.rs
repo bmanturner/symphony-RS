@@ -7,6 +7,7 @@ use symphony_config::{RoleConfig, RoleKind, WorkflowLoader};
 const WORKFLOW_DOC: &str = include_str!("../../../docs/workflow.md");
 const ROLES_DOC: &str = include_str!("../../../docs/roles.md");
 const WORKSPACES_DOC: &str = include_str!("../../../docs/workspaces.md");
+const QA_DOC: &str = include_str!("../../../docs/qa.md");
 
 #[test]
 fn complete_workflow_example_in_docs_loads_and_validates() {
@@ -150,6 +151,54 @@ fn workspaces_doc_example_parses_as_workspace_and_branch_config() {
 
     assert!(!parsed.branching.allow_same_branch_for_children);
     assert!(parsed.branching.require_clean_tree_before_run);
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QaDocExample {
+    roles: BTreeMap<String, RoleConfig>,
+    qa: symphony_config::QaConfig,
+}
+
+#[test]
+fn qa_doc_example_parses_as_qa_config() {
+    let example = extract_marked_yaml(QA_DOC, "qa-example");
+    let parsed: QaDocExample =
+        serde_yaml::from_str(example).expect("documented QA example should parse");
+
+    assert_eq!(
+        parsed
+            .roles
+            .get("qa")
+            .expect("QA doc declares qa role")
+            .kind,
+        RoleKind::QaGate
+    );
+    assert_eq!(
+        parsed
+            .roles
+            .get("platform_lead")
+            .expect("QA doc declares waiver role")
+            .kind,
+        RoleKind::IntegrationOwner
+    );
+
+    assert_eq!(parsed.qa.owner_role.as_deref(), Some("qa"));
+    assert!(parsed.qa.required);
+    assert!(parsed.qa.exhaustive);
+    assert!(!parsed.qa.allow_static_only);
+    assert!(parsed.qa.can_file_blockers);
+    assert!(parsed.qa.can_file_followups);
+    assert_eq!(parsed.qa.waiver_roles, vec!["platform_lead".to_string()]);
+    assert!(parsed.qa.evidence_required.tests);
+    assert!(parsed.qa.evidence_required.changed_files_review);
+    assert!(parsed.qa.evidence_required.acceptance_criteria_trace);
+    assert!(
+        parsed
+            .qa
+            .evidence_required
+            .visual_or_runtime_evidence_when_applicable
+    );
 }
 
 fn extract_marked_yaml<'a>(doc: &'a str, marker: &str) -> &'a str {
