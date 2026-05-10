@@ -37,7 +37,8 @@ use async_trait::async_trait;
 use crate::decomposition::{ChildKey, DecompositionId, DecompositionProposal, DecompositionStatus};
 use crate::tracker::IssueId;
 use crate::tracker_trait::{
-    CreateIssueRequest, LinkParentChildRequest, TrackerCapabilities, TrackerError, TrackerMutations,
+    AddBlockerRequest, CreateIssueRequest, LinkParentChildRequest, TrackerCapabilities,
+    TrackerError, TrackerMutations,
 };
 
 /// Tracker-side outcome of one child issue creation.
@@ -72,6 +73,17 @@ pub struct AppliedDecomposition {
     pub proposal_id: DecompositionId,
     /// Per-child creation results in proposal declaration order.
     pub children: Vec<AppliedChild>,
+}
+
+/// Tracker-side policy for mirroring decomposition dependency blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyTrackerSyncMode {
+    /// Structural tracker blocker creation is required.
+    Required,
+    /// Structural tracker blocker creation is attempted when supported.
+    BestEffort,
+    /// Dependency truth stays local to Symphony; no tracker mutation runs.
+    LocalOnly,
 }
 
 /// Errors raised by [`apply_decomposition`].
@@ -116,6 +128,25 @@ pub enum ApplyError {
         key: ChildKey,
         /// Tracker id of the orphaned child.
         tracker_id: IssueId,
+        /// Underlying tracker error.
+        #[source]
+        source: TrackerError,
+    },
+    /// Workflow policy requires structural tracker dependency blockers,
+    /// but the configured tracker does not expose
+    /// [`TrackerCapabilities::add_blocker`].
+    #[error("tracker adapter does not support add_blocker")]
+    AddBlockerUnsupported,
+    /// A tracker-side dependency blocker failed to create after the
+    /// children already existed. The local dependency graph still belongs
+    /// in durable state; callers decide whether to keep the proposal
+    /// partial, retry, or proceed per policy.
+    #[error("syncing dependency blocker {blocker} -> {blocked} failed: {source}")]
+    DependencyBlockerSyncFailed {
+        /// Proposal-local key of the prerequisite child.
+        blocker: ChildKey,
+        /// Proposal-local key of the waiting child.
+        blocked: ChildKey,
         /// Underlying tracker error.
         #[source]
         source: TrackerError,
@@ -204,6 +235,75 @@ pub async fn apply_decomposition(
         proposal_id: proposal.id,
         children: applied,
     })
+}
+
+/// Mirror decomposition `depends_on` edges to a structural tracker
+/// blocker surface.
+///
+/// Direction is intentionally centralized here: for `api depends_on
+/// schema`, the tracker request is `blocker = schema`, `blocked = api`.
+/// `LocalOnly` skips all tracker calls; `BestEffort` skips when the
+/// tracker lacks support; `Required` refuses unsupported trackers and
+/// surfaces mutation failure.
+pub async fn sync_decomposition_dependency_blockers(
+    proposal: &DecompositionProposal,
+    applied: &AppliedDecomposition,
+    tracker: &dyn TrackerMutations,
+    capabilities: TrackerCapabilities,
+    mode: DependencyTrackerSyncMode,
+) -> Result<(), ApplyError> {
+    if mode == DependencyTrackerSyncMode::LocalOnly {
+        return Ok(());
+    }
+    if !capabilities.add_blocker {
+        return if mode == DependencyTrackerSyncMode::Required {
+            Err(ApplyError::AddBlockerUnsupported)
+        } else {
+            Ok(())
+        };
+    }
+
+    let tracker_ids: std::collections::HashMap<&ChildKey, &IssueId> = applied
+        .children
+        .iter()
+        .map(|child| (&child.key, &child.tracker_id))
+        .collect();
+
+    for child in &proposal.children {
+        let Some(blocked_tracker_id) = tracker_ids.get(&child.key).copied() else {
+            return Err(ApplyError::ChildCreationFailed {
+                key: child.key.clone(),
+                source: TrackerError::Other(format!(
+                    "missing applied child for dependency sync key {}",
+                    child.key
+                )),
+            });
+        };
+        for dependency in &child.depends_on {
+            let Some(blocker_tracker_id) = tracker_ids.get(dependency).copied() else {
+                return Err(ApplyError::ChildCreationFailed {
+                    key: dependency.clone(),
+                    source: TrackerError::Other(format!(
+                        "missing applied dependency child for key {dependency}"
+                    )),
+                });
+            };
+            tracker
+                .add_blocker(AddBlockerRequest {
+                    blocked: blocked_tracker_id.clone(),
+                    blocker: blocker_tracker_id.clone(),
+                    reason: Some(format!("{} depends on {}", child.key, dependency)),
+                })
+                .await
+                .map_err(|source| ApplyError::DependencyBlockerSyncFailed {
+                    blocker: dependency.clone(),
+                    blocked: child.key.clone(),
+                    source,
+                })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Render a child's tracker body from its scope, description, and
@@ -332,6 +432,7 @@ mod tests {
     enum TrackerCall {
         Create(CreateIssueRequest),
         Link(LinkParentChildRequest),
+        AddBlocker(AddBlockerRequest),
     }
 
     impl RecordingTracker {
@@ -400,9 +501,15 @@ mod tests {
 
         async fn add_blocker(
             &self,
-            _request: AddBlockerRequest,
+            request: AddBlockerRequest,
         ) -> TrackerResult<AddBlockerResponse> {
-            unreachable!("applier never calls add_blocker")
+            self.calls
+                .lock()
+                .unwrap()
+                .push(TrackerCall::AddBlocker(request));
+            Ok(AddBlockerResponse {
+                edge_id: Some("edge-1".to_string()),
+            })
         }
 
         async fn link_parent_child(
@@ -638,5 +745,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.children.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_dependency_blockers_calls_tracker_in_dependency_direction() {
+        let proposal = proposal(FollowupPolicy::CreateDirectly);
+        let tracker = RecordingTracker::new();
+        let applied = apply_decomposition(
+            &proposal,
+            &IssueId::new("100"),
+            &tracker,
+            TrackerCapabilities::FULL,
+        )
+        .await
+        .unwrap();
+
+        sync_decomposition_dependency_blockers(
+            &proposal,
+            &applied,
+            &tracker,
+            TrackerCapabilities::FULL,
+            DependencyTrackerSyncMode::BestEffort,
+        )
+        .await
+        .unwrap();
+
+        let calls = tracker.calls();
+        let blocker = calls
+            .iter()
+            .find_map(|call| match call {
+                TrackerCall::AddBlocker(req) => Some(req),
+                _ => None,
+            })
+            .expect("dependency blocker call");
+        assert_eq!(blocker.blocker.as_str(), "1000");
+        assert_eq!(blocker.blocked.as_str(), "1001");
+        assert_eq!(blocker.reason.as_deref(), Some("b depends on a"));
+    }
+
+    #[tokio::test]
+    async fn local_only_dependency_sync_skips_tracker_calls() {
+        let proposal = proposal(FollowupPolicy::CreateDirectly);
+        let tracker = RecordingTracker::new();
+        let applied = AppliedDecomposition {
+            proposal_id: proposal.id,
+            children: vec![
+                AppliedChild {
+                    key: ChildKey::new("a"),
+                    tracker_id: IssueId::new("A"),
+                    identifier: "A".to_string(),
+                    url: None,
+                    linked_parent: false,
+                },
+                AppliedChild {
+                    key: ChildKey::new("b"),
+                    tracker_id: IssueId::new("B"),
+                    identifier: "B".to_string(),
+                    url: None,
+                    linked_parent: false,
+                },
+            ],
+        };
+
+        sync_decomposition_dependency_blockers(
+            &proposal,
+            &applied,
+            &tracker,
+            TrackerCapabilities::FULL,
+            DependencyTrackerSyncMode::LocalOnly,
+        )
+        .await
+        .unwrap();
+
+        assert!(tracker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn required_dependency_sync_rejects_missing_capability() {
+        let proposal = proposal(FollowupPolicy::CreateDirectly);
+        let tracker = RecordingTracker::new();
+        let applied = AppliedDecomposition {
+            proposal_id: proposal.id,
+            children: Vec::new(),
+        };
+        let err = sync_decomposition_dependency_blockers(
+            &proposal,
+            &applied,
+            &tracker,
+            TrackerCapabilities {
+                create_issue: true,
+                add_blocker: false,
+                ..TrackerCapabilities::READ_ONLY
+            },
+            DependencyTrackerSyncMode::Required,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::AddBlockerUnsupported));
+    }
+
+    #[tokio::test]
+    async fn best_effort_dependency_sync_skips_missing_capability() {
+        let proposal = proposal(FollowupPolicy::CreateDirectly);
+        let tracker = RecordingTracker::new();
+        let applied = AppliedDecomposition {
+            proposal_id: proposal.id,
+            children: Vec::new(),
+        };
+        sync_decomposition_dependency_blockers(
+            &proposal,
+            &applied,
+            &tracker,
+            TrackerCapabilities {
+                create_issue: true,
+                add_blocker: false,
+                ..TrackerCapabilities::READ_ONLY
+            },
+            DependencyTrackerSyncMode::BestEffort,
+        )
+        .await
+        .unwrap();
+        assert!(tracker.calls().is_empty());
     }
 }

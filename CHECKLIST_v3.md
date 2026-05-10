@@ -41,7 +41,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 4 — Tracker Dependency Sync
 
-- [ ] Add orchestration path that calls `TrackerMutations::add_blocker` for each decomposition dependency edge when capability and policy allow.
+- [x] Add orchestration path that calls `TrackerMutations::add_blocker` for each decomposition dependency edge when capability and policy allow.
 - [ ] Persist returned tracker edge IDs where adapters provide them.
 - [ ] Implement `tracker_sync: required` behavior: keep affected children blocked when tracker blocker mutation fails.
 - [ ] Implement `tracker_sync: best_effort` behavior: local gating remains authoritative while failed tracker sync is visible/retryable.
