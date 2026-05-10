@@ -66,13 +66,13 @@ mock agent.
 
 ## Phase 5 — `submit_handoff` Write Tool
 
-- [ ] Implement `SubmitHandoffHandler`. Payload deserializes into the existing `crates/symphony-core/src/handoff.rs::Handoff` shape.
-- [ ] Run `Handoff::validate` on the deserialized value before persisting.
-- [ ] On success, persist via `HandoffRepository::create_handoff` inside a `transaction.rs` envelope so the run's terminal event and the handoff land atomically.
-- [ ] Compute the kernel `ReadyForConsequence` and enqueue the next runner accordingly.
-- [ ] On invalid shape, return `ToolError::InvalidPayload` with the failing field.
-- [ ] When the agent has called `submit_handoff`, the orchestrator MUST short-circuit the Phase 11 text-extraction path so the handoff is not double-counted.
-- [ ] Add tests covering: success, invalid shape, double-submit (second call returns idempotency-style success referring to the first row).
+- [x] Implement `SubmitHandoffHandler`. Payload deserializes into the existing `crates/symphony-core/src/handoff.rs::Handoff` shape.
+- [x] Run `Handoff::validate` on the deserialized value before persisting.
+- [x] On success, persist via `HandoffRepository::create_handoff` inside a `transaction.rs` envelope so the run's terminal event and the handoff land atomically.
+- [x] Compute the kernel `ReadyForConsequence` and enqueue the next runner accordingly.
+- [x] On invalid shape, return `ToolError::InvalidPayload` with the failing field.
+- [x] When the agent has called `submit_handoff`, the orchestrator MUST short-circuit the Phase 11 text-extraction path so the handoff is not double-counted.
+- [x] Add tests covering: success, invalid shape, double-submit (second call returns idempotency-style success referring to the first row).
 
 ## Phase 6 — `record_qa_verdict` Write Tool
 
