@@ -61,13 +61,13 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 6 — Reconciliation and Auto-Resolution
 
-- [ ] Add reconciliation tick logic that fetches current tracker states for blocker/blocked children.
+- [x] Add reconciliation tick logic that fetches current tracker states for blocker/blocked children.
 - [x] Auto-resolve decomposition-sourced local blocker edges when the blocker child reaches terminal state and policy allows.
-- [ ] Keep the dependent child blocked when local terminal state and tracker blocker state disagree; emit a reconciliation warning/event.
+- [x] Keep the dependent child blocked when local terminal state and tracker blocker state disagree; emit a reconciliation warning/event.
 - [ ] Retry failed tracker edge syncs for `required` and `best_effort` policies.
 - [x] Recompute specialist queue eligibility for newly unblocked children on the next tick.
 - [x] Add tests for terminal blocker child unblocking dependent child.
-- [ ] Add tests for tracker/local disagreement choosing the safer blocked state.
+- [x] Add tests for tracker/local disagreement choosing the safer blocked state.
 - [ ] Add tests for failed sync retry counters and eventual success.
 
 ## Phase 7 — Integration and QA Gate Interactions

@@ -8,7 +8,7 @@
 
 use symphony_core::work_item::WorkItemStatusClass;
 
-use crate::edges::WorkItemEdgeRepository;
+use crate::edges::{EdgeId, WorkItemEdgeRecord, WorkItemEdgeRepository};
 use crate::repository::WorkItemRepository;
 use crate::{StateDb, StateResult};
 
@@ -20,9 +20,48 @@ pub struct DependencyReconciliationReport {
     /// Blocked children released to `ready` because no open blockers
     /// remained after edge resolution.
     pub released_children: usize,
+    /// Safer-blocked disagreements observed while comparing terminal
+    /// local children with tracker-side structural blocker state.
+    pub warnings: Vec<DependencyReconciliationWarning>,
 }
 
-/// Resolve decomposition blockers whose blocker child is terminal.
+/// Warning emitted by a reconciliation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyReconciliationWarning {
+    /// Local dependency edge that stayed open.
+    pub edge_id: EdgeId,
+    /// Operator-facing explanation.
+    pub message: String,
+}
+
+/// Tracker-side blocker state observed during reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerDependencyState {
+    /// Tracker still reports the structural blocker relation open.
+    Open,
+    /// Tracker agrees the relation no longer blocks.
+    Resolved,
+    /// Tracker cannot currently answer. The local terminal state is used.
+    Unknown,
+}
+
+/// Probe used by reconciliation to compare local and tracker truth.
+pub trait TrackerDependencyStateProvider {
+    /// Return the current tracker-side state for `edge`.
+    fn dependency_state(&self, edge: &WorkItemEdgeRecord) -> StateResult<TrackerDependencyState>;
+}
+
+#[derive(Debug, Default)]
+struct LocalOnlyTrackerDependencyState;
+
+impl TrackerDependencyStateProvider for LocalOnlyTrackerDependencyState {
+    fn dependency_state(&self, _edge: &WorkItemEdgeRecord) -> StateResult<TrackerDependencyState> {
+        Ok(TrackerDependencyState::Unknown)
+    }
+}
+
+/// Resolve decomposition blockers whose blocker child is terminal using
+/// local state when no tracker probe is available.
 ///
 /// The query source is
 /// [`WorkItemEdgeRepository::list_decomposition_blockers_with_terminal_blocker`],
@@ -34,11 +73,40 @@ pub fn reconcile_terminal_decomposition_blockers(
     db: &mut StateDb,
     now: &str,
 ) -> StateResult<DependencyReconciliationReport> {
+    reconcile_terminal_decomposition_blockers_with_tracker(
+        db,
+        now,
+        &LocalOnlyTrackerDependencyState,
+    )
+}
+
+/// Resolve terminal decomposition blockers after probing tracker state.
+///
+/// If tracker state says the structural blocker relation is still open,
+/// local reconciliation chooses the safer state: the edge remains open,
+/// the child stays blocked, and a warning is returned for operator
+/// surfaces to persist or display.
+pub fn reconcile_terminal_decomposition_blockers_with_tracker(
+    db: &mut StateDb,
+    now: &str,
+    tracker: &dyn TrackerDependencyStateProvider,
+) -> StateResult<DependencyReconciliationReport> {
     let eligible = db.list_decomposition_blockers_with_terminal_blocker()?;
     let mut resolved_edges = 0usize;
     let mut released_children = 0usize;
+    let mut warnings = Vec::new();
 
     for edge in eligible {
+        if tracker.dependency_state(&edge)? == TrackerDependencyState::Open {
+            warnings.push(DependencyReconciliationWarning {
+                edge_id: edge.id,
+                message:
+                    "local blocker child is terminal, but tracker blocker relation is still open"
+                        .into(),
+            });
+            continue;
+        }
+
         if db.update_edge_status(edge.id, "resolved")? {
             resolved_edges += 1;
         }
@@ -58,6 +126,7 @@ pub fn reconcile_terminal_decomposition_blockers(
     Ok(DependencyReconciliationReport {
         resolved_edges,
         released_children,
+        warnings,
     })
 }
 
@@ -116,6 +185,7 @@ mod tests {
             DependencyReconciliationReport {
                 resolved_edges: 1,
                 released_children: 1,
+                warnings: Vec::new(),
             }
         );
         assert_eq!(db.get_edge(edge.id).unwrap().unwrap().status, "resolved");
@@ -183,6 +253,51 @@ mod tests {
         assert_eq!(db.get_edge(qa_edge.id).unwrap().unwrap().status, "open");
         assert_eq!(
             db.get_work_item(blocked).unwrap().unwrap().status_class,
+            "blocked"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FixedTrackerState(TrackerDependencyState);
+
+    impl TrackerDependencyStateProvider for FixedTrackerState {
+        fn dependency_state(
+            &self,
+            _edge: &WorkItemEdgeRecord,
+        ) -> StateResult<TrackerDependencyState> {
+            Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn tracker_local_disagreement_keeps_dependent_child_blocked() {
+        let mut db = open();
+        let a = seed_item(&mut db, "A", "done");
+        let b = seed_item(&mut db, "B", "blocked");
+        let edge = db
+            .create_decomposition_blocker_edges(&[NewDecompositionBlockerEdge {
+                blocker_id: a,
+                blocked_id: b,
+                reason: "B depends on A",
+                now: "2026-05-10T00:00:00Z",
+            }])
+            .unwrap()
+            .remove(0);
+
+        let report = reconcile_terminal_decomposition_blockers_with_tracker(
+            &mut db,
+            "2026-05-10T00:01:00Z",
+            &FixedTrackerState(TrackerDependencyState::Open),
+        )
+        .unwrap();
+
+        assert_eq!(report.resolved_edges, 0);
+        assert_eq!(report.released_children, 0);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].edge_id, edge.id);
+        assert_eq!(db.get_edge(edge.id).unwrap().unwrap().status, "open");
+        assert_eq!(
+            db.get_work_item(b).unwrap().unwrap().status_class,
             "blocked"
         );
     }
