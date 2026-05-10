@@ -306,6 +306,23 @@ Work from the structured run context. Specialists own scoped child work, the int
 
 `roles` is the workflow org chart. Role names are configurable, but two semantic kinds matter to the kernel: `integration_owner` and `qa_gate`. Other supported kinds are `specialist`, `reviewer`, `operator`, and `custom`.
 
+Roles may reference instruction packs:
+
+```yaml
+roles:
+  backend_engineer:
+    kind: specialist
+    instructions:
+      role_prompt: .symphony/roles/backend_engineer/AGENTS.md
+      soul: .symphony/roles/backend_engineer/SOUL.md
+```
+
+Both paths resolve relative to the workflow root and must point to
+files. The loader reads them before dispatch so missing role doctrine
+fails fast, before any workspace claim or agent launch. `AGENTS.md`
+should hold role-specific operating instructions; `SOUL.md` should
+hold the stable quality bar and judgment doctrine for that role.
+
 `agents` defines backend profiles independent from role names. Product backends are `codex`, `claude`, and `hermes`; `mock` is for tests and fixtures. Composite `strategy: tandem` profiles wrap two concrete profiles and can run `draft_review`, `split_implement`, or `consensus`.
 
 Use `command` for the executable or shell entrypoint, `args` for
@@ -324,6 +341,28 @@ roles, agents, global `routing.rules`, and role-local assignment
 metadata. Do not create parallel per-role `ASSIGNMENT.md` files for
 normal operation; they drift from the routing contract and are not the
 catalog source of truth.
+
+Use `roles.<role>.assignment` to make the generated catalog useful:
+
+```yaml
+roles:
+  frontend_engineer:
+    kind: specialist
+    assignment:
+      owns: [CLI output, TUI screens, prompt preview surfaces]
+      does_not_own: [database migrations]
+      requires: [terminal viewport constraints, sample data]
+      handoff_expectations: [screens touched, visual/runtime evidence]
+      routing_hints:
+        labels_any: [frontend, tui]
+        paths_any: [crates/symphony-cli/src/tui/**]
+```
+
+The catalog includes eligible child implementers and support roles:
+specialists by default, plus reviewers/operators when assignment
+metadata or routing rules make them actionable. It excludes the current
+platform lead and excludes QA as a normal child implementer. QA remains
+the verification gate over integrated output.
 
 Prompt issue context is intentionally bounded. Every issue prompt can
 see `identifier`, `title`, `description`, `state`, `labels`,
@@ -360,6 +399,22 @@ cargo run -p symphony-cli -- issue graph <work_item_id> --state-db symphony.sqli
 ```
 
 For each blocker edge, `issue graph` shows the peer issue, reason, source, local edge status, tracker sync status, and next action. Failed dependency syncs surface as `tracker_sync_status = failed` with `next_action = retry_tracker_sync`; local-only edges show `next_action = wait_for_local_resolution`.
+
+Prompt and catalog previews are available without launching agents:
+
+```bash
+cargo run -p symphony-cli -- debug prompt WORKFLOW.md --role backend_engineer --identifier ENG-42 --title "Add cache"
+cargo run -p symphony-cli -- debug prompt WORKFLOW.md --role backend_engineer --json
+cargo run -p symphony-cli -- debug catalog WORKFLOW.md --role platform_lead
+cargo run -p symphony-cli -- debug catalog WORKFLOW.md --role platform_lead --json
+```
+
+`debug prompt` renders the global workflow prompt, current role
+instruction pack, synthetic issue context, workspace placeholder, and
+output schema. It redacts secret-looking instruction text by default
+while preserving provenance metadata; use `--unsafe-unredacted` only in
+a trusted terminal. `debug catalog --json` is the stable machine-readable
+surface for tooling that wants the platform-lead assignment catalog.
 
 `workspace` declares named workspace strategies. `git_worktree` creates isolated worktrees. `existing_worktree` reuses a known path and verifies its branch. `shared_branch` is only legal when `branching.allow_same_branch_for_children` is true.
 

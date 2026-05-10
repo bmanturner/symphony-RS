@@ -126,11 +126,11 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 12 — Documentation
 
-- [ ] Document role instruction packs in `docs/roles.md`.
-- [ ] Document generated platform-lead assignment catalog in `docs/workflow.md`.
-- [ ] Document recommended `.symphony/roles/<role>/AGENTS.md` and `SOUL.md` conventions.
-- [ ] Document why `ASSIGNMENT.md` is not required: assignment guidance is structured in `WORKFLOW.md` and rendered automatically.
-- [ ] Document prompt preview/debug commands.
+- [x] Document role instruction packs in `docs/roles.md`.
+- [x] Document generated platform-lead assignment catalog in `docs/workflow.md`.
+- [x] Document recommended `.symphony/roles/<role>/AGENTS.md` and `SOUL.md` conventions.
+- [x] Document why `ASSIGNMENT.md` is not required: assignment guidance is structured in `WORKFLOW.md` and rendered automatically.
+- [x] Document prompt preview/debug commands.
 
 ## Phase 13 — Forward Reference
 
