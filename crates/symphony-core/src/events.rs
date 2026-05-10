@@ -252,6 +252,49 @@ pub enum OrchestratorEvent {
         /// Configured cap on the contended scope.
         cap: u32,
     },
+
+    /// A budget cap was exceeded — the orchestrator must pause work
+    /// rather than dispatch.
+    ///
+    /// Today the only emitter is the retry-cap policy
+    /// ([`crate::retry`]): when an issue's `attempt` exceeds the
+    /// configured `budgets.max_retries`, the scheduler emits this
+    /// event instead of inserting another [`crate::retry::RetryEntry`]
+    /// and enqueues a durable [`crate::budget_pause_runner`] dispatch.
+    /// Future budget kinds (cost-per-issue, turns-per-run, etc.) reuse
+    /// the same variant with a different `budget_kind` discriminator.
+    ///
+    /// Like `ScopeCapReached` this is a *policy* event, not a
+    /// dispatched run, so it carries no agent session and is exempt
+    /// from any future `expects_lease()` predicate. Per-episode dedup
+    /// (so a long stream of cap-exceeded ticks emits one event, not
+    /// one per tick) is the broadcaster's responsibility.
+    BudgetExceeded {
+        /// Durable run row that tripped the cap, when the failure
+        /// path reserved one. `None` for continuation-driven caps and
+        /// for callers that key purely on `identifier`. Wire shape
+        /// matches `ScopeCapReached.run_id` (transparent integer);
+        /// see [`crate::blocker::RunRef`].
+        #[serde(default)]
+        run_id: Option<i64>,
+        /// Tracker-facing identifier of the work item the cap pertains
+        /// to (e.g. an issue id). Always present — budget pauses are
+        /// keyed on `(budget_kind, identifier)` in the budget-pause
+        /// queue, so the wire mirrors that key.
+        identifier: String,
+        /// Stable string discriminator for the cap that tripped (e.g.
+        /// `"max_retries"`, `"max_cost_per_issue_usd"`,
+        /// `"max_turns_per_run"`). Free-form so adding a budget kind
+        /// is non-breaking; consumers route on this field.
+        budget_kind: String,
+        /// Observed value at the moment of exceedance, in the cap's
+        /// natural units (attempts for `max_retries`, USD for
+        /// `max_cost_per_issue_usd`, turns for `max_turns_per_run`).
+        /// Encoded as `f64` so heterogeneous units share one shape.
+        observed: f64,
+        /// Configured cap, in the same units as `observed`.
+        cap: f64,
+    },
 }
 
 impl OrchestratorEvent {
@@ -270,9 +313,9 @@ impl OrchestratorEvent {
             | OrchestratorEvent::Agent { issue, .. }
             | OrchestratorEvent::RetryScheduled { issue, .. }
             | OrchestratorEvent::Released { issue, .. } => Some(issue),
-            OrchestratorEvent::Reconciled { .. } | OrchestratorEvent::ScopeCapReached { .. } => {
-                None
-            }
+            OrchestratorEvent::Reconciled { .. }
+            | OrchestratorEvent::ScopeCapReached { .. }
+            | OrchestratorEvent::BudgetExceeded { .. } => None,
         }
     }
 
@@ -290,6 +333,7 @@ impl OrchestratorEvent {
             OrchestratorEvent::Reconciled { .. } => "reconciled",
             OrchestratorEvent::Released { .. } => "released",
             OrchestratorEvent::ScopeCapReached { .. } => "scope_cap_reached",
+            OrchestratorEvent::BudgetExceeded { .. } => "budget_exceeded",
         }
     }
 }
@@ -523,11 +567,87 @@ mod tests {
                 in_flight: 1,
                 cap: 1,
             },
+            OrchestratorEvent::BudgetExceeded {
+                run_id: Some(11),
+                identifier: "ENG-6".into(),
+                budget_kind: "max_retries".into(),
+                observed: 4.0,
+                cap: 3.0,
+            },
+            OrchestratorEvent::BudgetExceeded {
+                run_id: None,
+                identifier: "ENG-7".into(),
+                budget_kind: "max_cost_per_issue_usd".into(),
+                observed: 12.5,
+                cap: 10.0,
+            },
         ];
         for ev in cases {
             let s = serde_json::to_string(&ev).unwrap();
             let back: OrchestratorEvent = serde_json::from_str(&s).unwrap();
             assert_eq!(ev, back);
+        }
+    }
+
+    #[test]
+    fn budget_exceeded_serialises_with_type_tag_and_snake_case_kind() {
+        // Failure-driven cap: a specific run row tripped the cap.
+        let ev = OrchestratorEvent::BudgetExceeded {
+            run_id: Some(42),
+            identifier: "ENG-9".into(),
+            budget_kind: "max_retries".into(),
+            observed: 4.0,
+            cap: 3.0,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"], "budget_exceeded");
+        assert_eq!(v["run_id"], 42);
+        assert_eq!(v["identifier"], "ENG-9");
+        assert_eq!(v["budget_kind"], "max_retries");
+        assert_eq!(v["observed"], 4.0);
+        assert_eq!(v["cap"], 3.0);
+        assert!(ev.issue().is_none());
+        assert_eq!(ev.kind(), "budget_exceeded");
+    }
+
+    #[test]
+    fn budget_exceeded_carries_optional_run_id_for_continuation_caps() {
+        // Continuation caps (e.g. cost-per-issue, turns-per-run) are
+        // not associated with a specific failed run row, so run_id is
+        // absent. Identifier remains required.
+        let ev = OrchestratorEvent::BudgetExceeded {
+            run_id: None,
+            identifier: "ENG-10".into(),
+            budget_kind: "max_cost_per_issue_usd".into(),
+            observed: 12.50,
+            cap: 10.00,
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        let back: OrchestratorEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn budget_exceeded_deserialises_with_default_run_id() {
+        // Future emitters may omit run_id entirely. The serde default
+        // must accept that without breaking decode.
+        let raw = r#"{"type":"budget_exceeded","identifier":"ENG-11","budget_kind":"max_turns_per_run","observed":21.0,"cap":20.0}"#;
+        let ev: OrchestratorEvent = serde_json::from_str(raw).unwrap();
+        match ev {
+            OrchestratorEvent::BudgetExceeded {
+                run_id,
+                identifier,
+                budget_kind,
+                observed,
+                cap,
+            } => {
+                assert!(run_id.is_none());
+                assert_eq!(identifier, "ENG-11");
+                assert_eq!(budget_kind, "max_turns_per_run");
+                assert!((observed - 21.0).abs() < f64::EPSILON);
+                assert!((cap - 20.0).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 }

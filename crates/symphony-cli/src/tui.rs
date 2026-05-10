@@ -645,6 +645,26 @@ impl AppState {
                     identifier.clone(),
                 );
             }
+            OrchestratorEvent::BudgetExceeded {
+                run_id,
+                identifier,
+                budget_kind,
+                observed,
+                cap,
+            } => {
+                let label = if identifier.is_empty() {
+                    run_id
+                        .map(|id| format!("run#{id}"))
+                        .unwrap_or_else(|| "<unknown>".into())
+                } else {
+                    identifier.clone()
+                };
+                self.push_recent(
+                    "budget_exceeded",
+                    format!("{label} hit {budget_kind} budget {observed}/{cap}"),
+                    Some(identifier.clone()),
+                );
+            }
         }
     }
 
