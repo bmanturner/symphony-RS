@@ -16,6 +16,7 @@ mod cli;
 mod dashboard;
 mod issue;
 mod logging;
+mod prompt_builders;
 mod qa;
 mod recover;
 mod run;

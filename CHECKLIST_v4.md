@@ -71,18 +71,18 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 6 — Platform Lead Decomposition and Integration Prompts
 
-- [ ] Add a decomposition-specific prompt builder for platform-lead decomposition runs.
-- [ ] Include global workflow prompt, platform-lead `role_prompt`, platform-lead `soul`, parent issue/repo context, decomposition policy, role catalog, dependency/blocker rules, and decomposition output schema. (The `decomposition output schema` section reduces to a brief prose pointer once the `propose_decomposition` MCP tool lands in `CHECKLIST_v5.md`; for v4 it remains an inlined schema so the live decomposition path has a working surface either way.)
-- [ ] Include the generated role catalog for every eligible child-owning role.
-- [ ] Exclude full specialist SOUL files from platform-lead prompts; include role assignment metadata and concise instruction-pack summaries only.
-- [ ] Include global routing rules and role-local routing hints so the platform lead can assign child issues deterministically.
-- [ ] Add tests proving decomposition prompts include catalog entries for backend/frontend/operator/reviewer roles when eligible.
-- [ ] Add tests proving QA is not listed as a normal implementation child role unless workflow explicitly allows manual QA task issues.
-- [ ] Add tests proving platform lead has enough prompt context to emit `assigned_role` for each child without guessing from terse descriptions.
-- [ ] Add an integration-owner prompt builder (SPEC v4 §5 integration block) for the consolidation/PR phase, distinct from the decomposition phase.
-- [ ] Surface latest `Handoff` per child (SPEC v4 §5.2) in the integration-owner prompt: `summary`, `changed_files`, `tests_run`, `verification_evidence`, `known_risks`, `branch_or_workspace`, `ready_for`. Read from `HandoffRepository::latest_handoff` via `IntegrationChild.latest_handoff`.
-- [ ] Add tests proving the integration-owner prompt includes each child's latest handoff fields and not just bare `identifier`/`title`/`status`.
-- [ ] Add tests proving the integration-owner prompt distinguishes children that produced no handoff (e.g. waived) from children with handoffs.
+- [x] Add a decomposition-specific prompt builder for platform-lead decomposition runs.
+- [x] Include global workflow prompt, platform-lead `role_prompt`, platform-lead `soul`, parent issue/repo context, decomposition policy, role catalog, dependency/blocker rules, and decomposition output schema. (The `decomposition output schema` section reduces to a brief prose pointer once the `propose_decomposition` MCP tool lands in `CHECKLIST_v5.md`; for v4 it remains an inlined schema so the live decomposition path has a working surface either way.)
+- [x] Include the generated role catalog for every eligible child-owning role.
+- [x] Exclude full specialist SOUL files from platform-lead prompts; include role assignment metadata and concise instruction-pack summaries only.
+- [x] Include global routing rules and role-local routing hints so the platform lead can assign child issues deterministically.
+- [x] Add tests proving decomposition prompts include catalog entries for backend/frontend/operator/reviewer roles when eligible.
+- [x] Add tests proving QA is not listed as a normal implementation child role unless workflow explicitly allows manual QA task issues.
+- [x] Add tests proving platform lead has enough prompt context to emit `assigned_role` for each child without guessing from terse descriptions.
+- [x] Add an integration-owner prompt builder (SPEC v4 §5 integration block) for the consolidation/PR phase, distinct from the decomposition phase.
+- [x] Surface latest `Handoff` per child (SPEC v4 §5.2) in the integration-owner prompt: `summary`, `changed_files`, `tests_run`, `verification_evidence`, `known_risks`, `branch_or_workspace`, `ready_for`. Read from `HandoffRepository::latest_handoff` via `IntegrationChild.latest_handoff`.
+- [x] Add tests proving the integration-owner prompt includes each child's latest handoff fields and not just bare `identifier`/`title`/`status`.
+- [x] Add tests proving the integration-owner prompt distinguishes children that produced no handoff (e.g. waived) from children with handoffs.
 
 ## Phase 7 — Specialist Prompts
 
