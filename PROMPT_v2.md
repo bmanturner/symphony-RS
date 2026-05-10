@@ -10,7 +10,7 @@ Read these files first, in this order:
 4. `CHECKLIST_v2.md` — executable iteration queue.
 5. Existing implementation files (`SPEC.md`, `ARCHITECTURE.md`, `PLAN.md`, `CHECKLIST.md`) as current-state context to reshape, not preserve.
 
-The goal is to shape Symphony-RS directly into a product that captures the useful essence of the Paperclip workflow: specialist decomposition, single-owner integration, relentless QA, blockers, follow-ups, and durable evidence.
+The goal is to shape Symphony-RS directly into a product that captures the useful essence of the Paperclip workflow: specialist decomposition, single-owner integration, rigorous QA, blockers, follow-ups, and durable evidence.
 
 ## North Star
 
@@ -29,6 +29,7 @@ If a change makes agents run but weakens integration truth or QA authority, it i
    - Default role name may be `qa`.
    - Semantic role kind is `qa_gate`.
    - QA can reject, file blockers, file follow-ups, and force rework.
+   - QA rigor scales to the risk of the change. Not every task needs exhaustive verification; pick the strongest check that fits the change.
 
 3. **Specialists are configurable.**
    - Do not hardcode a fixed org chart.
@@ -65,9 +66,11 @@ Read the v2 files listed above. If they are missing, restore or create them befo
 
 Open `CHECKLIST_v2.md`. Pick the first unchecked item whose dependencies are satisfied.
 
-If the next item is too large, add a decomposition item above it and complete that decomposition first.
+Default to doing the item. If a task fits in roughly one focused commit (~200 LOC including tests), just do it — do not decompose. Only decompose when a task genuinely cannot be landed as one coherent change, and when you do, break it down in your head and do the first piece in this iteration. Do not commit checklist edits as their own iteration; decomposition is planning, not progress.
 
-One checklist item = one commit.
+Checklist items are at most one level of sub-bullets. No sub-sub-items.
+
+One commit = one coherent change.
 
 ### Step 3 — Implement with tests
 
@@ -98,7 +101,7 @@ If the environment lacks Rust/Cargo, do not claim verification. State the limita
 ### Step 5 — Update state files
 
 - Tick the completed item in `CHECKLIST_v2.md`.
-- Add newly discovered follow-up work to `CHECKLIST_v2.md`.
+- Only add new checklist items for work that genuinely blocks the North Star. Otherwise note observations in the commit body and move on. Default to *not* adding items.
 - Add architectural decisions to `ARCHITECTURE_v2.md` as ADRs.
 - Keep `PLAN_v2.md` strategic; do not dump task noise there.
 
@@ -147,8 +150,13 @@ Good: make early close impossible in the state transition function.
 
 ### Follow-up suppression
 
-Bad: agents hide adjacent problems because they are out of scope.
-Good: agents file/propose follow-ups and mark whether they block current acceptance.
+Bad: agents hide adjacent problems that genuinely block the North Star.
+Good: agents surface adjacent problems that matter; they note minor observations in the commit body rather than spawning checklist items for every drive-by thought.
+
+### Decomposition sprawl
+
+Bad: every task spawns a "decompose X" entry plus 5–8 sub-items, and the decomposition entry itself counts as progress.
+Good: tasks that fit in one coherent commit get done. Decomposition happens in your head, not as a committed checklist edit. Finishing is the goal; the checklist should shrink, not grow.
 
 ## Completion Sentinel
 

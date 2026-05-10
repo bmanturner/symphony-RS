@@ -200,6 +200,13 @@ pub trait RunRepository {
 
     /// Update only the run's lifecycle status. Returns `Ok(false)` if the
     /// row does not exist.
+    ///
+    /// Now a thin wrapper over [`Self::update_run_status_typed`]: the
+    /// `&str` label is parsed via [`RunStatus::from_label`] and an
+    /// unparseable label returns
+    /// `Err(StateError::InvalidRunTransition { from: "<unparseable>", to })`.
+    /// Legal transitions are enforced exactly as for the typed API.
+    #[deprecated(note = "use update_run_status_typed")]
     fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool>;
 
     /// Typed counterpart to [`Self::update_run_status`]: validate the
@@ -475,11 +482,17 @@ pub(crate) fn update_run_status_in(
     id: RunId,
     status: &str,
 ) -> StateResult<bool> {
-    let updated = conn.execute(
-        "UPDATE runs SET status = ?2 WHERE id = ?1",
-        params![id.0, status],
-    )?;
-    Ok(updated == 1)
+    // Untyped wrapper: parse the label up-front so legacy callers flow
+    // through the same typed transition gate as
+    // [`update_run_status_typed_in`]. Anything outside the canonical
+    // `RunStatus` set surfaces as `InvalidRunTransition` with `from =
+    // "<unparseable>"` so the typed gate's invariants hold for string
+    // callers too.
+    let parsed = RunStatus::from_label(status).ok_or_else(|| StateError::InvalidRunTransition {
+        from: "<unparseable>".to_string(),
+        to: status.to_string(),
+    })?;
+    update_run_status_typed_in(conn, id, parsed)
 }
 
 pub(crate) fn update_run_status_typed_in(
@@ -654,6 +667,7 @@ impl RunRepository for StateDb {
         get_run_in(self.conn(), id)
     }
 
+    #[allow(deprecated)]
     fn update_run_status(&mut self, id: RunId, status: &str) -> StateResult<bool> {
         update_run_status_in(self.conn(), id, status)
     }
@@ -878,7 +892,8 @@ mod tests {
     }
 
     #[test]
-    fn update_run_status_transitions() {
+    #[allow(deprecated)]
+    fn update_run_status_string_wrapper_forwards_through_typed_gate() {
         let mut db = open();
         let work_item = db
             .create_work_item(sample_work_item("ENG-1", "2026-05-08T00:00:00Z"))
@@ -893,9 +908,69 @@ mod tests {
                 now: "2026-05-08T00:00:00Z",
             })
             .expect("run");
+        // Canonical label, legal transition: forwards cleanly through the
+        // typed gate.
         assert!(db.update_run_status(run.id, "running").unwrap());
         assert_eq!(db.get_run(run.id).unwrap().unwrap().status, "running");
-        assert!(!db.update_run_status(RunId(123_456), "done").unwrap());
+        // Missing row still returns Ok(false), matching the typed API.
+        assert!(!db.update_run_status(RunId(123_456), "running").unwrap());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn update_run_status_string_wrapper_rejects_unparseable_label() {
+        let mut db = open();
+        let id = create_run_with_status(&mut db, "ENG-1", "queued");
+        let err = db
+            .update_run_status(id, "done")
+            .expect_err("unparseable label must error");
+        match err {
+            StateError::InvalidRunTransition { from, to } => {
+                assert_eq!(from, "<unparseable>");
+                assert_eq!(to, "done");
+            }
+            other => panic!("expected InvalidRunTransition, got {other:?}"),
+        }
+        // Row stays put — the wrapper rejects before issuing the UPDATE.
+        assert_eq!(db.get_run(id).unwrap().unwrap().status, "queued");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn update_run_status_string_wrapper_rejects_illegal_transition() {
+        let mut db = open();
+        let id = create_run_with_status(&mut db, "ENG-1", "queued");
+        // Queued -> Completed is not a legal transition under the typed
+        // gate; the wrapper enforces the same table.
+        let err = db
+            .update_run_status(id, "completed")
+            .expect_err("illegal transition must error");
+        match err {
+            StateError::InvalidRunTransition { from, to } => {
+                assert_eq!(from, "queued");
+                assert_eq!(to, "completed");
+            }
+            other => panic!("expected InvalidRunTransition, got {other:?}"),
+        }
+        assert_eq!(db.get_run(id).unwrap().unwrap().status, "queued");
+    }
+
+    /// Compile-time check that the typed API does not trip
+    /// `#[deny(deprecated)]`: callers that have migrated off the
+    /// stringly-typed `update_run_status` build clean.
+    #[deny(deprecated)]
+    mod typed_api_is_deprecation_clean {
+        use super::*;
+
+        #[test]
+        fn typed_update_compiles_under_deny_deprecated() {
+            let mut db = open();
+            let id = create_run_with_status(&mut db, "ENG-1", "queued");
+            assert!(
+                db.update_run_status_typed(id, RunStatus::Running)
+                    .expect("legal transition")
+            );
+        }
     }
 
     fn create_run_with_status(db: &mut StateDb, identifier: &str, status: &str) -> RunId {

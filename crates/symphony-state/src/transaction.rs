@@ -616,12 +616,17 @@ mod tests {
         let expires = "2026-05-08T00:05:00Z";
 
         let wi = db.create_work_item(sample_work_item("ENG-1", now)).unwrap();
+        // Seed the run as `running`: the typed run-status gate
+        // (Phase 11) only allows `Running -> Completed` for terminal
+        // release, not `Queued -> Completed`. The transactional
+        // intent of this test (lease release + status update + event
+        // append commit together) is unchanged.
         let run = db
             .create_run(NewRun {
                 work_item_id: wi.id,
                 role: "platform_lead",
                 agent: "claude",
-                status: "queued",
+                status: "running",
                 workspace_claim_id: None,
                 now,
             })
