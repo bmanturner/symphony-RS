@@ -18,6 +18,17 @@ pub(crate) async fn prepare_mcp_session(
     existing_args: &[String],
     enabled_tools: &[String],
 ) -> AgentResult<(Option<AgentMcpSession>, Vec<String>)> {
+    let registry = ToolRegistry::new(Vec::new())
+        .map_err(|err| AgentError::Spawn(format!("build MCP registry: {err}")))?;
+    prepare_mcp_session_with_registry(workspace, existing_args, enabled_tools, registry).await
+}
+
+pub(crate) async fn prepare_mcp_session_with_registry(
+    workspace: &Path,
+    existing_args: &[String],
+    enabled_tools: &[String],
+    registry: ToolRegistry,
+) -> AgentResult<(Option<AgentMcpSession>, Vec<String>)> {
     if enabled_tools.is_empty() {
         return Ok((None, existing_args.to_vec()));
     }
@@ -29,9 +40,7 @@ pub(crate) async fn prepare_mcp_session(
     let socket_path = symphony_dir.join("mcp.sock");
     let config_path = symphony_dir.join("mcp-config.json");
 
-    let registry = ToolRegistry::new(Vec::new())
-        .map_err(|err| AgentError::Spawn(format!("build MCP registry: {err}")))?
-        .enable_only(enabled_tools.iter().cloned());
+    let registry = registry.enable_only(enabled_tools.iter().cloned());
     let handle = Server::spawn(SpawnParams {
         socket_path: socket_path.clone(),
         registry,
@@ -125,7 +134,29 @@ fn strip_operator_mcp_config(args: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
     use super::*;
+    use symphony_mcp::{ToolError, ToolHandler, ToolRegistration, ToolResult};
+
+    struct StaticTool;
+
+    #[async_trait]
+    impl ToolHandler for StaticTool {
+        fn name(&self) -> &str {
+            "propose_decomposition"
+        }
+
+        async fn call(&self, _input: Value) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::json(json!({
+                "decomposition_id": 1,
+                "child_count": 1,
+                "status": "applied"
+            })))
+        }
+    }
 
     #[test]
     fn merges_no_operator_config() {
@@ -189,5 +220,61 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--mcp-config"));
         drop(session);
         assert!(!dir.path().join(".symphony/mcp.sock").exists());
+    }
+
+    async fn call_tool(socket_path: &Path, tool: &str) -> Value {
+        let stream = UnixStream::connect(socket_path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let encoded = serde_json::to_string(&json!({
+            "tool": tool,
+            "input": { "summary": "ok", "children": [] }
+        }))
+        .unwrap();
+        write.write_all(encoded.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn claude_and_codex_configs_surface_propose_decomposition_and_serialize_tool_calls() {
+        let mut claude = crate::claude::ClaudeConfig::default();
+        claude.mcp_tools = vec!["propose_decomposition".into()];
+        let mut codex = crate::codex::CodexConfig::default();
+        codex.mcp_tools = vec!["propose_decomposition".into()];
+
+        for (backend, tools) in [("claude", claude.mcp_tools), ("codex", codex.mcp_tools)] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ToolRegistry::new(vec![ToolRegistration {
+                name: "propose_decomposition".into(),
+                handler: std::sync::Arc::new(StaticTool),
+            }])
+            .unwrap();
+            let (session, args) =
+                prepare_mcp_session_with_registry(dir.path(), &[], &tools, registry)
+                    .await
+                    .unwrap();
+            let session = session.expect("MCP session");
+            let config: Value =
+                serde_json::from_slice(&tokio::fs::read(&session._config_path).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                config["mcpServers"]["symphony"]["tools"],
+                json!(["propose_decomposition"]),
+                "{backend} should expose propose_decomposition"
+            );
+            assert!(args.iter().any(|arg| arg == "--mcp-config"));
+
+            let response = call_tool(
+                dir.path().join(".symphony/mcp.sock").as_path(),
+                "propose_decomposition",
+            )
+            .await;
+            assert_eq!(response["status"], "ok");
+            assert_eq!(
+                response["result"]["content"]["status"], "applied",
+                "{backend} should serialize a successful tool result"
+            );
+        }
     }
 }

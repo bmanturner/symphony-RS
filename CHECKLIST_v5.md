@@ -55,14 +55,14 @@ mock agent.
 
 ## Phase 4 — `propose_decomposition` Write Tool
 
-- [ ] Add the `DecompositionDraftWire` and `ChildDraftWire` typed shapes in `symphony-mcp` with `#[serde(deny_unknown_fields)]`.
-- [ ] Implement `ProposeDecompositionHandler` (SPEC v5 §5.1, ARCHITECTURE v5 §6 example).
-- [ ] Resolve `assigned_role` strings against the live v4 `RoleCatalog`; reject unknown roles with field-pathed `ToolError::InvalidPayload`.
-- [ ] Validate `depends_on` graph at handler entry: every reference points to a child key in the same payload; no cycles; no duplicate keys.
-- [ ] On `DecompositionRunner::accept` success, persist via `symphony-state::decomposition_apply` and return the `DecompositionId`, child count, and resulting status.
-- [ ] On policy-gate refusal (depth, owner role, missing acceptance criteria), return `ToolError::PolicyViolation` with the gate name.
-- [ ] Add deterministic tests covering: success, unknown role, cyclic depends_on, missing acceptance criteria, max-depth violation.
-- [ ] Add a cross-backend parity test that verifies Claude and Codex both surface `propose_decomposition` correctly (both backends register the tool; both can serialize a successful tool call).
+- [x] Add the `DecompositionDraftWire` and `ChildDraftWire` typed shapes in `symphony-mcp` with `#[serde(deny_unknown_fields)]`.
+- [x] Implement `ProposeDecompositionHandler` (SPEC v5 §5.1, ARCHITECTURE v5 §6 example).
+- [x] Resolve `assigned_role` strings against the live v4 `RoleCatalog`; reject unknown roles with field-pathed `ToolError::InvalidPayload`.
+- [x] Validate `depends_on` graph at handler entry: every reference points to a child key in the same payload; no cycles; no duplicate keys.
+- [x] On `DecompositionRunner::accept` success, persist via `symphony-state::decomposition_apply` and return the `DecompositionId`, child count, and resulting status.
+- [x] On policy-gate refusal (depth, owner role, missing acceptance criteria), return `ToolError::PolicyViolation` with the gate name.
+- [x] Add deterministic tests covering: success, unknown role, cyclic depends_on, missing acceptance criteria, max-depth violation.
+- [x] Add a cross-backend parity test that verifies Claude and Codex both surface `propose_decomposition` correctly (both backends register the tool; both can serialize a successful tool call).
 
 ## Phase 5 — `submit_handoff` Write Tool
 

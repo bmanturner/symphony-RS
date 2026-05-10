@@ -6,6 +6,7 @@
 //! phases adapt this to `rmcp` tool/result types as concrete Symphony
 //! tools land.
 
+pub mod decomposition_tools;
 pub mod handler;
 pub mod read_tools;
 pub mod registry;

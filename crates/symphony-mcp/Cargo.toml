@@ -13,6 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 symphony-config = { path = "../symphony-config" }
 symphony-core = { path = "../symphony-core" }
+symphony-state = { path = "../symphony-state" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

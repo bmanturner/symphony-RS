@@ -3858,6 +3858,7 @@ dependencies = [
  "serde_yaml",
  "symphony-config",
  "symphony-core",
+ "symphony-state",
  "symphony-tracker",
  "tempfile",
  "thiserror 2.0.18",
