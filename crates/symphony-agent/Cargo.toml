@@ -8,6 +8,7 @@ description = "AgentRunner trait with Codex, Claude, and Tandem backends."
 
 [dependencies]
 symphony-core = { path = "../symphony-core" }
+symphony-mcp = { path = "../symphony-mcp" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

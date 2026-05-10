@@ -33,12 +33,12 @@ mock agent.
 
 ## Phase 2 — Symphony-Agent Integration
 
-- [ ] Add MCP wiring to `crates/symphony-agent/src/claude/runner.rs::spawn_session`: allocate socket, spawn `symphony-mcp::Server`, materialize `--mcp-config`, append to argv, attach RAII handle to the session.
-- [ ] Mirror the wiring for `crates/symphony-agent/src/codex/runner.rs`.
-- [ ] Add the `agents.<profile>.mcp_tools` field to `AgentBackendProfile` (SPEC v5 §4.6.2) with sensible per-`RoleKind` defaults.
-- [ ] Implement multi-config merging when the operator supplies their own `--mcp-config` via `extra_args`. Preserve operator servers; fail spawn on tool-name conflicts with Symphony's registry.
-- [ ] Add config-merge unit tests: no operator config, operator config without conflicts, operator config with conflicts (must fail).
-- [ ] Add an integration test using the mock agent to prove the Symphony MCP socket is bound during a session and torn down on completion.
+- [x] Add MCP wiring to `crates/symphony-agent/src/claude/runner.rs::spawn_session`: allocate socket, spawn `symphony-mcp::Server`, materialize `--mcp-config`, append to argv, attach RAII handle to the session.
+- [x] Mirror the wiring for `crates/symphony-agent/src/codex/runner.rs`.
+- [x] Add the `agents.<profile>.mcp_tools` field to `AgentBackendProfile` (SPEC v5 §4.6.2) with sensible per-`RoleKind` defaults.
+- [x] Implement multi-config merging when the operator supplies their own `--mcp-config` via `extra_args`. Preserve operator servers; fail spawn on tool-name conflicts with Symphony's registry.
+- [x] Add config-merge unit tests: no operator config, operator config without conflicts, operator config with conflicts (must fail).
+- [x] Add an integration test using the mock agent to prove the Symphony MCP socket is bound during a session and torn down on completion.
 
 ## Phase 3 — Read Tools
 

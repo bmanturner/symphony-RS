@@ -666,11 +666,11 @@ fn build_backend_agent_runner(
 ) -> Result<(Arc<dyn AgentRunner>, AgentRunnerDebugMetadata)> {
     let runner: Arc<dyn AgentRunner> = match profile.backend {
         AgentBackend::Codex => Arc::new(CodexRunner::new(codex_runner_config_for_profile(
-            cfg, profile,
+            cfg, role_name, profile,
         ))),
-        AgentBackend::Claude => {
-            Arc::new(ClaudeRunner::new(claude_runner_config_for_profile(profile)))
-        }
+        AgentBackend::Claude => Arc::new(ClaudeRunner::new(claude_runner_config_for_profile(
+            cfg, role_name, profile,
+        ))),
         AgentBackend::Mock => Arc::new(MockAgentRunner::new(MockAgentConfig::default())),
     };
     let metadata = AgentRunnerDebugMetadata {
@@ -709,6 +709,7 @@ fn codex_runner_config(cfg: &WorkflowConfig) -> RunnerCodexConfig {
 
 fn codex_runner_config_for_profile(
     cfg: &WorkflowConfig,
+    role_name: &str,
     profile: &AgentBackendProfile,
 ) -> RunnerCodexConfig {
     RunnerCodexConfig {
@@ -718,6 +719,7 @@ fn codex_runner_config_for_profile(
             .unwrap_or_else(|| cfg.codex.command.clone()),
         args: profile.args.clone(),
         extra_args: profile.extra_args.clone(),
+        mcp_tools: effective_mcp_tools(cfg, role_name, profile),
         model: profile.model.clone(),
         approval_policy: profile
             .approval_policy
@@ -734,7 +736,11 @@ fn codex_runner_config_for_profile(
     }
 }
 
-fn claude_runner_config_for_profile(profile: &AgentBackendProfile) -> ClaudeConfig {
+fn claude_runner_config_for_profile(
+    cfg: &WorkflowConfig,
+    role_name: &str,
+    profile: &AgentBackendProfile,
+) -> ClaudeConfig {
     ClaudeConfig {
         command: profile
             .command
@@ -747,8 +753,55 @@ fn claude_runner_config_for_profile(profile: &AgentBackendProfile) -> ClaudeConf
             .chain(profile.extra_args.iter())
             .cloned()
             .collect(),
+        mcp_tools: effective_mcp_tools(cfg, role_name, profile),
         ..ClaudeConfig::default()
     }
+}
+
+fn effective_mcp_tools(
+    cfg: &WorkflowConfig,
+    role_name: &str,
+    profile: &AgentBackendProfile,
+) -> Vec<String> {
+    if !profile.mcp_tools.is_empty() {
+        return profile.mcp_tools.clone();
+    }
+    let Some(role) = cfg.roles.get(role_name) else {
+        return Vec::new();
+    };
+    let tools: &[&str] = match role.kind {
+        symphony_config::RoleKind::IntegrationOwner => &[
+            "get_issue_details",
+            "list_comments",
+            "get_related_issues",
+            "list_available_roles",
+            "propose_decomposition",
+            "submit_handoff",
+            "file_followup",
+            "add_issue_comment",
+        ],
+        symphony_config::RoleKind::QaGate => &[
+            "get_issue_details",
+            "list_comments",
+            "get_related_issues",
+            "record_qa_verdict",
+            "submit_handoff",
+            "file_followup",
+            "add_issue_comment",
+        ],
+        symphony_config::RoleKind::Specialist
+        | symphony_config::RoleKind::Reviewer
+        | symphony_config::RoleKind::Operator
+        | symphony_config::RoleKind::Custom => &[
+            "get_issue_details",
+            "list_comments",
+            "get_related_issues",
+            "submit_handoff",
+            "file_followup",
+            "add_issue_comment",
+        ],
+    };
+    tools.iter().copied().map(str::to_string).collect()
 }
 
 fn redacted_effective_argv(profile: &AgentBackendProfile) -> Vec<String> {
@@ -1089,6 +1142,79 @@ agents:
         assert!(frontend_meta.effective_argv.contains(&"gpt-5.5".into()));
         assert!(backend_meta.effective_argv.contains(&"fast".into()));
         assert!(frontend_meta.effective_argv.contains(&"ui".into()));
+    }
+
+    #[test]
+    fn role_scoped_runner_applies_mcp_tool_defaults_by_role_kind() {
+        let cfg: WorkflowConfig = serde_yaml::from_str(
+            r#"
+roles:
+  lead:
+    kind: integration_owner
+    agent: codex_fast
+  qa:
+    kind: qa_gate
+    agent: codex_fast
+  backend:
+    kind: specialist
+    agent: codex_fast
+agents:
+  codex_fast:
+    backend: codex
+    command: codex
+    args: [app-server]
+"#,
+        )
+        .unwrap();
+
+        let profile = cfg
+            .agents
+            .get("codex_fast")
+            .and_then(AgentProfileConfig::as_backend)
+            .unwrap();
+        assert!(
+            effective_mcp_tools(&cfg, "lead", profile)
+                .contains(&"propose_decomposition".to_string())
+        );
+        assert!(
+            effective_mcp_tools(&cfg, "qa", profile).contains(&"record_qa_verdict".to_string())
+        );
+        assert!(
+            effective_mcp_tools(&cfg, "backend", profile).contains(&"submit_handoff".to_string())
+        );
+        assert!(
+            !effective_mcp_tools(&cfg, "backend", profile)
+                .contains(&"propose_decomposition".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_profile_mcp_tools_override_role_defaults() {
+        let cfg: WorkflowConfig = serde_yaml::from_str(
+            r#"
+roles:
+  lead:
+    kind: integration_owner
+    agent: codex_fast
+agents:
+  codex_fast:
+    backend: codex
+    command: codex
+    args: [app-server]
+    mcp_tools: [submit_handoff]
+"#,
+        )
+        .unwrap();
+
+        let profile = cfg
+            .agents
+            .get("codex_fast")
+            .and_then(AgentProfileConfig::as_backend)
+            .unwrap();
+        assert_eq!(
+            effective_mcp_tools(&cfg, "lead", profile),
+            vec!["submit_handoff".to_string()]
+        );
     }
 
     #[test]

@@ -96,6 +96,11 @@ pub struct ClaudeConfig {
     /// without code changes.
     #[serde(default)]
     pub extra_args: Vec<String>,
+
+    /// Symphony MCP tools to expose for this session. Empty disables
+    /// Symphony MCP injection.
+    #[serde(default)]
+    pub mcp_tools: Vec<String>,
 }
 
 fn default_command() -> String {
@@ -118,6 +123,7 @@ impl Default for ClaudeConfig {
             permission_mode: default_permission_mode(),
             verbose: default_verbose(),
             extra_args: Vec::new(),
+            mcp_tools: Vec::new(),
         }
     }
 }
@@ -239,8 +245,14 @@ async fn spawn_session(
     let thread_id = ThreadId::new(session_uuid.clone());
     let initial_session = SessionId::new(&thread_id, &turn_id);
 
-    let args = build_initial_args(config, &session_uuid, &params.initial_prompt);
-    let child = spawn_child(&config.command, &args, &params.workspace)?;
+    let (mcp_session, extra_args) =
+        crate::mcp::prepare_mcp_session(&params.workspace, &config.extra_args, &config.mcp_tools)
+            .await?;
+    let mut launch_config = config.clone();
+    launch_config.extra_args = extra_args;
+
+    let args = build_initial_args(&launch_config, &session_uuid, &params.initial_prompt);
+    let child = spawn_child(&launch_config.command, &args, &params.workspace)?;
 
     // Synthesise Started immediately so the orchestrator sees a
     // dispatch event without waiting for stdout.
@@ -261,7 +273,7 @@ async fn spawn_session(
     );
 
     let control = ClaudeAgentControl {
-        config: config.clone(),
+        config: launch_config,
         workspace: params.workspace.clone(),
         issue: params.issue,
         session_uuid,
@@ -270,6 +282,7 @@ async fn spawn_session(
         event_tx,
         current_child: child_handle,
         current_reader: Arc::new(Mutex::new(Some(reader_handle))),
+        _mcp_session: mcp_session,
     };
 
     Ok(AgentSession {
@@ -601,6 +614,7 @@ pub struct ClaudeAgentControl {
     event_tx: mpsc::Sender<AgentEvent>,
     current_child: Arc<Mutex<Option<Child>>>,
     current_reader: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    _mcp_session: Option<crate::mcp::AgentMcpSession>,
 }
 
 #[async_trait]

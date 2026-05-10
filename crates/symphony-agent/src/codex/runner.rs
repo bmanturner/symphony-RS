@@ -118,6 +118,11 @@ pub struct CodexConfig {
     /// Pass-through Codex `turn_sandbox_policy` value (SPEC §5.3.6).
     #[serde(default)]
     pub turn_sandbox_policy: Option<Value>,
+
+    /// Symphony MCP tools to expose for this session. Empty disables
+    /// Symphony MCP injection.
+    #[serde(default)]
+    pub mcp_tools: Vec<String>,
 }
 
 fn default_command() -> String {
@@ -169,6 +174,7 @@ impl Default for CodexConfig {
             approval_policy: None,
             thread_sandbox: None,
             turn_sandbox_policy: None,
+            mcp_tools: Vec::new(),
         }
     }
 }
@@ -216,7 +222,12 @@ async fn spawn_session(
 ) -> AgentResult<AgentSession> {
     validate_workspace(&params.workspace)?;
 
-    let effective_command = effective_shell_command(config);
+    let (mcp_session, extra_args) =
+        crate::mcp::prepare_mcp_session(&params.workspace, &config.extra_args, &config.mcp_tools)
+            .await?;
+    let mut launch_config = config.clone();
+    launch_config.extra_args = extra_args;
+    let effective_command = effective_shell_command(&launch_config);
     let mut child = Command::new("bash")
         .arg("-lc")
         .arg(&effective_command)
@@ -244,7 +255,7 @@ async fn spawn_session(
     // Send the initial bootstrap requests synchronously so any startup
     // failure surfaces as `AgentError::Spawn` before we hand back the
     // stream.
-    bootstrap_session(config, &stdin, &next_request_id, &params).await?;
+    bootstrap_session(&launch_config, &stdin, &next_request_id, &params).await?;
 
     // The reader task owns stdout and forwards normalized AgentEvents
     // to the orchestrator's stream.
@@ -258,11 +269,12 @@ async fn spawn_session(
 
     let initial_session = SessionId::from_raw("pending"); // replaced by Started events
     let control = CodexAgentControl {
-        config: config.clone(),
+        config: launch_config,
         stdin,
         next_request_id,
         child: Arc::new(Mutex::new(Some(child))),
         reader_handle: Arc::new(Mutex::new(Some(reader_handle))),
+        _mcp_session: mcp_session,
     };
 
     Ok(AgentSession {
@@ -677,13 +689,13 @@ impl Stream for ReceiverStream {
 // ---------------------------------------------------------------------------
 
 /// `AgentControl` impl returned from `CodexRunner::start_session`.
-#[derive(Clone)]
 pub struct CodexAgentControl {
     config: CodexConfig,
     stdin: Arc<Mutex<ChildStdin>>,
     next_request_id: Arc<AtomicU64>,
     child: Arc<Mutex<Option<Child>>>,
     reader_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    _mcp_session: Option<crate::mcp::AgentMcpSession>,
 }
 
 #[async_trait]

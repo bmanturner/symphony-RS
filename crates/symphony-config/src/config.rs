@@ -1685,6 +1685,11 @@ pub struct AgentBackendProfile {
     #[serde(default)]
     pub tools: Vec<String>,
 
+    /// Symphony MCP tool names enabled for this profile. Empty means
+    /// no Symphony MCP tools are injected.
+    #[serde(default)]
+    pub mcp_tools: Vec<String>,
+
     /// Extra environment variables exported into the agent process.
     /// Values may contain `$VAR_NAME` placeholders; resolution
     /// happens during workflow loading.
@@ -4493,6 +4498,7 @@ agents:
     extra_args: [--profile, fast]
     model: o4
     tools: [git, github, tracker]
+    mcp_tools: [get_issue_details, submit_handoff]
     memory: persistent
     max_turns: 30
     turn_timeout_ms: 1800000
@@ -4521,6 +4527,13 @@ agents:
         assert_eq!(lead.extra_args, vec!["--profile", "fast"]);
         assert_eq!(lead.model.as_deref(), Some("o4"));
         assert_eq!(lead.tools, vec!["git", "github", "tracker"]);
+        assert_eq!(
+            lead.mcp_tools,
+            vec![
+                "get_issue_details".to_string(),
+                "submit_handoff".to_string()
+            ]
+        );
         assert_eq!(lead.memory.as_deref(), Some("persistent"));
         assert_eq!(lead.max_turns, Some(30));
         assert_eq!(lead.turn_timeout_ms, Some(1_800_000));
@@ -7027,6 +7040,7 @@ decomposition:
                 model: None,
                 system_prompt: None,
                 tools: Vec::new(),
+                mcp_tools: Vec::new(),
                 env: BTreeMap::new(),
                 memory: None,
                 approval_policy: None,
@@ -7064,6 +7078,7 @@ decomposition:
             model: None,
             system_prompt: None,
             tools: Vec::new(),
+            mcp_tools: Vec::new(),
             env: BTreeMap::new(),
             memory: None,
             approval_policy: None,
@@ -7121,6 +7136,7 @@ decomposition:
                 model: Some("pretend-model".into()),
                 system_prompt: None,
                 tools: Vec::new(),
+                mcp_tools: Vec::new(),
                 env: BTreeMap::new(),
                 memory: None,
                 approval_policy: None,
@@ -7155,6 +7171,7 @@ decomposition:
                 model: None,
                 system_prompt: None,
                 tools: Vec::new(),
+                mcp_tools: Vec::new(),
                 env: BTreeMap::new(),
                 memory: None,
                 approval_policy: None,
@@ -7209,6 +7226,7 @@ decomposition:
                 model: None,
                 system_prompt: None,
                 tools: Vec::new(),
+                mcp_tools: Vec::new(),
                 env: BTreeMap::new(),
                 memory: None,
                 approval_policy: None,
@@ -7436,6 +7454,7 @@ agent:
             model: None,
             system_prompt: None,
             tools: Vec::new(),
+            mcp_tools: Vec::new(),
             env: BTreeMap::new(),
             memory: None,
             approval_policy: None,

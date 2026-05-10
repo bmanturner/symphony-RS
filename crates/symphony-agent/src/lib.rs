@@ -21,6 +21,7 @@
 
 pub mod claude;
 pub mod codex;
+mod mcp;
 pub mod mock;
 pub mod tandem;
 
