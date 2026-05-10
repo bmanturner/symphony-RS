@@ -150,8 +150,8 @@ pub use integration_request::{
     IntegrationRunRequest, IntegrationWorkspace,
 };
 pub use integration_runner::{
-    IntegrationDispatchOutcome, IntegrationDispatchReason, IntegrationDispatchRunner,
-    IntegrationDispatcher, IntegrationRunReport,
+    IntegrationCancellationObserved, IntegrationDispatchOutcome, IntegrationDispatchReason,
+    IntegrationDispatchRunner, IntegrationDispatcher, IntegrationRunReport,
 };
 pub use integration_tick::{
     IntegrationCandidate, IntegrationDispatchQueue, IntegrationDispatchRequest,
