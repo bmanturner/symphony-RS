@@ -17,7 +17,7 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add workflow validation/warning: `dispatch_gate: false` emits a loud warning because dependencies become observability-only.
 - [x] Add workflow validation for parent/child link policy: structural parent links require tracker support unless local/advisory mode is explicitly allowed.
 - [x] Update `tests/fixtures/sample-workflow/WORKFLOW.md` with `decomposition.dependency_policy` and at least one role-routed dependency example.
-- [ ] Add round-trip config tests and negative tests for invalid dependency policy values/capability combinations.
+- [x] Add round-trip config tests and negative tests for invalid dependency policy values/capability combinations.
 
 ## Phase 2 — State Model and Repositories
 

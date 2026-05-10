@@ -5099,6 +5099,43 @@ decomposition:
     }
 
     #[test]
+    fn dependency_tracker_sync_policy_serialises_snake_case() {
+        for (variant, literal) in [
+            (DependencyTrackerSyncPolicy::Required, "required"),
+            (DependencyTrackerSyncPolicy::BestEffort, "best_effort"),
+            (DependencyTrackerSyncPolicy::LocalOnly, "local_only"),
+        ] {
+            let yaml = serde_yaml::to_string(&variant).expect("serialises");
+            assert!(
+                yaml.contains(literal),
+                "expected {literal} in {yaml:?} for {variant:?}"
+            );
+            let reparsed: DependencyTrackerSyncPolicy =
+                serde_yaml::from_str(&yaml).expect("re-parses");
+            assert_eq!(reparsed, variant);
+        }
+    }
+
+    #[test]
+    fn dependency_policy_round_trips_all_fields_independently() {
+        let policy = DependencyPolicy {
+            materialize_edges: false,
+            tracker_sync: DependencyTrackerSyncPolicy::LocalOnly,
+            dispatch_gate: false,
+            auto_resolve_on_terminal: false,
+        };
+
+        let yaml = serde_yaml::to_string(&policy).expect("serialises");
+        let reparsed: DependencyPolicy = serde_yaml::from_str(&yaml).expect("re-parses");
+
+        assert_eq!(reparsed, policy);
+        assert!(yaml.contains("materialize_edges: false"));
+        assert!(yaml.contains("tracker_sync: local_only"));
+        assert!(yaml.contains("dispatch_gate: false"));
+        assert!(yaml.contains("auto_resolve_on_terminal: false"));
+    }
+
+    #[test]
     fn decomposition_dependency_policy_rejects_unknown_sync_mode() {
         let yaml = r#"
 tracker:
@@ -6306,6 +6343,28 @@ hooks:
     }
 
     #[test]
+    fn validate_rejects_required_dependency_tracker_sync_from_github_yaml() {
+        let yaml = r#"
+tracker:
+  kind: github
+  repository: foglet-io/rust-symphony
+decomposition:
+  dependency_policy:
+    tracker_sync: required
+"#;
+        let cfg: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+
+        assert_eq!(
+            cfg.validate(),
+            Err(
+                ConfigValidationError::DependencyTrackerSyncRequiresAddBlocker {
+                    actual: TrackerKind::Github,
+                }
+            )
+        );
+    }
+
+    #[test]
     fn validate_rejects_required_dependency_tracker_sync_for_mock() {
         let mut cfg = WorkflowConfig::default();
         cfg.tracker.kind = TrackerKind::Mock;
@@ -6322,6 +6381,36 @@ hooks:
     }
 
     #[test]
+    fn validate_accepts_local_only_dependency_tracker_sync_for_github_yaml() {
+        let yaml = r#"
+tracker:
+  kind: github
+  repository: foglet-io/rust-symphony
+decomposition:
+  dependency_policy:
+    tracker_sync: local_only
+"#;
+        let cfg: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_best_effort_dependency_tracker_sync_for_github_yaml() {
+        let yaml = r#"
+tracker:
+  kind: github
+  repository: foglet-io/rust-symphony
+decomposition:
+  dependency_policy:
+    tracker_sync: best_effort
+"#;
+        let cfg: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
     fn validate_accepts_direct_child_creation_for_linear_parent_links() {
         let mut cfg = minimal_linear_cfg();
         cfg.decomposition.child_issue_policy = ChildIssuePolicy::CreateDirectly;
@@ -6334,6 +6423,27 @@ hooks:
         cfg.tracker.kind = TrackerKind::Github;
         cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
         cfg.decomposition.child_issue_policy = ChildIssuePolicy::CreateDirectly;
+        assert_eq!(
+            cfg.validate(),
+            Err(
+                ConfigValidationError::DecompositionDirectChildCreationRequiresParentLink {
+                    actual: TrackerKind::Github,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn validate_rejects_direct_child_creation_from_github_yaml() {
+        let yaml = r#"
+tracker:
+  kind: github
+  repository: foglet-io/rust-symphony
+decomposition:
+  child_issue_policy: create_directly
+"#;
+        let cfg: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+
         assert_eq!(
             cfg.validate(),
             Err(
