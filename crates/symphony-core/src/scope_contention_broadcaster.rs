@@ -82,7 +82,10 @@ pub struct ScopeContentionSinkError(pub String);
 /// provides an implementation that forwards into
 /// `EventRepository::append_event` and returns the assigned sequence.
 /// A broadcaster constructed with `None` for the sink simply skips
-/// persistence — the event is still broadcast on the bus.
+/// persistence — the event is still broadcast on the bus. With a sink
+/// configured, the broadcaster honours the persist-before-broadcast
+/// invariant: a sink error suppresses the bus emission so live
+/// subscribers cannot drift ahead of the durable log (Phase 12 §139).
 pub trait ScopeContentionEventSink: Send + Sync {
     /// Persist a [`OrchestratorEvent::ScopeCapReached`] event and
     /// return the sequence assigned by the underlying event repository.
@@ -224,19 +227,26 @@ impl ScopeContentionEventBroadcaster {
         };
 
         for event in &events {
-            self.inner.bus.emit(event.clone());
+            // Persist-before-broadcast (Phase 12 §139): the durable
+            // event log is the source of truth for SSE replay, audit,
+            // and recovery. A subscriber must never observe an event
+            // that does not already exist in the log, otherwise an SSE
+            // consumer reconnecting and replaying from `after_sequence`
+            // would silently miss frames it had already seen live. When
+            // the sink errors we log loudly and *suppress* the
+            // broadcast for that event; the dedup log still advances
+            // because the contention episode was observed.
             if let Some(sink) = &self.inner.sink
                 && let Err(err) = sink.append_scope_cap_reached(event)
             {
-                // The sink owns its own logging — surface the
-                // failure through `tracing` here so a missing log
-                // line cannot mask a persistence regression.
                 tracing::warn!(
                     target: "symphony::scope_contention",
                     error = %err,
-                    "failed to persist ScopeCapReached event",
+                    "failed to persist ScopeCapReached event; suppressing broadcast",
                 );
+                continue;
             }
+            self.inner.bus.emit(event.clone());
         }
 
         events
@@ -412,7 +422,9 @@ mod tests {
         // Emit twice on the same episode. The dedup invariant must
         // still hold even though the sink failed on the first append:
         // the broadcaster does not roll back the dedup log on sink
-        // failure (the bus already saw the event).
+        // failure. With persist-before-broadcast, the bus does *not*
+        // see the failed event (see `sink_failure_suppresses_broadcast`
+        // below); this test only asserts dedup advancement.
         let first = bx.observe_run_pass([(1_i64, fields(ScopeKind::Role, "qa", 1, 1))]);
         let second = bx.observe_run_pass([(1_i64, fields(ScopeKind::Role, "qa", 1, 1))]);
         assert_eq!(first.len(), 1);
@@ -420,6 +432,79 @@ mod tests {
             second.is_empty(),
             "second pass on same episode is still deduped"
         );
+    }
+
+    /// Sink that records, for each append call, the set of events
+    /// already visible to a pre-attached bus subscriber. Persist-before-
+    /// broadcast requires that the subscriber sees *nothing* by the
+    /// time the sink runs; broadcast-before-persist would leak the
+    /// event into the receiver before the append.
+    struct OrderingSink {
+        rx: StdMutex<tokio::sync::broadcast::Receiver<OrchestratorEvent>>,
+        seen_before_persist: StdMutex<Vec<usize>>,
+    }
+
+    impl OrderingSink {
+        fn arc(bus: &EventBus) -> Arc<Self> {
+            Arc::new(Self {
+                rx: StdMutex::new(bus.raw_subscribe()),
+                seen_before_persist: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ScopeContentionEventSink for OrderingSink {
+        fn append_scope_cap_reached(
+            &self,
+            _event: &OrchestratorEvent,
+        ) -> Result<i64, ScopeContentionSinkError> {
+            let mut rx = self.rx.lock().unwrap();
+            let mut count = 0;
+            while rx.try_recv().is_ok() {
+                count += 1;
+            }
+            self.seen_before_persist.lock().unwrap().push(count);
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn persist_runs_before_broadcast() {
+        let bus = EventBus::default();
+        let sink = OrderingSink::arc(&bus);
+        let bx = ScopeContentionEventBroadcaster::new(
+            bus,
+            Some(sink.clone() as Arc<dyn ScopeContentionEventSink>),
+        );
+
+        bx.observe_run_pass([(1_i64, fields(ScopeKind::Role, "qa", 1, 1))]);
+
+        let observed = sink.seen_before_persist.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![0],
+            "persist must observe an empty bus — broadcast comes after"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_failure_suppresses_broadcast() {
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
+        let bx = ScopeContentionEventBroadcaster::new(
+            bus.clone(),
+            Some(Arc::new(FailingSink) as Arc<dyn ScopeContentionEventSink>),
+        );
+
+        bx.observe_run_pass([(1_i64, fields(ScopeKind::Role, "qa", 1, 1))]);
+
+        // The bus must remain empty when persistence failed.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(50), rx.next()).await;
+        assert!(
+            next.is_err(),
+            "broadcast must be suppressed when persist fails"
+        );
+        assert_eq!(bus.subscriber_count(), 1);
     }
 
     #[test]

@@ -155,7 +155,10 @@ pub struct BudgetExceededSinkError(pub String);
 /// composition root supplies an implementation that forwards into
 /// `EventRepository::append_event`. A bridge constructed without a sink
 /// skips persistence — the event is still broadcast on the bus and the
-/// pause request is still enqueued.
+/// pause request is still enqueued. With a sink configured, the bridge
+/// honours the persist-before-broadcast invariant: a sink error
+/// suppresses the bus emission so live subscribers cannot drift ahead
+/// of the durable log (Phase 12 §139).
 pub trait BudgetExceededEventSink: Send + Sync {
     /// Persist a [`OrchestratorEvent::BudgetExceeded`] and return the
     /// assigned sequence. Implementations may panic-on-mismatch for
@@ -337,16 +340,23 @@ impl BudgetExceededBridge {
         };
 
         for event in &events {
-            self.inner.bus.emit(event.clone());
+            // Persist-before-broadcast (Phase 12 §139): see the matching
+            // comment in `scope_contention_broadcaster::observe_pass`. A
+            // sink failure suppresses the bus emission so live
+            // subscribers cannot drift ahead of the durable log; the
+            // dedup state advances regardless because the episode itself
+            // was observed.
             if let Some(sink) = &self.inner.sink
                 && let Err(err) = sink.append_budget_exceeded(event)
             {
                 tracing::warn!(
                     target: "symphony::budget_exceeded",
                     error = %err,
-                    "failed to persist BudgetExceeded event",
+                    "failed to persist BudgetExceeded event; suppressing broadcast",
                 );
+                continue;
             }
+            self.inner.bus.emit(event.clone());
         }
 
         events
@@ -755,6 +765,96 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
         assert_eq!(queue.len(), 1, "only first pass enqueued");
+    }
+
+    /// Sink that records, on each append, how many events the
+    /// pre-attached bus subscriber has already seen. The persist-
+    /// before-broadcast invariant requires zero — broadcast happens
+    /// only after the append returns.
+    struct OrderingSink {
+        rx: StdMutex<tokio::sync::broadcast::Receiver<OrchestratorEvent>>,
+        seen_before_persist: StdMutex<Vec<usize>>,
+    }
+
+    impl OrderingSink {
+        fn arc(bus: &EventBus) -> Arc<Self> {
+            Arc::new(Self {
+                rx: StdMutex::new(bus.raw_subscribe()),
+                seen_before_persist: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl BudgetExceededEventSink for OrderingSink {
+        fn append_budget_exceeded(
+            &self,
+            _event: &OrchestratorEvent,
+        ) -> Result<i64, BudgetExceededSinkError> {
+            let mut rx = self.rx.lock().unwrap();
+            let mut count = 0;
+            while rx.try_recv().is_ok() {
+                count += 1;
+            }
+            self.seen_before_persist.lock().unwrap().push(count);
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn bridge_persist_runs_before_broadcast() {
+        let bus = EventBus::default();
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let sink = OrderingSink::arc(&bus);
+        let bx = BudgetExceededBridge::new(
+            bus,
+            queue,
+            Some(sink.clone() as Arc<dyn BudgetExceededEventSink>),
+        );
+
+        bx.observe_retry_pass([(
+            req("ENG-1", 99, 100, None),
+            RetryPolicyDecision::BudgetExceeded {
+                observed: 4.0,
+                cap: 3.0,
+            },
+        )]);
+
+        let observed = sink.seen_before_persist.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![0],
+            "persist must observe an empty bus — broadcast comes after"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_sink_failure_suppresses_broadcast() {
+        let bus = EventBus::default();
+        let queue = Arc::new(BudgetPauseDispatchQueue::new());
+        let mut rx = bus.subscribe();
+        let bx = BudgetExceededBridge::new(
+            bus,
+            queue.clone(),
+            Some(Arc::new(FailingSink) as Arc<dyn BudgetExceededEventSink>),
+        );
+
+        bx.observe_retry_pass([(
+            req("ENG-1", 99, 100, None),
+            RetryPolicyDecision::BudgetExceeded {
+                observed: 4.0,
+                cap: 3.0,
+            },
+        )]);
+
+        // Bus must stay empty when persist failed.
+        let next = tokio::time::timeout(std::time::Duration::from_millis(50), rx.next()).await;
+        assert!(
+            next.is_err(),
+            "broadcast must be suppressed when persist fails"
+        );
+        // The pause request still enqueued — observability suppression
+        // does not block the workflow side effect that wraps it.
+        assert_eq!(queue.len(), 1);
     }
 
     #[test]

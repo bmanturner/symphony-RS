@@ -77,6 +77,18 @@ impl EventBus {
         BroadcastStream::new(self.sender.subscribe())
     }
 
+    /// Subscribe and return the raw [`broadcast::Receiver`].
+    ///
+    /// Most callers want the [`Self::subscribe`] stream wrapper. This
+    /// accessor exists for sync-context tests that need `try_recv` to
+    /// observe whether anything has been broadcast yet — used by the
+    /// `persist-before-broadcast` invariant tests in
+    /// `scope_contention_broadcaster` and `budget_exceeded`.
+    #[must_use]
+    pub fn raw_subscribe(&self) -> broadcast::Receiver<OrchestratorEvent> {
+        self.sender.subscribe()
+    }
+
     /// Best-effort emit. Returns silently when no subscribers are
     /// attached — that is the steady state for a daemon running without
     /// `symphony watch` connected, and we deliberately do not force the
