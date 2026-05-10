@@ -14,13 +14,13 @@ One unchecked item per implementation iteration. Each item should land with test
 - [x] Add typed `RoleInstructionConfig` under `RoleConfig.instructions` with optional file-backed `role_prompt` and `soul` paths.
 - [x] Add structured role assignment metadata directly under `RoleConfig` or a nested role-local routing block: `owns`, `does_not_own`, `requires`, `handoff_expectations`, and role-local match hints such as paths/labels/domains.
 - [x] Decide the exact schema shape for role-local routing metadata and make it distinct from global `routing.rules` while allowing the catalog builder to use both.
-- [ ] Add strict validation that instruction file paths stay inside the repo/workflow root.
-- [ ] Add strict validation that configured instruction files exist and are readable.
+- [x] Add strict validation that instruction file paths stay inside the repo/workflow root.
+- [x] Add strict validation that configured instruction files exist and are readable.
 - [x] Add strict validation that role instruction config rejects unknown keys.
 - [x] Add warning validation when a specialist role lacks structured assignment metadata and only has a terse description.
 - [x] Add warning validation when decomposition is enabled but the platform-lead catalog would be built mostly from fallback descriptions/global routing rules.
 - [x] Add round-trip tests for role instruction config and role assignment metadata.
-- [ ] Add negative tests for path traversal, missing instruction files, unknown instruction keys, and missing eligible child-owning roles.
+- [x] Add negative tests for path traversal, missing instruction files, unknown instruction keys, and missing eligible child-owning roles.
 
 ## Phase 2 — Instruction File Loading
 

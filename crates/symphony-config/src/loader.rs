@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use gray_matter::Matter;
 use gray_matter::engine::YAML;
@@ -86,6 +86,24 @@ pub enum WorkflowLoadError {
         #[source]
         source: serde_yaml::Error,
     },
+
+    /// A configured role instruction path escaped the workflow root or
+    /// did not resolve to a readable file.
+    #[error(
+        "role `{role}` {kind} instruction path `{path}` is invalid at {workflow_path}: {reason}"
+    )]
+    InstructionPath {
+        /// Workflow file being loaded.
+        workflow_path: PathBuf,
+        /// Role whose instruction path failed validation.
+        role: String,
+        /// `role_prompt` or `soul`.
+        kind: &'static str,
+        /// Configured path value.
+        path: PathBuf,
+        /// Operator-facing reason.
+        reason: String,
+    },
 }
 
 /// Loader entry point for `WORKFLOW.md`.
@@ -130,6 +148,7 @@ impl WorkflowLoader {
         } else {
             parse_front_matter(&parsed.matter, path)?
         };
+        validate_role_instruction_paths(&config, path)?;
 
         // SPEC §5.2: prompt body is trimmed before use. We trim the
         // *content* (post-front-matter) string from gray_matter, which
@@ -142,6 +161,62 @@ impl WorkflowLoader {
             prompt_template,
         })
     }
+}
+
+fn validate_role_instruction_paths(
+    config: &WorkflowConfig,
+    workflow_path: &Path,
+) -> Result<(), WorkflowLoadError> {
+    let root = workflow_path.parent().unwrap_or_else(|| Path::new("."));
+    for (role_name, role) in &config.roles {
+        for (kind, maybe_path) in [
+            ("role_prompt", role.instructions.role_prompt.as_ref()),
+            ("soul", role.instructions.soul.as_ref()),
+        ] {
+            let Some(path) = maybe_path else {
+                continue;
+            };
+            if path.is_absolute()
+                || path.components().any(|c| {
+                    matches!(
+                        c,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(WorkflowLoadError::InstructionPath {
+                    workflow_path: workflow_path.to_path_buf(),
+                    role: role_name.clone(),
+                    kind,
+                    path: path.clone(),
+                    reason: "path must stay inside the workflow root".to_string(),
+                });
+            }
+            let resolved = root.join(path);
+            match fs::metadata(&resolved) {
+                Ok(meta) if meta.is_file() => {}
+                Ok(_) => {
+                    return Err(WorkflowLoadError::InstructionPath {
+                        workflow_path: workflow_path.to_path_buf(),
+                        role: role_name.clone(),
+                        kind,
+                        path: path.clone(),
+                        reason: "path exists but is not a file".to_string(),
+                    });
+                }
+                Err(source) => {
+                    return Err(WorkflowLoadError::InstructionPath {
+                        workflow_path: workflow_path.to_path_buf(),
+                        role: role_name.clone(),
+                        kind,
+                        path: path.clone(),
+                        reason: format!("file could not be read: {source}"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Re-parse the raw YAML front-matter string into our typed config.
@@ -184,7 +259,8 @@ fn parse_front_matter(raw: &str, path: &Path) -> Result<WorkflowConfig, Workflow
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::config::{AgentKind, TrackerKind};
@@ -298,7 +374,7 @@ Implement the issue described below.
     fn from_path_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("WORKFLOW.md");
-        std::fs::write(
+        fs::write(
             &path,
             "---\ntracker:\n  kind: linear\n  project_slug: ENG\n---\nhello\n",
         )
@@ -307,5 +383,98 @@ Implement the issue described below.
         assert_eq!(loaded.config.tracker.project_slug.as_deref(), Some("ENG"));
         assert_eq!(loaded.prompt_template, "hello");
         assert_eq!(loaded.source_path, path);
+    }
+
+    #[test]
+    fn role_instruction_paths_must_stay_inside_workflow_root() {
+        let input = r#"---
+tracker:
+  kind: linear
+  project_slug: ENG
+roles:
+  backend:
+    kind: specialist
+    instructions:
+      role_prompt: ../outside/AGENTS.md
+---
+body
+"#;
+        let err = WorkflowLoader::from_str_with_path(input, &fake_path()).unwrap_err();
+        match err {
+            WorkflowLoadError::InstructionPath {
+                role, kind, reason, ..
+            } => {
+                assert_eq!(role, "backend");
+                assert_eq!(kind, "role_prompt");
+                assert!(reason.contains("inside the workflow root"));
+            }
+            other => panic!("expected InstructionPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn role_instruction_paths_must_exist_and_be_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        let input = r#"---
+tracker:
+  kind: linear
+  project_slug: ENG
+roles:
+  backend:
+    kind: specialist
+    instructions:
+      soul: .symphony/roles/backend/SOUL.md
+---
+body
+"#;
+        fs::write(&path, input).unwrap();
+
+        let err = WorkflowLoader::from_path(&path).unwrap_err();
+        match err {
+            WorkflowLoadError::InstructionPath {
+                role, kind, reason, ..
+            } => {
+                assert_eq!(role, "backend");
+                assert_eq!(kind, "soul");
+                assert!(reason.contains("could not be read"));
+            }
+            other => panic!("expected InstructionPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn role_instruction_paths_resolve_relative_to_workflow_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let role_dir = dir.path().join(".symphony/roles/backend");
+        fs::create_dir_all(&role_dir).unwrap();
+        fs::write(role_dir.join("AGENTS.md"), "backend instructions").unwrap();
+        fs::write(role_dir.join("SOUL.md"), "backend soul").unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        let input = r#"---
+tracker:
+  kind: linear
+  project_slug: ENG
+roles:
+  backend:
+    kind: specialist
+    instructions:
+      role_prompt: .symphony/roles/backend/AGENTS.md
+      soul: .symphony/roles/backend/SOUL.md
+---
+body
+"#;
+        fs::write(&path, input).unwrap();
+
+        let loaded = WorkflowLoader::from_path(&path).unwrap();
+        let backend = loaded.config.roles.get("backend").unwrap();
+        assert_eq!(
+            backend.instructions.role_prompt.as_deref(),
+            Some(Path::new(".symphony/roles/backend/AGENTS.md"))
+        );
+        assert_eq!(
+            backend.instructions.soul.as_deref(),
+            Some(Path::new(".symphony/roles/backend/SOUL.md"))
+        );
     }
 }

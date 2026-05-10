@@ -2819,6 +2819,14 @@ pub enum ConfigValidationError {
     #[error("workflow requires at least one role with `kind: qa_gate` because qa.required is true")]
     MissingQaGateRole,
 
+    /// Decomposition needs at least one role that can receive normal
+    /// child implementation/review/operator work in the generated
+    /// platform-lead catalog.
+    #[error(
+        "decomposition.enabled requires at least one child-owning role (`specialist`, `reviewer`, or `operator`) for the platform-lead catalog"
+    )]
+    MissingEligibleChildOwningRole,
+
     /// A `*_role` field references a role name that is not defined in
     /// `roles`. Covers `routing.default_role`, every `routing.rules[].assign_role`,
     /// `decomposition.owner_role`, `integration.owner_role`,
@@ -3094,6 +3102,7 @@ impl WorkflowConfig {
         self.validate_workspace_default_strategy()?;
         self.validate_role_and_agent_references()?;
         self.validate_required_role_kinds()?;
+        self.validate_decomposition_catalog_roles()?;
         self.validate_concurrency()?;
         self.validate_budgets()?;
         Ok(())
@@ -3195,6 +3204,18 @@ impl WorkflowConfig {
                     repository: repo.clone(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn validate_decomposition_catalog_roles(&self) -> Result<(), ConfigValidationError> {
+        if self.decomposition.enabled
+            && !self
+                .roles
+                .values()
+                .any(|role| role.kind.child_owning_catalog_role())
+        {
+            return Err(ConfigValidationError::MissingEligibleChildOwningRole);
         }
         Ok(())
     }
@@ -6505,6 +6526,25 @@ decomposition:
             }
         ));
         assert!(warnings.contains(&ConfigValidationWarning::DecompositionCatalogMostlyFallback));
+    }
+
+    #[test]
+    fn validate_rejects_decomposition_without_child_owning_roles() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+roles:
+  platform_lead:
+    kind: integration_owner
+decomposition:
+  enabled: true
+  owner_role: platform_lead
+"#;
+        let cfg: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::MissingEligibleChildOwningRole)
+        );
     }
 
     #[test]
