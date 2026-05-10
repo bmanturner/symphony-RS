@@ -127,7 +127,7 @@ fn sample_fixture_loads_and_validates() {
     );
     assert_eq!(
         cfg.decomposition.child_issue_policy,
-        ChildIssuePolicy::CreateDirectly
+        ChildIssuePolicy::ProposeForApproval
     );
     assert!(cfg.decomposition.dependency_policy.materialize_edges);
     assert_eq!(

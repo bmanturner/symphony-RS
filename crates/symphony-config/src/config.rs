@@ -2853,6 +2853,19 @@ pub enum ConfigValidationError {
         actual: TrackerKind,
     },
 
+    /// Direct decomposition child creation requires native parent/child
+    /// support. Workflows using trackers without that support must keep
+    /// child creation in approval/advisory mode so the tracker is not
+    /// treated as structural truth by convention alone.
+    #[error(
+        "decomposition.child_issue_policy = create_directly requires TrackerCapabilities.link_parent_child = true (tracker.kind = {actual:?}); use propose_for_approval for advisory/local-only parent links"
+    )]
+    DecompositionDirectChildCreationRequiresParentLink {
+        /// The configured tracker kind that does not advertise
+        /// structural parent/child linking.
+        actual: TrackerKind,
+    },
+
     /// Workspace strategy and branching policy disagree on shared
     /// branch usage. SPEC v2 §5.9 chooses the safer setting by
     /// rejecting the config rather than silently picking one side.
@@ -2968,6 +2981,7 @@ impl WorkflowConfig {
         self.validate_branching_templates()?;
         self.validate_decomposition_depth()?;
         self.validate_dependency_policy_tracker_capabilities()?;
+        self.validate_decomposition_parent_link_capabilities()?;
         self.validate_pr_provider_pairing()?;
         self.validate_shared_branch_consistency()?;
         self.validate_workspace_default_strategy()?;
@@ -3144,6 +3158,25 @@ impl WorkflowConfig {
         {
             return Err(
                 ConfigValidationError::DependencyTrackerSyncRequiresAddBlocker {
+                    actual: self.tracker.kind,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `child_issue_policy: create_directly` means Symphony will create
+    /// child tracker issues during decomposition and expects the tracker
+    /// relation to be structural. Trackers that can only render advisory
+    /// comments/text must use `propose_for_approval`, which keeps the
+    /// local workflow truth explicit instead of pretending the tracker
+    /// has a parent/child primitive.
+    fn validate_decomposition_parent_link_capabilities(&self) -> Result<(), ConfigValidationError> {
+        if self.decomposition.child_issue_policy == ChildIssuePolicy::CreateDirectly
+            && !self.tracker.kind.supports_structural_parent_links()
+        {
+            return Err(
+                ConfigValidationError::DecompositionDirectChildCreationRequiresParentLink {
                     actual: self.tracker.kind,
                 },
             );
@@ -3390,6 +3423,13 @@ impl TrackerKind {
     /// `symphony-config` depend on runtime adapter crates. Linear has
     /// native issue relations; GitHub Issues and the fixture Mock do not.
     const fn supports_structural_blockers(self) -> bool {
+        matches!(self, TrackerKind::Linear)
+    }
+
+    /// Product-level parent/child capability map used by workflow
+    /// validation. Keep this separate from blocker support so a future
+    /// tracker can support one structural relation without the other.
+    const fn supports_structural_parent_links(self) -> bool {
         matches!(self, TrackerKind::Linear)
     }
 }
@@ -6275,6 +6315,54 @@ hooks:
             cfg.validate(),
             Err(
                 ConfigValidationError::DependencyTrackerSyncRequiresAddBlocker {
+                    actual: TrackerKind::Mock,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn validate_accepts_direct_child_creation_for_linear_parent_links() {
+        let mut cfg = minimal_linear_cfg();
+        cfg.decomposition.child_issue_policy = ChildIssuePolicy::CreateDirectly;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_direct_child_creation_for_github_without_parent_links() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.decomposition.child_issue_policy = ChildIssuePolicy::CreateDirectly;
+        assert_eq!(
+            cfg.validate(),
+            Err(
+                ConfigValidationError::DecompositionDirectChildCreationRequiresParentLink {
+                    actual: TrackerKind::Github,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn validate_accepts_github_parent_links_in_advisory_approval_mode() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Github;
+        cfg.tracker.repository = Some("foglet-io/rust-symphony".into());
+        cfg.decomposition.child_issue_policy = ChildIssuePolicy::ProposeForApproval;
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_direct_child_creation_for_mock_without_parent_links() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.kind = TrackerKind::Mock;
+        cfg.tracker.fixtures = Some(PathBuf::from("issues.yaml"));
+        cfg.decomposition.child_issue_policy = ChildIssuePolicy::CreateDirectly;
+        assert_eq!(
+            cfg.validate(),
+            Err(
+                ConfigValidationError::DecompositionDirectChildCreationRequiresParentLink {
                     actual: TrackerKind::Mock,
                 }
             )

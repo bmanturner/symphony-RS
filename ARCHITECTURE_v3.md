@@ -629,6 +629,24 @@ structural orchestration. Adding GitHub native support is a future
 adapter project, not a v3 deliverable, and would land as a capability
 flag flip plus mutation implementation, not as a label hack.
 
+### 2026-05-10 — Direct child creation requires structural parent links
+
+Context: SPEC v3 requires child issues to be created or linked under
+their parent according to `decomposition.child_issue_policy`, while also
+forbidding adapters from treating comments, labels, or body text as
+structural tracker support.
+
+Decision: `decomposition.child_issue_policy: create_directly` requires a
+tracker kind whose capability contract includes native parent/child
+links. Trackers without that support, including GitHub Issues and the
+fixture mock tracker, must use `propose_for_approval` as the explicit
+advisory/local-only parent-link mode.
+
+Consequence: GitHub-backed workflows can still use local Symphony
+dependency truth, PR lifecycle, and approval queues, but they cannot
+claim direct structural child creation until a real native parent/child
+API is implemented and advertised by the adapter.
+
 ### 2026-05-09 — Edge auto-resolution is provenance-scoped
 
 Context: terminal-blocker auto-resolution must not silently flip QA or

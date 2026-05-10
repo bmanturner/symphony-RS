@@ -125,7 +125,10 @@ decomposition:
     labels_any: [epic, broad, umbrella]
     estimated_files_over: 5
     acceptance_items_over: 3
-  child_issue_policy: create_directly
+  # GitHub Issues lacks structural parent/child links; keep child
+  # creation in approval mode so parent links remain explicitly
+  # advisory/local-only instead of being treated as tracker truth.
+  child_issue_policy: propose_for_approval
   max_depth: 2
   require_acceptance_criteria_per_child: true
   dependency_policy:
