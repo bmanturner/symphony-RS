@@ -117,6 +117,33 @@ pub enum Command {
     /// those rows back without SQL — useful for audit ("what did QA
     /// decide on ENG-101?") and for debugging gate decisions.
     Qa(QaArgs),
+
+    /// Operator dashboard TUI with five tabs over the durable store
+    /// (Phase 12 / SPEC v2 §6).
+    ///
+    /// Distinct from `symphony watch`: `watch` consumes the live SSE
+    /// event tail of a running daemon; `dashboard` reads the durable
+    /// SQLite store directly, so it works whether or not a daemon is
+    /// up. Tabs cover queues, blockers, QA verdicts, integration
+    /// records, and runs.
+    Dashboard(DashboardArgs),
+}
+
+/// Arguments for `symphony dashboard`.
+#[derive(Debug, clap::Args)]
+pub struct DashboardArgs {
+    /// Path to the durable state SQLite database. Must already exist —
+    /// `dashboard` is a read-only command and refuses to create a
+    /// database on demand for the same reason `symphony status
+    /// --state-db` and `symphony recover` do: presenting an empty
+    /// database to an operator who typed the wrong path is worse than
+    /// failing fast.
+    #[arg(
+        long = "state-db",
+        value_name = "PATH",
+        default_value = "symphony.sqlite3"
+    )]
+    pub state_db: PathBuf,
 }
 
 /// Arguments for `symphony recover`.

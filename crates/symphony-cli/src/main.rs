@@ -13,6 +13,7 @@
 
 mod cancel;
 mod cli;
+mod dashboard;
 mod issue;
 mod logging;
 mod qa;
@@ -134,6 +135,22 @@ fn main() -> anyhow::Result<ExitCode> {
             // sync, and the kernel's propagator is pure.
             let outcome = cancel::run(&args);
             let code = cancel::render(&outcome);
+            Ok(ExitCode::from(code as u8))
+        }
+        Some(Command::Dashboard(args)) => {
+            // `dashboard` is read-only and synchronous: it opens the
+            // durable SQLite store, refreshes a snapshot on a timer,
+            // and renders five tabs. No tokio runtime needed because
+            // every query is synchronous and input is read with
+            // crossterm's blocking `event::poll`.
+            let outcome = dashboard::run(&args.state_db);
+            let code = outcome.exit_code();
+            if let dashboard::DashboardOutcome::StateDbFailed(err) = &outcome {
+                eprintln!("dashboard: state db error: {err}");
+            }
+            if let dashboard::DashboardOutcome::TerminalFailed(err) = &outcome {
+                eprintln!("dashboard: terminal error: {err}");
+            }
             Ok(ExitCode::from(code as u8))
         }
         Some(Command::Status(args)) => {
