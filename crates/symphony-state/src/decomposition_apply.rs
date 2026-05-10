@@ -325,12 +325,22 @@ mod tests {
     }
 
     fn proposal(parent: WorkItemId) -> DecompositionProposal {
+        proposal_with_children(
+            parent,
+            vec![child("A", &[]), child("B", &["A"]), child("C", &["B"])],
+        )
+    }
+
+    fn proposal_with_children(
+        parent: WorkItemId,
+        children: Vec<ChildProposal>,
+    ) -> DecompositionProposal {
         DecompositionProposal::try_new(
             DecompositionId::new(7),
             symphony_core::work_item::WorkItemId::new(parent.0),
             RoleName::new("platform_lead"),
             "split",
-            vec![child("A", &[]), child("B", &["A"]), child("C", &["B"])],
+            children,
             FollowupPolicy::CreateDirectly,
         )
         .expect("proposal")
@@ -440,6 +450,55 @@ mod tests {
                 persisted.local_dependency_evidence(),
             )
             .expect("A -> B -> C materialization is enough to apply");
+        assert_eq!(proposal.status, DecompositionStatus::Applied);
+    }
+
+    #[test]
+    fn materializes_mixed_parallel_sequential_graph_with_two_root_children() {
+        let mut db = open();
+        let parent = seed_parent(&mut db);
+        let mut proposal = proposal_with_children(
+            parent,
+            vec![child("A", &[]), child("B", &[]), child("C", &["A", "B"])],
+        );
+
+        let persisted =
+            persist_applied_decomposition(&mut db, &proposal, &applied(), "github", NOW)
+                .expect("persist");
+        let ids = persisted.child_work_item_ids();
+        let a = WorkItemId(ids[&ChildKey::new("A")].get());
+        let b = WorkItemId(ids[&ChildKey::new("B")].get());
+        let c = WorkItemId(ids[&ChildKey::new("C")].get());
+
+        assert!(db.list_incoming_open_blockers(a).unwrap().is_empty());
+        assert!(db.list_incoming_open_blockers(b).unwrap().is_empty());
+
+        let c_blockers = db.list_incoming_open_blockers(c).unwrap();
+        assert_eq!(c_blockers.len(), 2);
+        assert_eq!(
+            c_blockers
+                .iter()
+                .map(|edge| (edge.parent_id, edge.child_id, edge.reason.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (a, c, Some("C depends on A")),
+                (b, c, Some("C depends on B"))
+            ]
+        );
+
+        assert_eq!(persisted.dependency_edges.len(), 2);
+        assert!(persisted.dependency_edges.iter().all(|edge| {
+            edge.edge_type == EdgeType::Blocks
+                && edge.status == "open"
+                && edge.source == EdgeSource::Decomposition
+        }));
+
+        proposal
+            .mark_applied(
+                persisted.child_work_item_ids(),
+                persisted.local_dependency_evidence(),
+            )
+            .expect("mixed parallel/sequential materialization is enough to apply");
         assert_eq!(proposal.status, DecompositionStatus::Applied);
     }
 
