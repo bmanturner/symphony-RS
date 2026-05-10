@@ -21,6 +21,10 @@ Unknown YAML keys are rejected. The schema is intentionally strict so typos do n
 
 For migration guidance from the original Symphony-RS fixture and planning shape, see `docs/upgrade.md`.
 
+For tracker-backed child dependency orchestration, see the v3 addendum in
+`SPEC_v3.md`. v3 extends `decomposition` with dependency policy and durable
+`blocks` edges; it does not replace the v2 workflow schema or gate semantics.
+
 ## Minimal Valid Shape
 
 A useful workflow normally declares roles, agents, routing, workspace policy, integration, QA, and follow-up policy. For validation only, a minimal Linear workflow can be as small as:

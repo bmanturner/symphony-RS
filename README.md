@@ -133,6 +133,9 @@ The full schema is documented in
 [`docs/workspaces.md`](./docs/workspaces.md), and QA behavior in
 [`docs/qa.md`](./docs/qa.md).
 
+Tracker-backed dependency orchestration for decomposed child issues is tracked
+as the v3 addendum in [`SPEC_v3.md`](./SPEC_v3.md).
+
 ## Development
 
 ```sh

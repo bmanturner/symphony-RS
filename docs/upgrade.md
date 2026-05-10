@@ -26,6 +26,19 @@ The v1 planning files are archived in `docs/legacy/` for historical context only
 
 Do not maintain a parallel v1 checklist or root-level v1 architecture as product truth. If a legacy detail still matters, restate it in the v2 document that owns the behavior.
 
+## Apply V3 Dependency Orchestration As An Addendum
+
+`SPEC_v3.md` extends the v2 productization path with tracker-backed dependency orchestration between child issues created by decomposition. It does not redefine v2 roles, QA, PR, workspace, blockers, or follow-up behavior.
+
+Use the v3 root documents as the active reference for this addendum:
+
+- `SPEC_v3.md` for the dependency orchestration product contract.
+- `ARCHITECTURE_v3.md` for the implementation shape over existing v2 crates.
+- `PLAN_v3.md` for the strategic rollout.
+- `CHECKLIST_v3.md` for one-commit iteration items.
+
+The practical upgrade point is narrow: `ChildProposal.depends_on` must become durable `blocks` edges, scheduler dispatch must respect those edges, and capable trackers should receive equivalent structural blocker relations.
+
 ## Repackage Tandem
 
 The old `tandem` agent behavior is not a backend in v2. It is a composite agent strategy over configured backend profiles:

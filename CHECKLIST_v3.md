@@ -4,7 +4,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 ## Phase 0 — v3 Grounding
 
-- [ ] Add `SPEC_v3.md` to product docs/references and link it from the v2 productization docs without redefining v2 role, QA, PR, workspace, or follow-up requirements.
+- [x] Add `SPEC_v3.md` to product docs/references and link it from the v2 productization docs without redefining v2 role, QA, PR, workspace, or follow-up requirements.
 - [ ] Add a fixture decomposition scenario documenting `A`, `B depends_on A`, `C depends_on B` as the canonical sequential child DAG.
 - [ ] Add a fixture decomposition scenario documenting mixed parallel/sequential work: `A`, `B`, `C depends_on [A, B]`.
 

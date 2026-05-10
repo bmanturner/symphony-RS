@@ -210,6 +210,10 @@ fn upgrade_doc_covers_v2_migration_contract() {
         "tests/fixtures/quickstart-workflow/WORKFLOW.md",
         "docs/legacy/",
         "docs/workflow.md",
+        "SPEC_v3.md",
+        "ARCHITECTURE_v3.md",
+        "PLAN_v3.md",
+        "CHECKLIST_v3.md",
         "strategy: tandem",
         "Keep Mocks Test-Only",
         "kind: integration_owner",
@@ -268,6 +272,7 @@ fn quickstart_fixture_loads_and_readme_covers_v2_walkthrough() {
         "kind: qa_gate",
         "Mock adapters are test-only",
         "docs/workflow.md",
+        "SPEC_v3.md",
     ] {
         assert!(
             README_DOC.contains(required),
