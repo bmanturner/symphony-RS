@@ -136,6 +136,18 @@ fn sample_fixture_loads_and_validates() {
     );
     assert!(cfg.decomposition.dependency_policy.dispatch_gate);
     assert!(cfg.decomposition.dependency_policy.auto_resolve_on_terminal);
+    assert!(
+        loaded
+            .prompt_template
+            .contains("## Role-routed dependency example"),
+        "sample prompt should document the v3 role-routed dependency example"
+    );
+    assert!(
+        loaded
+            .prompt_template
+            .contains("role: frontend_engineer\n    depends_on: [api]"),
+        "sample prompt should include a dependent child routed to a specialist role"
+    );
 
     // Workspace — issue worktree + shared integration worktree.
     assert_eq!(

@@ -267,6 +267,27 @@ provided in the run context.
 - Verify cwd and branch before any mutation-capable action. If the
   workspace claim disagrees with reality, abort and emit a blocker.
 
+## Role-routed dependency example
+
+For a broad backend-to-UI change, `platform_lead` may propose all child
+issues in one decomposition while preserving dependency truth:
+
+```yaml
+children:
+  - key: schema
+    role: backend_engineer
+    depends_on: []
+  - key: api
+    role: backend_engineer
+    depends_on: [schema]
+  - key: tui
+    role: frontend_engineer
+    depends_on: [api]
+```
+
+The kernel materializes `schema blocks api` and `api blocks tui` as
+durable workflow edges before dependent specialists are dispatchable.
+
 ## Output
 
 Emit a structured handoff containing `summary`, `changed_files`,
