@@ -102,6 +102,9 @@ pub fn render(outcome: &ValidateOutcome) -> i32 {
                 "  prompt.body_chars    = {}",
                 loaded.prompt_template.chars().count()
             );
+            for warning in cfg.validation_warnings() {
+                eprintln!("{warning}");
+            }
         }
         ValidateOutcome::LoadFailed(err) => {
             // `eprintln!` so a CI step capturing stdout for the success

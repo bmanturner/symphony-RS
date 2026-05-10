@@ -72,6 +72,28 @@ fn validate_exits_2_for_semantically_invalid_config() {
 }
 
 #[test]
+fn validate_warns_when_dependency_dispatch_gate_is_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("WORKFLOW.md");
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(
+            b"---\ntracker:\n  kind: linear\n  project_slug: ENG\ndecomposition:\n  dependency_policy:\n    dispatch_gate: false\n---\nbody\n",
+        )
+        .unwrap();
+    }
+    Command::cargo_bin("symphony")
+        .unwrap()
+        .arg("validate")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OK:"))
+        .stderr(predicate::str::contains("WARNING:"))
+        .stderr(predicate::str::contains("observability-only"));
+}
+
+#[test]
 fn validate_help_lists_subcommand() {
     Command::cargo_bin("symphony")
         .unwrap()

@@ -2877,6 +2877,30 @@ pub enum ConfigValidationError {
     },
 }
 
+/// Non-fatal validation warnings raised by [`WorkflowConfig::validation_warnings`].
+///
+/// These represent accepted-but-risky workflow choices. They are kept
+/// typed so CLIs and future JSON output can render loud operator
+/// warnings without scraping strings from logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigValidationWarning {
+    /// `dispatch_gate: false` makes dependency edges observability-only:
+    /// decomposition dependencies can be rendered, but they no longer
+    /// stop specialist dispatch.
+    DependencyDispatchGateDisabled,
+}
+
+impl std::fmt::Display for ConfigValidationWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DependencyDispatchGateDisabled => write!(
+                f,
+                "WARNING: decomposition.dependency_policy.dispatch_gate = false makes dependency edges observability-only; specialists may dispatch before prerequisites clear"
+            ),
+        }
+    }
+}
+
 impl WorkflowConfig {
     /// Reject configs whose values parse but cannot be dispatched.
     ///
@@ -2952,6 +2976,18 @@ impl WorkflowConfig {
         self.validate_concurrency()?;
         self.validate_budgets()?;
         Ok(())
+    }
+
+    /// Return accepted-but-risky workflow choices that operators should
+    /// see during validation. Warnings never make the config invalid;
+    /// callers that want a stricter policy can promote them at their
+    /// own boundary.
+    pub fn validation_warnings(&self) -> Vec<ConfigValidationWarning> {
+        let mut warnings = Vec::new();
+        if !self.decomposition.dependency_policy.dispatch_gate {
+            warnings.push(ConfigValidationWarning::DependencyDispatchGateDisabled);
+        }
+        warnings
     }
 
     /// Validate the typed [`BudgetsConfig`] block. Every numeric cap
@@ -4967,6 +5003,35 @@ decomposition:
                 auto_resolve_on_terminal: true,
             }
         );
+    }
+
+    #[test]
+    fn decomposition_dispatch_gate_false_emits_warning_not_error() {
+        let yaml = r#"
+tracker:
+  project_slug: ENG
+decomposition:
+  dependency_policy:
+    dispatch_gate: false
+"#;
+        let parsed: WorkflowConfig = serde_yaml::from_str(yaml).expect("yaml parses");
+        assert_eq!(parsed.validate(), Ok(()));
+        assert_eq!(
+            parsed.validation_warnings(),
+            vec![ConfigValidationWarning::DependencyDispatchGateDisabled]
+        );
+        assert!(
+            parsed.validation_warnings()[0]
+                .to_string()
+                .contains("observability-only")
+        );
+    }
+
+    #[test]
+    fn default_dependency_dispatch_gate_has_no_warning() {
+        let parsed: WorkflowConfig =
+            serde_yaml::from_str("tracker:\n  project_slug: ENG\n").expect("yaml parses");
+        assert!(parsed.validation_warnings().is_empty());
     }
 
     #[test]
