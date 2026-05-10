@@ -188,7 +188,32 @@ pub trait WorkItemRepository {
     /// List children attached to a parent via the `parent_id` column.
     /// Edge-based decomposition (`work_item_edges`) lands in Phase 5.
     fn list_children(&self, parent: WorkItemId) -> StateResult<Vec<WorkItemRecord>>;
+
+    /// List every work item whose normalized `status_class` is non-terminal.
+    ///
+    /// "Non-terminal" mirrors
+    /// [`symphony_core::work_item::WorkItemStatusClass::is_active`]: any
+    /// class except `done`, `cancelled`, and `ignore`. The storage layer
+    /// keeps the comparison stringly-typed so it does not depend on
+    /// `symphony-core`; the canonical list of inactive labels is encoded
+    /// in [`INACTIVE_STATUS_CLASSES`] and pinned by a test that walks
+    /// every variant.
+    ///
+    /// Rows come back ordered by `updated_at DESC` so `symphony status`
+    /// surfaces the most recently touched work first — the same ordering
+    /// an operator expects when answering "what is the orchestrator
+    /// looking at right now?". Ties break on `id ASC` for determinism.
+    fn list_active_work_items(&self) -> StateResult<Vec<WorkItemRecord>>;
 }
+
+/// Status-class labels considered terminal/inactive by
+/// [`WorkItemRepository::list_active_work_items`].
+///
+/// Storage filters strings, not typed enums, so the canonical list lives
+/// here as `&'static [&'static str]` and a test in `symphony-core`
+/// asserts it stays in sync with
+/// [`symphony_core::work_item::WorkItemStatusClass::is_active`].
+pub const INACTIVE_STATUS_CLASSES: &[&str] = &["done", "cancelled", "ignore"];
 
 /// CRUD over `runs`.
 pub trait RunRepository {
@@ -452,6 +477,36 @@ pub(crate) fn list_children_in(
     Ok(out)
 }
 
+pub(crate) fn list_active_work_items_in(conn: &Connection) -> StateResult<Vec<WorkItemRecord>> {
+    // Build a SQL `NOT IN (?, ?, ?)` clause from `INACTIVE_STATUS_CLASSES`.
+    // Comparison is case-insensitive to match the rest of the codebase's
+    // tracker-status handling — kernel inserts already lower-case the
+    // status_class, but defending here keeps a manual SQL poke from
+    // silently flipping a row into the active set.
+    let placeholders = INACTIVE_STATUS_CLASSES
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {WORK_ITEM_COLUMNS} FROM work_items \
+         WHERE LOWER(status_class) NOT IN ({placeholders}) \
+         ORDER BY updated_at DESC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params_vec: Vec<&dyn rusqlite::ToSql> = INACTIVE_STATUS_CLASSES
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    let rows = stmt.query_map(params_vec.as_slice(), map_work_item)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn create_run_in(conn: &Connection, new: NewRun<'_>) -> StateResult<RunRecord> {
     conn.execute(
         "INSERT INTO runs \
@@ -656,6 +711,10 @@ impl WorkItemRepository for StateDb {
     fn list_children(&self, parent: WorkItemId) -> StateResult<Vec<WorkItemRecord>> {
         list_children_in(self.conn(), parent)
     }
+
+    fn list_active_work_items(&self) -> StateResult<Vec<WorkItemRecord>> {
+        list_active_work_items_in(self.conn())
+    }
 }
 
 impl RunRepository for StateDb {
@@ -800,6 +859,81 @@ mod tests {
             .update_work_item_status(WorkItemId(999), "x", "y", "2026-05-08T00:00:00Z")
             .expect("update");
         assert!(!updated);
+    }
+
+    #[test]
+    fn list_active_work_items_excludes_terminal_classes() {
+        let mut db = open();
+        let active_ready = db
+            .create_work_item(NewWorkItem {
+                status_class: "ready",
+                ..sample_work_item("ENG-1", "2026-05-08T00:00:00Z")
+            })
+            .unwrap();
+        let active_running = db
+            .create_work_item(NewWorkItem {
+                status_class: "running",
+                ..sample_work_item("ENG-2", "2026-05-08T00:00:01Z")
+            })
+            .unwrap();
+        let _terminal_done = db
+            .create_work_item(NewWorkItem {
+                status_class: "done",
+                ..sample_work_item("ENG-3", "2026-05-08T00:00:02Z")
+            })
+            .unwrap();
+        let _terminal_cancelled = db
+            .create_work_item(NewWorkItem {
+                status_class: "cancelled",
+                ..sample_work_item("ENG-4", "2026-05-08T00:00:03Z")
+            })
+            .unwrap();
+        let _terminal_ignore = db
+            .create_work_item(NewWorkItem {
+                status_class: "ignore",
+                ..sample_work_item("ENG-5", "2026-05-08T00:00:04Z")
+            })
+            .unwrap();
+
+        let active = db.list_active_work_items().expect("list");
+        let ids: Vec<_> = active.iter().map(|w| w.id).collect();
+        // Ordered by updated_at DESC: running was inserted later than ready.
+        assert_eq!(ids, vec![active_running.id, active_ready.id]);
+    }
+
+    #[test]
+    fn inactive_status_classes_match_core_definition() {
+        // `symphony-core::WorkItemStatusClass::is_active` is the source
+        // of truth for "active vs terminal/inactive". The storage layer
+        // duplicates the labels for filtering; this test pins them so a
+        // future variant added in core forces the constant to move too.
+        use symphony_core::work_item::WorkItemStatusClass;
+        let derived: std::collections::BTreeSet<&str> = WorkItemStatusClass::ALL
+            .into_iter()
+            .filter(|c| !c.is_active())
+            .map(|c| c.as_str())
+            .collect();
+        let pinned: std::collections::BTreeSet<&str> =
+            INACTIVE_STATUS_CLASSES.iter().copied().collect();
+        assert_eq!(derived, pinned);
+    }
+
+    #[test]
+    fn list_active_work_items_is_case_insensitive_on_status_class() {
+        let mut db = open();
+        // Manually poke a non-canonical casing to defend against an
+        // adapter that forgets to lower-case before insert.
+        let ready = db
+            .create_work_item(sample_work_item("ENG-1", "2026-05-08T00:00:00Z"))
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE work_items SET status_class = 'DONE' WHERE id = ?1",
+                params![ready.id.0],
+            )
+            .unwrap();
+        let active = db.list_active_work_items().unwrap();
+        assert!(active.is_empty());
     }
 
     #[test]

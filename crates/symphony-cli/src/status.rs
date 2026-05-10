@@ -1,23 +1,30 @@
 //! Implementation of the `symphony status` subcommand.
 //!
-//! `status` is a *point-in-time* snapshot, distinct from the live TUI
-//! that lands in Phase 8 (`symphony watch`). It loads `WORKFLOW.md` with
-//! the same [`LayeredLoader`] the daemon uses, materialises the
-//! configured [`TrackerRead`], asks it for the current active issues,
-//! and prints a compact human-readable table. It is the operational
-//! answer to "if I started the orchestrator right now, what would it
-//! pick up?".
+//! `status` is a *point-in-time* snapshot of the orchestrator's view of
+//! the world. It loads `WORKFLOW.md` with the same [`LayeredLoader`] the
+//! daemon uses, then takes one of two paths depending on whether
+//! `--state-db` is supplied:
 //!
-//! ## Why a snapshot rather than reaching into a running daemon
+//! * **Durable mode** (`--state-db PATH`, SPEC v2 §4.7 / ARCH v2 §4):
+//!   the durable SQLite store is the source of truth. We enumerate every
+//!   non-terminal [`WorkItemRecord`] and join the latest persisted
+//!   handoff per row. The tracker is *not* called — the operator wants
+//!   to know what the orchestrator believes, not what the upstream
+//!   tracker happens to advertise this second.
+//! * **Tracker preview mode** (`--state-db` omitted): falls back to the
+//!   pre-v2 behavior of asking the configured tracker for active issues
+//!   directly. Useful before any orchestrator has run, or when the
+//!   operator does not have access to the durable DB. This is honest
+//!   about its limits — it cannot show role assignments, run state, or
+//!   handoffs because none of that has been persisted yet.
 //!
-//! Symphony-RS has no shared state between processes — the orchestrator
-//! is a single-process daemon, and there is no socket / pid file to
-//! attach to today. Reading from the tracker directly is honest about
-//! that constraint: it tells the operator the same thing the next poll
-//! tick would have told the daemon, with no risk of staleness from a
-//! cached on-disk snapshot. Phase 8's `symphony watch` is the right
-//! place to add live attach-to-daemon semantics; we deliberately do not
-//! pre-empt it here.
+//! ## Why the split rather than always reading the tracker
+//!
+//! Symphony-RS v2 makes the durable store authoritative. Reading from
+//! the tracker would silently lie about state-class normalization,
+//! decomposition children, and handoff history — none of which the
+//! tracker tracks. The fall-back is a convenience for operators who
+//! genuinely have no DB yet, not the recommended path.
 //!
 //! ## Exit codes
 //!
@@ -25,15 +32,15 @@
 //! - `1` — `WORKFLOW.md` could not be loaded (missing, malformed YAML,
 //!   env override that does not satisfy the typed schema).
 //! - `2` — the loaded config is semantically invalid.
-//! - `3` — the tracker rejected our request (auth, network, malformed
-//!   upstream payload). The error is printed to stderr.
+//! - `3` — tracker preview mode was selected and the tracker rejected
+//!   our request (auth, network, malformed upstream payload). Only
+//!   reachable when `--state-db` is *not* supplied.
 //! - `4` — `--state-db` was provided but the durable state database
-//!   could not be opened or queried (SPEC v2 §4.7 handoff lookup).
-//!   The tracker view still prints; only the handoff annotations are
-//!   missing.
+//!   could not be opened or queried. The tracker is not consulted in
+//!   this mode, so there is no partial fallback view.
 //!
 //! These match the splits used by `symphony validate` for codes 1 and 2
-//! so a CI script can tell "config problem" apart from "tracker
+//! so a CI script can tell "config problem" apart from "data plane
 //! problem" with one comparison.
 
 use std::path::Path;
@@ -45,15 +52,14 @@ use symphony_config::{
 use symphony_core::tracker::Issue;
 use symphony_core::tracker_trait::{TrackerError, TrackerRead};
 use symphony_state::handoffs::{HandoffRecord, HandoffRepository};
-use symphony_state::repository::WorkItemRepository;
+use symphony_state::repository::{WorkItemRecord, WorkItemRepository};
 use symphony_state::{StateDb, StateError};
 
 use crate::run::build_tracker;
 
 /// Stable string the durable state layer uses for the `tracker_id`
 /// column. Mirrors the value the orchestrator inserts when it persists a
-/// work item, so `find_work_item_by_identifier` lookups from `status`
-/// can join cleanly to the SPEC v2 §4.7 handoffs table.
+/// work item.
 fn tracker_id_for(kind: TrackerKind) -> &'static str {
     match kind {
         TrackerKind::Linear => "linear",
@@ -63,26 +69,21 @@ fn tracker_id_for(kind: TrackerKind) -> &'static str {
 }
 
 /// Outcome of a `symphony status` invocation.
-///
-/// Mirrors [`crate::validate::ValidateOutcome`] for the loader stages so
-/// the two subcommands report config problems with the same exit codes.
-/// `TrackerFailed` is the only outcome unique to `status` — it lands when
-/// the loader was happy but the live tracker call failed.
 #[derive(Debug)]
 pub enum StatusOutcome {
-    /// Loader, validate, and tracker fetch all succeeded.
+    /// Loader, validate, and either tracker fetch or DB query succeeded.
     Ok(Box<StatusSnapshot>),
     /// The loader rejected `WORKFLOW.md`.
     LoadFailed(LayeredLoadError),
     /// The loader succeeded but the typed config failed `validate()`.
     Invalid(Box<LoadedWorkflow>, ConfigValidationError),
-    /// The loader succeeded but the tracker call returned an error.
+    /// Tracker preview mode (no `--state-db`) but the tracker call
+    /// failed.
     TrackerFailed(Box<LoadedWorkflow>, TrackerError),
-    /// The loader and tracker succeeded, but `--state-db` pointed at a
-    /// database we could not open or query. Surfaced separately so an
-    /// operator never confuses a missing handoff column with a tracker
-    /// outage.
-    StateDbFailed(Box<LoadedWorkflow>, Vec<Issue>, StateError),
+    /// Durable mode (`--state-db PATH`) but the database could not be
+    /// opened or queried. There is no partial view in this mode — the
+    /// durable store is the source of truth.
+    StateDbFailed(Box<LoadedWorkflow>, StateError),
 }
 
 impl StatusOutcome {
@@ -93,36 +94,51 @@ impl StatusOutcome {
             StatusOutcome::LoadFailed(_) => 1,
             StatusOutcome::Invalid(_, _) => 2,
             StatusOutcome::TrackerFailed(_, _) => 3,
-            StatusOutcome::StateDbFailed(_, _, _) => 4,
+            StatusOutcome::StateDbFailed(_, _) => 4,
         }
     }
 }
 
 /// All the data `status` prints. Carrying the loaded config alongside
-/// the issues lets the renderer surface the tracker label / agent kind
+/// the rows lets the renderer surface the configured tracker / agent
 /// without re-reading anything.
 #[derive(Debug)]
 pub struct StatusSnapshot {
-    /// The loaded `WORKFLOW.md` — exposed so the renderer can show the
-    /// configured tracker / agent / polling values next to the live
-    /// issue list.
+    /// The loaded `WORKFLOW.md`.
     pub loaded: Box<LoadedWorkflow>,
-    /// Active issues as the tracker reports them right now. Empty list
-    /// is a legitimate snapshot (no work to dispatch), not an error.
-    pub active: Vec<Issue>,
-    /// Latest persisted handoff per active issue, aligned positionally
-    /// with [`Self::active`]. `None` when no state DB was supplied or
-    /// when the durable layer has not seen this work item yet.
-    pub latest_handoffs: Vec<Option<HandoffRecord>>,
+    /// Either the durable view or the tracker preview, depending on
+    /// whether `--state-db` was supplied.
+    pub view: StatusView,
+}
+
+/// The two distinct views `symphony status` can render.
+#[derive(Debug)]
+pub enum StatusView {
+    /// Source-of-truth view assembled from the durable SQLite store.
+    Durable {
+        /// Every non-terminal work item the orchestrator has persisted,
+        /// most recently updated first.
+        items: Vec<DurableWorkItemRow>,
+    },
+    /// Pre-v2 fallback view assembled by asking the tracker directly.
+    /// Used when no `--state-db` is supplied.
+    TrackerPreview {
+        /// Active issues as the tracker reports them right now.
+        active: Vec<Issue>,
+    },
+}
+
+/// One row in the [`StatusView::Durable`] table — the persisted work
+/// item plus its latest handoff envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableWorkItemRow {
+    /// The work item as the orchestrator stored it.
+    pub work_item: WorkItemRecord,
+    /// The most recent persisted handoff for this work item, if any.
+    pub latest_handoff: Option<HandoffRecord>,
 }
 
 /// Top-level entry: load → validate → fetch.
-///
-/// Errors propagate as typed [`StatusOutcome`] variants so the renderer
-/// can map them to stable exit codes. We intentionally do *not* swallow
-/// the tracker error and pretend "0 issues" — an operator who runs
-/// `symphony status` after configuring a bad token deserves to see the
-/// failure, not a misleading empty table.
 pub async fn run(path: &Path, state_db: Option<&Path>) -> StatusOutcome {
     let loaded = match LayeredLoader::from_path(path) {
         Ok(l) => l,
@@ -131,85 +147,72 @@ pub async fn run(path: &Path, state_db: Option<&Path>) -> StatusOutcome {
     if let Err(err) = loaded.config.validate() {
         return StatusOutcome::Invalid(Box::new(loaded), err);
     }
+    let loaded = Box::new(loaded);
+
+    match state_db {
+        Some(db_path) => snapshot_from_durable(loaded, db_path),
+        None => snapshot_from_tracker_preview(loaded).await,
+    }
+}
+
+/// Durable mode: enumerate non-terminal work items from the SQLite store
+/// and attach the latest handoff per row. Tracker is not consulted.
+fn snapshot_from_durable(loaded: Box<LoadedWorkflow>, db_path: &Path) -> StatusOutcome {
+    match load_durable_rows(db_path) {
+        Ok(items) => StatusOutcome::Ok(Box::new(StatusSnapshot {
+            loaded,
+            view: StatusView::Durable { items },
+        })),
+        Err(err) => StatusOutcome::StateDbFailed(loaded, err),
+    }
+}
+
+fn load_durable_rows(db_path: &Path) -> Result<Vec<DurableWorkItemRow>, StateError> {
+    let db = StateDb::open(db_path)?;
+    let work_items = db.list_active_work_items()?;
+    let mut rows = Vec::with_capacity(work_items.len());
+    for work_item in work_items {
+        let latest_handoff = db.latest_handoff_for_work_item(work_item.id)?;
+        rows.push(DurableWorkItemRow {
+            work_item,
+            latest_handoff,
+        });
+    }
+    Ok(rows)
+}
+
+/// Tracker preview mode: build the configured tracker and ask for
+/// active issues. Used only when `--state-db` is omitted.
+async fn snapshot_from_tracker_preview(loaded: Box<LoadedWorkflow>) -> StatusOutcome {
     let tracker = match build_tracker(&loaded.config, &loaded.source_path) {
         Ok(t) => t,
         Err(err) => {
-            // `build_tracker` failures are credential / config shaped
-            // (missing env var, malformed `owner/repo`). They surface
-            // through the tracker channel because that is the layer the
-            // operator was reaching toward, even though strictly the
-            // failure happened before the network round trip.
             return StatusOutcome::TrackerFailed(
-                Box::new(loaded),
+                loaded,
                 TrackerError::Other(format!("tracker init failed: {err:#}")),
             );
         }
     };
-    snapshot_with_tracker(Box::new(loaded), tracker, state_db).await
+    snapshot_with_tracker(loaded, tracker).await
 }
 
-/// Fetch the active issues from `tracker` and assemble a [`StatusSnapshot`].
-///
-/// Split out from [`run`] so unit tests can exercise the
-/// snapshot/render path against a [`symphony_tracker::MockTracker`]
-/// without touching the file system. Production code only calls [`run`].
+/// Tracker-preview helper exposed for tests so they can inject a
+/// [`symphony_tracker::MockTracker`] without touching the file system.
 pub async fn snapshot_with_tracker(
     loaded: Box<LoadedWorkflow>,
     tracker: Arc<dyn TrackerRead>,
-    state_db: Option<&Path>,
 ) -> StatusOutcome {
-    let active = match tracker.fetch_active().await {
-        Ok(active) => active,
-        Err(err) => return StatusOutcome::TrackerFailed(loaded, err),
-    };
-
-    let latest_handoffs = match state_db {
-        Some(path) => match load_latest_handoffs(path, loaded.config.tracker.kind, &active) {
-            Ok(handoffs) => handoffs,
-            Err(err) => return StatusOutcome::StateDbFailed(loaded, active, err),
-        },
-        None => vec![None; active.len()],
-    };
-
-    StatusOutcome::Ok(Box::new(StatusSnapshot {
-        loaded,
-        active,
-        latest_handoffs,
-    }))
-}
-
-/// Open the durable state database and return the latest persisted
-/// handoff for each issue in `active`, aligned positionally.
-///
-/// Errors short-circuit the whole status call: a misconfigured
-/// `--state-db` is an operator-facing problem and we want it visible
-/// rather than hidden behind a row of empty handoff cells.
-fn load_latest_handoffs(
-    path: &Path,
-    kind: TrackerKind,
-    active: &[Issue],
-) -> Result<Vec<Option<HandoffRecord>>, StateError> {
-    let db = StateDb::open(path)?;
-    let tracker_id = tracker_id_for(kind);
-    let mut out = Vec::with_capacity(active.len());
-    for issue in active {
-        let handoff = match db.find_work_item_by_identifier(tracker_id, &issue.identifier)? {
-            Some(record) => db.latest_handoff_for_work_item(record.id)?,
-            None => None,
-        };
-        out.push(handoff);
+    match tracker.fetch_active().await {
+        Ok(active) => StatusOutcome::Ok(Box::new(StatusSnapshot {
+            loaded,
+            view: StatusView::TrackerPreview { active },
+        })),
+        Err(err) => StatusOutcome::TrackerFailed(loaded, err),
     }
-    Ok(out)
 }
 
 /// Render `outcome` to stdout (success) or stderr (failure). Returns the
 /// exit code the caller should propagate.
-///
-/// Output is intentionally human-first: a header line that names the
-/// tracker, a short config summary, and an aligned table of active
-/// issues. Machine-readable output (`--format=json`) is a future
-/// enhancement; carving the typed [`StatusOutcome`] out of the renderer
-/// keeps that swap a pure addition.
 pub fn render(outcome: &StatusOutcome) -> i32 {
     match outcome {
         StatusOutcome::Ok(snap) => render_snapshot(snap),
@@ -228,52 +231,103 @@ pub fn render(outcome: &StatusOutcome) -> i32 {
                 loaded.source_path.display()
             );
         }
-        StatusOutcome::StateDbFailed(loaded, active, err) => {
-            // Print the tracker view first so the operator still sees
-            // what `symphony run` would dispatch, then surface the
-            // handoff-lookup failure on stderr. The exit code stays
-            // non-zero (4) — the renderer is honest about partial data.
+        StatusOutcome::StateDbFailed(loaded, err) => {
             eprintln!(
-                "error: state DB read failed for {} ({} active issue{}): {err}",
+                "error: state DB read failed for {}: {err}",
                 loaded.source_path.display(),
-                active.len(),
-                if active.len() == 1 { "" } else { "s" },
             );
         }
     }
     outcome.exit_code()
 }
 
-/// Print the success-case table. Extracted so [`render`] stays a flat
-/// match on outcome variants.
 fn render_snapshot(snap: &StatusSnapshot) {
     let cfg = &snap.loaded.config;
     let label = tracker_label(cfg.tracker.kind, cfg);
+    let (mode_label, count) = match &snap.view {
+        StatusView::Durable { items } => ("durable", items.len()),
+        StatusView::TrackerPreview { active } => ("tracker preview", active.len()),
+    };
     println!(
-        "SNAPSHOT: {} — {:?} ({}) — {} active",
+        "SNAPSHOT: {} — {:?} ({}) — {} active [{}]",
         snap.loaded.source_path.display(),
         cfg.tracker.kind,
         label,
-        snap.active.len(),
+        count,
+        mode_label,
     );
     println!(
         "  config: poll_interval={}ms, max_concurrent={}, agent={:?}",
         cfg.polling.interval_ms, cfg.agent.max_concurrent_agents, cfg.agent.kind,
     );
 
-    if snap.active.is_empty() {
-        println!("  (no active issues)");
+    match &snap.view {
+        StatusView::Durable { items } => render_durable(items, cfg.tracker.kind),
+        StatusView::TrackerPreview { active } => render_tracker_preview(active),
+    }
+}
+
+fn render_durable(items: &[DurableWorkItemRow], expected_kind: TrackerKind) {
+    if items.is_empty() {
+        println!("  (no active work items in durable state)");
+        return;
+    }
+    let expected_tracker = tracker_id_for(expected_kind);
+    println!(
+        "  {:<14}  {:<12}  {:<14}  {:<14}  TITLE",
+        "ID", "STATUS_CLASS", "TRACKER_STATUS", "ROLE",
+    );
+    for row in items {
+        let wi = &row.work_item;
+        let role = wi.assigned_role.as_deref().unwrap_or("-");
+        // Visibly mark cross-tracker rows so an operator running
+        // `status` against a workflow that points at tracker `X`
+        // notices when the DB also holds rows for tracker `Y` (e.g.
+        // partial migration, multi-tracker repo). Cheap and honest.
+        let id_label = if wi.tracker_id == expected_tracker {
+            wi.identifier.clone()
+        } else {
+            format!("{}:{}", wi.tracker_id, wi.identifier)
+        };
+        println!(
+            "  {:<14}  {:<12}  {:<14}  {:<14}  {}",
+            truncate(&id_label, 14),
+            truncate(&wi.status_class, 12),
+            truncate(&wi.tracker_status, 14),
+            truncate(role, 14),
+            truncate(&wi.title, 60),
+        );
+    }
+
+    let with_handoffs: Vec<&DurableWorkItemRow> = items
+        .iter()
+        .filter(|r| r.latest_handoff.is_some())
+        .collect();
+    if !with_handoffs.is_empty() {
+        println!("  handoffs:");
+        for row in with_handoffs {
+            let h = row.latest_handoff.as_ref().unwrap();
+            println!(
+                "    {} → {} — {}",
+                row.work_item.identifier,
+                h.ready_for,
+                truncate(&h.summary, 80),
+            );
+        }
+    }
+}
+
+fn render_tracker_preview(active: &[Issue]) {
+    if active.is_empty() {
+        println!("  (no active issues — tracker preview)");
         return;
     }
 
-    // Column widths chosen for the common case: identifier ≤ 12 chars,
-    // state ≤ 14, branch ≤ 24. Long values are truncated with an ellipsis
-    // so the layout doesn't shear when one issue has a 60-char title.
     println!(
         "  {:<12}  {:<14}  {:<8}  {:<24}  TITLE",
         "ID", "STATE", "PRIORITY", "BRANCH",
     );
-    for issue in &snap.active {
+    for issue in active {
         let priority = issue
             .priority
             .map(|p| format!("P{p}"))
@@ -289,15 +343,7 @@ fn render_snapshot(snap: &StatusSnapshot) {
         );
     }
 
-    // Surface blocker edges as a follow-up section rather than another
-    // column — most issues have zero blockers and an extra column would
-    // be empty noise. We only print the section when at least one issue
-    // declares blockers.
-    let with_blockers: Vec<&Issue> = snap
-        .active
-        .iter()
-        .filter(|i| !i.blocked_by.is_empty())
-        .collect();
+    let with_blockers: Vec<&Issue> = active.iter().filter(|i| !i.blocked_by.is_empty()).collect();
     if !with_blockers.is_empty() {
         println!("  blockers:");
         for issue in with_blockers {
@@ -312,27 +358,6 @@ fn render_snapshot(snap: &StatusSnapshot) {
                 })
                 .collect();
             println!("    {} ← {}", issue.identifier, blockers.join(", "));
-        }
-    }
-
-    // Latest persisted handoff per issue (Phase 7). Only printed when at
-    // least one row is present so that a stock `symphony status` (no
-    // `--state-db`) keeps its prior tracker-only output unchanged.
-    let with_handoffs: Vec<(&Issue, &HandoffRecord)> = snap
-        .active
-        .iter()
-        .zip(snap.latest_handoffs.iter())
-        .filter_map(|(issue, h)| h.as_ref().map(|h| (issue, h)))
-        .collect();
-    if !with_handoffs.is_empty() {
-        println!("  handoffs:");
-        for (issue, h) in with_handoffs {
-            println!(
-                "    {} → {} — {}",
-                issue.identifier,
-                h.ready_for,
-                truncate(&h.summary, 80),
-            );
         }
     }
 }
@@ -362,16 +387,11 @@ fn tracker_label(kind: TrackerKind, cfg: &symphony_config::WorkflowConfig) -> St
     }
 }
 
-/// Truncate `s` to at most `max` *characters* (not bytes), appending `…`
-/// when truncation occurred. Used by the table renderer so a single
-/// pathological issue title can't shear the column layout.
 fn truncate(s: &str, max: usize) -> String {
     let count = s.chars().count();
     if count <= max {
         return s.to_string();
     }
-    // Reserve one column for the ellipsis. `max == 0` is degenerate but
-    // guard against it to avoid an underflow panic.
     let take = max.saturating_sub(1);
     let mut out: String = s.chars().take(take).collect();
     out.push('…');
@@ -402,8 +422,6 @@ mod tests {
         workflow_file("---\ntracker:\n  kind: linear\n  project_slug: ENG\n---\nbody\n")
     }
 
-    /// The renderer must distinguish "load failed" from "loaded but
-    /// invalid" so CI scripts can branch on the exit code.
     #[tokio::test]
     async fn run_returns_load_failed_for_missing_file() {
         let outcome = run(Path::new("/no/such/path/WORKFLOW.md"), None).await;
@@ -423,32 +441,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_with_tracker_collects_active_issues() {
+    async fn tracker_preview_returns_active_issues_when_no_state_db() {
         let (_dir, path) = ok_workflow();
         let loaded = LayeredLoader::from_path(&path).unwrap();
         let tracker = MockTracker::with_active(vec![
             Issue::minimal("id-1", "ABC-7", "Add fizz to buzz", "todo"),
             Issue::minimal("id-2", "ABC-9", "Wire dispatcher", "in progress"),
         ]);
-        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker), None).await;
+        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker)).await;
         match outcome {
-            StatusOutcome::Ok(snap) => {
-                assert_eq!(snap.active.len(), 2);
-                assert_eq!(snap.active[0].identifier, "ABC-7");
-                assert_eq!(snap.latest_handoffs.len(), 2);
-                assert!(snap.latest_handoffs.iter().all(Option::is_none));
-            }
+            StatusOutcome::Ok(snap) => match &snap.view {
+                StatusView::TrackerPreview { active } => {
+                    assert_eq!(active.len(), 2);
+                    assert_eq!(active[0].identifier, "ABC-7");
+                }
+                other => panic!("expected TrackerPreview, got {other:?}"),
+            },
             other => panic!("expected Ok, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn snapshot_with_tracker_propagates_tracker_errors() {
+    async fn tracker_preview_propagates_tracker_errors() {
         let (_dir, path) = ok_workflow();
         let loaded = LayeredLoader::from_path(&path).unwrap();
         let tracker = MockTracker::new();
         tracker.enqueue_active_error(TrackerError::Other("boom".into()));
-        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker), None).await;
+        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker)).await;
         match &outcome {
             StatusOutcome::TrackerFailed(_, err) => {
                 assert!(err.to_string().contains("boom"));
@@ -458,9 +477,6 @@ mod tests {
         assert_eq!(outcome.exit_code(), 3);
     }
 
-    /// `render` is mostly side-effecting (println!) but it returns the
-    /// exit code we route through `main`. Pin the success-path code so a
-    /// future refactor can't silently flip it.
     #[tokio::test]
     async fn render_returns_zero_on_ok_outcome() {
         let (_dir, path) = ok_workflow();
@@ -471,16 +487,16 @@ mod tests {
             "Add fizz to buzz",
             "todo",
         )]);
-        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker), None).await;
+        let outcome = snapshot_with_tracker(Box::new(loaded), Arc::new(tracker)).await;
         assert_eq!(render(&outcome), 0);
     }
 
-    /// When `--state-db` points at a populated database, the snapshot
-    /// must surface the latest handoff per active issue. This is the
-    /// SPEC v2 §4.7 contract that lets an operator answer "what did the
-    /// agent say last?" without re-asking the agent.
+    /// Durable mode: when `--state-db` is supplied, `status` reads
+    /// every non-terminal work item from the durable store and joins
+    /// the latest handoff per row. The tracker is *not* consulted —
+    /// SPEC v2 §4.7 says the durable store is the source of truth.
     #[tokio::test]
-    async fn snapshot_with_state_db_attaches_latest_handoff() {
+    async fn durable_mode_lists_persisted_work_items_with_latest_handoff() {
         use symphony_state::handoffs::{HandoffRepository, NewHandoff};
         use symphony_state::migrations::migrations;
         use symphony_state::repository::{NewRun, NewWorkItem, RunRepository, WorkItemRepository};
@@ -490,8 +506,7 @@ mod tests {
         {
             let mut db = StateDb::open(&db_path).unwrap();
             db.migrate(migrations()).unwrap();
-            // Two work items: one with two handoffs (latest wins), one
-            // with no handoffs (column should stay None).
+            // Active row with two handoffs (latest wins).
             let wi = db
                 .create_work_item(NewWorkItem {
                     tracker_id: "linear",
@@ -500,7 +515,7 @@ mod tests {
                     title: "Add fizz to buzz",
                     status_class: "ready",
                     tracker_status: "todo",
-                    assigned_role: None,
+                    assigned_role: Some("platform_lead"),
                     assigned_agent: None,
                     priority: None,
                     workspace_policy: None,
@@ -542,23 +557,131 @@ mod tests {
                 now: "2026-05-08T00:00:02Z",
             })
             .unwrap();
+            // Active row with no handoff.
+            db.create_work_item(NewWorkItem {
+                tracker_id: "linear",
+                identifier: "ABC-9",
+                parent_id: None,
+                title: "Untouched",
+                status_class: "intake",
+                tracker_status: "todo",
+                assigned_role: None,
+                assigned_agent: None,
+                priority: None,
+                workspace_policy: None,
+                branch_policy: None,
+                now: "2026-05-08T00:00:03Z",
+            })
+            .unwrap();
+            // Terminal row that must be filtered out.
+            db.create_work_item(NewWorkItem {
+                tracker_id: "linear",
+                identifier: "ABC-1",
+                parent_id: None,
+                title: "Already shipped",
+                status_class: "done",
+                tracker_status: "done",
+                assigned_role: None,
+                assigned_agent: None,
+                priority: None,
+                workspace_policy: None,
+                branch_policy: None,
+                now: "2026-05-08T00:00:04Z",
+            })
+            .unwrap();
         }
 
         let (_dir, path) = ok_workflow();
-        let loaded = LayeredLoader::from_path(&path).unwrap();
-        let tracker = MockTracker::with_active(vec![
-            Issue::minimal("id-1", "ABC-7", "Add fizz to buzz", "todo"),
-            Issue::minimal("id-2", "ABC-9", "Untouched", "todo"),
-        ]);
-        let outcome =
-            snapshot_with_tracker(Box::new(loaded), Arc::new(tracker), Some(&db_path)).await;
+        let outcome = run(&path, Some(&db_path)).await;
         match outcome {
-            StatusOutcome::Ok(snap) => {
-                let latest = snap.latest_handoffs[0].as_ref().expect("ABC-7 handoff");
-                assert_eq!(latest.ready_for, "qa");
-                assert_eq!(latest.summary, "ready for QA gate");
-                assert!(snap.latest_handoffs[1].is_none(), "ABC-9 has no handoff");
+            StatusOutcome::Ok(snap) => match snap.view {
+                StatusView::Durable { items } => {
+                    let identifiers: Vec<&str> = items
+                        .iter()
+                        .map(|r| r.work_item.identifier.as_str())
+                        .collect();
+                    // Terminal `done` row excluded; ordering is
+                    // updated_at DESC so ABC-9 (later insert) precedes
+                    // ABC-7.
+                    assert_eq!(identifiers, vec!["ABC-9", "ABC-7"]);
+                    let abc7 = items
+                        .iter()
+                        .find(|r| r.work_item.identifier == "ABC-7")
+                        .unwrap();
+                    let h = abc7.latest_handoff.as_ref().expect("ABC-7 handoff");
+                    assert_eq!(h.ready_for, "qa");
+                    assert_eq!(h.summary, "ready for QA gate");
+                    let abc9 = items
+                        .iter()
+                        .find(|r| r.work_item.identifier == "ABC-9")
+                        .unwrap();
+                    assert!(abc9.latest_handoff.is_none());
+                }
+                other => panic!("expected Durable, got {other:?}"),
+            },
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// Durable mode does not consult the tracker — even an obviously
+    /// broken tracker config (e.g. a Linear workflow without a token)
+    /// must still produce a snapshot, because the durable store is the
+    /// source of truth and a tracker outage cannot mask state.
+    #[tokio::test]
+    async fn durable_mode_does_not_consult_tracker() {
+        use symphony_state::migrations::migrations;
+        use symphony_state::repository::{NewWorkItem, WorkItemRepository};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        {
+            let mut db = StateDb::open(&db_path).unwrap();
+            db.migrate(migrations()).unwrap();
+            db.create_work_item(NewWorkItem {
+                tracker_id: "linear",
+                identifier: "ABC-7",
+                parent_id: None,
+                title: "From DB",
+                status_class: "ready",
+                tracker_status: "todo",
+                assigned_role: None,
+                assigned_agent: None,
+                priority: None,
+                workspace_policy: None,
+                branch_policy: None,
+                now: "2026-05-08T00:00:00Z",
+            })
+            .unwrap();
+        }
+
+        // The workflow file is the same valid Linear config used
+        // elsewhere; `build_tracker` would normally try to connect, but
+        // durable mode bypasses it entirely. We pin that by checking
+        // the snapshot succeeds without a `LINEAR_API_TOKEN` in env.
+        // SAFETY: tests share the process env; we read-then-restore
+        // around the assertion to avoid bleeding into other tests.
+        let prev = std::env::var("LINEAR_API_TOKEN").ok();
+        // SAFETY: single-threaded tokio current_thread test; no other
+        // test reads LINEAR_API_TOKEN concurrently within this binary.
+        unsafe {
+            std::env::remove_var("LINEAR_API_TOKEN");
+        }
+        let (_dir, path) = ok_workflow();
+        let outcome = run(&path, Some(&db_path)).await;
+        if let Some(v) = prev {
+            // SAFETY: see above; restore the prior value.
+            unsafe {
+                std::env::set_var("LINEAR_API_TOKEN", v);
             }
+        }
+        match outcome {
+            StatusOutcome::Ok(snap) => match snap.view {
+                StatusView::Durable { items } => {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0].work_item.identifier, "ABC-7");
+                }
+                other => panic!("expected Durable, got {other:?}"),
+            },
             other => panic!("expected Ok, got {other:?}"),
         }
     }
@@ -568,27 +691,12 @@ mod tests {
     /// outcome (and exit code 4) so an operator never confuses an
     /// empty handoff column with a misconfigured flag.
     #[tokio::test]
-    async fn snapshot_returns_state_db_failed_when_db_unreadable() {
-        // Pointing at a path under a directory that does not exist
-        // forces `Connection::open` to fail at the OS layer, exercising
-        // the StateError propagation without depending on rusqlite's
-        // file-format detection on a corrupt file.
+    async fn durable_mode_returns_state_db_failed_when_db_unreadable() {
         let unreachable = std::path::PathBuf::from("/no/such/dir/state.db");
-
         let (_wf_dir, path) = ok_workflow();
-        let loaded = LayeredLoader::from_path(&path).unwrap();
-        let tracker =
-            MockTracker::with_active(vec![Issue::minimal("id-1", "ABC-7", "title", "todo")]);
-        let outcome =
-            snapshot_with_tracker(Box::new(loaded), Arc::new(tracker), Some(&unreachable)).await;
+        let outcome = run(&path, Some(&unreachable)).await;
         match &outcome {
-            StatusOutcome::StateDbFailed(_, active, _) => {
-                assert_eq!(
-                    active.len(),
-                    1,
-                    "tracker payload preserved on state failure"
-                );
-            }
+            StatusOutcome::StateDbFailed(_, _) => {}
             other => panic!("expected StateDbFailed, got {other:?}"),
         }
         assert_eq!(outcome.exit_code(), 4);
@@ -596,9 +704,6 @@ mod tests {
 
     #[test]
     fn tracker_id_for_matches_orchestrator_inserts() {
-        // Pin the mapping so a future rename of the column convention
-        // is forced through this test rather than silently desyncing
-        // `status` lookups from the orchestrator's writes.
         assert_eq!(tracker_id_for(TrackerKind::Linear), "linear");
         assert_eq!(tracker_id_for(TrackerKind::Github), "github");
         assert_eq!(tracker_id_for(TrackerKind::Mock), "mock");
@@ -611,7 +716,6 @@ mod tests {
 
     #[test]
     fn truncate_appends_ellipsis_when_too_long() {
-        // 8-char input truncated to 5 → 4 chars + ellipsis.
         let out = truncate("abcdefgh", 5);
         assert_eq!(out.chars().count(), 5);
         assert!(out.ends_with('…'));
@@ -619,10 +723,7 @@ mod tests {
 
     #[test]
     fn truncate_handles_max_zero_without_panicking() {
-        // Degenerate case — exercising the saturating_sub guard.
         let out = truncate("abcdefgh", 0);
-        // We don't pin the exact output (it's just an ellipsis); only
-        // assert no panic and bounded length.
         assert!(out.chars().count() <= 1);
     }
 }

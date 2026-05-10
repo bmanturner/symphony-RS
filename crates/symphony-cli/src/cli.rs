@@ -181,10 +181,15 @@ pub struct StatusArgs {
     pub path: PathBuf,
 
     /// Optional path to the durable state SQLite database. When
-    /// provided, `status` augments the active-issue table with the
-    /// latest persisted handoff envelope per work item (SPEC v2 §4.7).
-    /// Omitted by default so a stock `symphony status` keeps its
-    /// tracker-only snapshot semantics.
+    /// provided, `status` reads the orchestrator's source-of-truth view
+    /// directly from the durable store (SPEC v2 §4.7 / ARCH v2 §4):
+    /// every non-terminal work item plus the latest persisted handoff
+    /// per row. The tracker is *not* called in this mode.
+    ///
+    /// When omitted, `status` falls back to a tracker-preview snapshot
+    /// — useful before any orchestrator has run, but unable to surface
+    /// role assignments, run state, or handoffs because none of that
+    /// has been persisted yet.
     #[arg(long = "state-db", value_name = "PATH")]
     pub state_db: Option<PathBuf>,
 }

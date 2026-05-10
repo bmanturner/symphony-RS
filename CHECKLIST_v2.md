@@ -137,7 +137,7 @@ One unchecked item per implementation iteration. Each item should land with test
 
 - [x] Add the specific `OrchestratorEvent` variants required to make Phase 13's deterministic scenarios pass. Drive the variant set from test consumers, not from an enumeration of categories.
 - [x] Persist every event before broadcasting.
-- [ ] Update `symphony status` to read durable state, not only tracker snapshot.
+- [x] Update `symphony status` to read durable state, not only tracker snapshot.
 - [ ] Add `symphony issue graph <id>` for parent/child/blocker graph.
 - [ ] Add `symphony qa verdict <id>` for QA evidence.
 - [ ] Add `symphony recover` CLI command that reconciles durable state with tracker/workspaces (per ARCHITECTURE_v2.md §4.7), surfacing reaped expired leases and orphaned workspace claims.
