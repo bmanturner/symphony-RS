@@ -101,7 +101,7 @@ not auto-promote them — a human moves them to `Todo` to start agent work.
 
 - [x] Add `followups.initial_tracker_state: Option<String>` to the workflow config (`crates/symphony-config/src/config.rs`). Validate at load time that the value is **not** present in `tracker.active_states` (else it defeats the dormant-by-default guarantee). Document the knob alongside the existing `followups.*` fields.
 - [x] Add `crates/symphony-core/src/followup_applier.rs` mirroring `decomposition_applier.rs`: pick up `FollowupStatus::Approved` rows, call `TrackerMutations::create_issue` with `initial_state: Some(<configured state>)`, then call `FollowupIssueRequest::mark_created` with the returned `WorkItemId` inside a `transaction.rs` envelope so the tracker id and the `Created` transition land atomically.
-- [ ] Wire the applier into the runner schedule so an Approved follow-up advances to `Created` on the next tick (parity with how `decomposition_applier` is driven).
+- [x] Wire the applier into the runner schedule so an Approved follow-up advances to `Created` on the next tick (parity with how `decomposition_applier` is driven).
 - [ ] Ensure the `FileFollowupHandler` direct-creation path (workflow with `CreateDirectly` policy) routes through the same applier rather than skipping it — single seam for tracker writes.
 - [ ] Add a regression test proving a newly-filed follow-up's tracker state is outside `tracker.active_states` and that the next intake tick does **not** ingest it. Then mutate the issue state to an active state and assert the following intake tick picks it up.
 - [x] Add a test proving config load fails when `followups.initial_tracker_state` overlaps `tracker.active_states`.

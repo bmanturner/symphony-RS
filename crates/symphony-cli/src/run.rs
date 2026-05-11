@@ -74,6 +74,7 @@
 
 use std::env;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -94,8 +95,8 @@ use symphony_core::prompt::{
     PromptContext, RenderError, default_handoff_output_schema, render as render_core_prompt,
 };
 use symphony_core::state_machine::ReleaseReason;
-use symphony_core::tracker::Issue;
-use symphony_core::tracker_trait::TrackerRead;
+use symphony_core::tracker::{Issue, IssueState};
+use symphony_core::tracker_trait::{TrackerCapabilities, TrackerMutations, TrackerRead};
 use symphony_core::{
     BudgetPauseRunner, FollowupApprovalRunner, IntegrationDispatchRunner, QaDispatchRunner,
     SpecialistRunner,
@@ -147,7 +148,7 @@ pub async fn run(args: &RunArgs) -> Result<()> {
         );
     }
 
-    let tracker = build_tracker(&loaded.config, &loaded.source_path)
+    let tracker = build_tracker_handles(&loaded.config, &loaded.source_path)
         .with_context(|| "building issue tracker adapter")?;
     let workspace =
         build_workspace(&loaded.config).with_context(|| "building workspace manager")?;
@@ -166,7 +167,7 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // surfaces zero candidates so the corresponding tick is a no-op.
     let bundle = crate::scheduler::build_scheduler_v2(
         &loaded.config,
-        tracker,
+        tracker.read.clone(),
         dispatcher,
         crate::scheduler::empty_integration_source(),
         crate::scheduler::noop_integration_dispatcher(),
@@ -201,19 +202,26 @@ pub async fn run(args: &RunArgs) -> Result<()> {
     // from the `events` table (SPEC v2 §5.14). Without it the SSE
     // surface streams the in-process broadcast channel — which is fine
     // for tests and CI smoke runs where no events are persisted.
-    let durable_tail: Option<std::sync::Arc<dyn crate::sse::DurableTailSource>> =
+    let shared_state_db: Option<Arc<StdMutex<symphony_state::StateDb>>> =
         if let Some(state_db) = args.state_db.as_ref() {
             let mut db = symphony_state::StateDb::open(state_db)
                 .with_context(|| format!("opening state-db at {}", state_db.display()))?;
             db.migrate(symphony_state::migrations::migrations())
                 .with_context(|| "running state-db migrations")?;
-            let shared = std::sync::Arc::new(std::sync::Mutex::new(db));
-            Some(std::sync::Arc::new(crate::sse::StateDbTailSource::new(
-                shared,
-            )))
+            Some(Arc::new(StdMutex::new(db)))
         } else {
             None
         };
+    let durable_tail: Option<std::sync::Arc<dyn crate::sse::DurableTailSource>> =
+        shared_state_db.as_ref().map(|db| {
+            std::sync::Arc::new(crate::sse::StateDbTailSource::new(db.clone()))
+                as std::sync::Arc<dyn crate::sse::DurableTailSource>
+        });
+    let approved_followup_filer = tracker.mutations.clone().and_then(|mutations| {
+        shared_state_db
+            .clone()
+            .map(|db| ApprovedFollowupFiler::new(&loaded.config, db, mutations))
+    });
 
     let status_task = if loaded.config.observability.sse.enabled {
         let bind = loaded.config.observability.sse.bind.clone();
@@ -259,6 +267,7 @@ pub async fn run(args: &RunArgs) -> Result<()> {
                 qa_runner,
                 followup_runner,
                 budget_runner,
+                approved_followup_filer,
                 runner_interval,
                 DRAIN_DEADLINE,
             )
@@ -326,6 +335,7 @@ async fn run_runner_loop(
     qa: Arc<QaDispatchRunner>,
     followup: Arc<FollowupApprovalRunner>,
     budget: Arc<BudgetPauseRunner>,
+    approved_followup_filer: Option<ApprovedFollowupFiler>,
     interval: Duration,
     drain_deadline: Duration,
 ) {
@@ -348,6 +358,11 @@ async fn run_runner_loop(
         let _ = qa.run_pending(cancel.clone()).await;
         let _ = followup.run_pending(cancel.clone()).await;
         let _ = budget.run_pending(cancel.clone()).await;
+        if let Some(filer) = approved_followup_filer.as_ref()
+            && let Err(err) = filer.run_once().await
+        {
+            warn!(error = %err, "approved follow-up filing pass failed");
+        }
         // Reap pass: non-blocking — `try_join_next` under the hood, so
         // long-running tasks stay in flight without holding the driver.
         let _ = specialist.reap_completed().await;
@@ -393,6 +408,90 @@ async fn run_runner_loop(
     }
 }
 
+#[derive(Clone)]
+struct TrackerHandles {
+    read: Arc<dyn TrackerRead>,
+    mutations: Option<Arc<dyn TrackerMutations>>,
+}
+
+#[derive(Clone)]
+struct ApprovedFollowupFiler {
+    db: Arc<StdMutex<symphony_state::StateDb>>,
+    tracker: Arc<dyn TrackerMutations>,
+    capabilities: TrackerCapabilities,
+    tracker_kind: &'static str,
+    initial_tracker_state: Option<IssueState>,
+}
+
+impl ApprovedFollowupFiler {
+    fn new(
+        cfg: &WorkflowConfig,
+        db: Arc<StdMutex<symphony_state::StateDb>>,
+        tracker: Arc<dyn TrackerMutations>,
+    ) -> Self {
+        Self {
+            db,
+            tracker,
+            capabilities: tracker_capabilities_for(cfg.tracker.kind),
+            tracker_kind: tracker_kind_str(cfg.tracker.kind),
+            initial_tracker_state: cfg
+                .followups
+                .initial_tracker_state
+                .as_ref()
+                .map(|state| IssueState::new(state.clone())),
+        }
+    }
+
+    async fn run_once(&self) -> Result<usize> {
+        use symphony_state::followups::FollowupRepository;
+
+        let pending = {
+            let db = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("state-db mutex poisoned during follow-up scan"))?;
+            db.list_followups_by_status("approved")
+                .with_context(|| "listing approved follow-ups")?
+        };
+
+        let mut filed = 0usize;
+        for row in pending {
+            let followup = row
+                .to_domain()
+                .with_context(|| format!("rebuilding followup {} from state", row.id))?;
+            let applied = symphony_core::followup_applier::apply_followup(
+                &followup,
+                self.tracker.as_ref(),
+                self.capabilities,
+                self.initial_tracker_state.clone(),
+                Vec::new(),
+            )
+            .await
+            .with_context(|| format!("filing approved followup {}", followup.id))?;
+            let tracker_status = self
+                .initial_tracker_state
+                .as_ref()
+                .map(|state| state.as_str())
+                .unwrap_or("open");
+            let mut db = self
+                .db
+                .lock()
+                .map_err(|_| anyhow!("state-db mutex poisoned during follow-up persist"))?;
+            symphony_state::followup_apply::persist_applied_followup(
+                &mut db,
+                &followup,
+                &applied,
+                self.tracker_kind,
+                tracker_status,
+                &row.updated_at,
+            )
+            .with_context(|| format!("persisting applied followup {}", followup.id))?;
+            filed += 1;
+        }
+        Ok(filed)
+    }
+}
+
 /// Spawn a task that fires `cancel` on the first SIGINT.
 ///
 /// Idempotent: a second SIGINT is observed only because this function
@@ -435,6 +534,13 @@ pub(crate) fn build_tracker(
     cfg: &WorkflowConfig,
     workflow_path: &std::path::Path,
 ) -> Result<Arc<dyn TrackerRead>> {
+    Ok(build_tracker_handles(cfg, workflow_path)?.read)
+}
+
+fn build_tracker_handles(
+    cfg: &WorkflowConfig,
+    workflow_path: &std::path::Path,
+) -> Result<TrackerHandles> {
     match cfg.tracker.kind {
         TrackerKind::Linear => {
             let project_slug = cfg
@@ -457,7 +563,11 @@ pub(crate) fn build_tracker(
                     .parse()
                     .with_context(|| format!("parsing tracker.endpoint = {endpoint:?}"))?;
             }
-            Ok(Arc::new(LinearTracker::new(linear_cfg)?))
+            let tracker = Arc::new(LinearTracker::new(linear_cfg)?);
+            Ok(TrackerHandles {
+                read: tracker.clone(),
+                mutations: Some(tracker),
+            })
         }
         TrackerKind::Github => {
             let repository = cfg
@@ -480,7 +590,11 @@ pub(crate) fn build_tracker(
                     .parse()
                     .with_context(|| format!("parsing tracker.endpoint = {endpoint:?}"))?;
             }
-            Ok(Arc::new(GitHubTracker::new(gh_cfg)?))
+            let tracker = Arc::new(GitHubTracker::new(gh_cfg)?);
+            Ok(TrackerHandles {
+                read: tracker.clone(),
+                mutations: Some(tracker),
+            })
         }
         TrackerKind::Mock => {
             let rel = cfg
@@ -508,8 +622,26 @@ pub(crate) fn build_tracker(
                 terminal = fixtures.terminal_count(),
                 "loaded mock tracker fixtures",
             );
-            Ok(Arc::new(tracker))
+            Ok(TrackerHandles {
+                read: Arc::new(tracker),
+                mutations: None,
+            })
         }
+    }
+}
+
+fn tracker_kind_str(kind: TrackerKind) -> &'static str {
+    match kind {
+        TrackerKind::Linear => "linear",
+        TrackerKind::Github => "github",
+        TrackerKind::Mock => "mock",
+    }
+}
+
+fn tracker_capabilities_for(kind: TrackerKind) -> TrackerCapabilities {
+    match kind {
+        TrackerKind::Linear | TrackerKind::Github => TrackerCapabilities::FULL,
+        TrackerKind::Mock => TrackerCapabilities::READ_ONLY,
     }
 }
 
@@ -1013,6 +1145,9 @@ pub(crate) fn render_prompt(
 mod tests {
     use super::*;
     use symphony_config::{AgentConfig, AgentKind, RoleKind, TrackerConfig, TrackerKind};
+    use symphony_state::followups::{FollowupRepository, NewFollowup};
+    use symphony_state::migrations::migrations;
+    use symphony_state::repository::{NewRun, NewWorkItem, RunRepository, WorkItemRepository};
 
     fn issue() -> Issue {
         let mut i = Issue::minimal("id-1", "ABC-7", "Add fizz to buzz", "Todo");
@@ -1530,6 +1665,7 @@ agents:
                     qa,
                     followup,
                     budget,
+                    None,
                     // Long tick interval; we exit via cancel before the
                     // first sleep elapses.
                     Duration::from_secs(60),
@@ -1554,6 +1690,149 @@ agents:
             "run_runner_loop must return promptly when cancelled with no inflight work",
         );
         joined.unwrap().expect("runner driver task panicked");
+    }
+
+    #[tokio::test]
+    async fn approved_followup_filer_moves_approved_rows_to_created() {
+        use symphony_core::tracker::IssueId;
+        use symphony_core::tracker_trait::{
+            AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse,
+            AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+            LinkParentChildRequest, LinkParentChildResponse, UpdateIssueRequest,
+            UpdateIssueResponse,
+        };
+
+        struct RecordingTracker;
+
+        #[async_trait::async_trait]
+        impl TrackerMutations for RecordingTracker {
+            async fn create_issue(
+                &self,
+                _request: CreateIssueRequest,
+            ) -> Result<CreateIssueResponse, symphony_core::tracker_trait::TrackerError>
+            {
+                Ok(CreateIssueResponse {
+                    id: IssueId::new("ENG-123"),
+                    identifier: "ENG-123".into(),
+                    url: Some("https://example.test/ENG-123".into()),
+                })
+            }
+
+            async fn update_issue(
+                &self,
+                _request: UpdateIssueRequest,
+            ) -> Result<UpdateIssueResponse, symphony_core::tracker_trait::TrackerError>
+            {
+                unreachable!()
+            }
+
+            async fn add_comment(
+                &self,
+                _request: AddCommentRequest,
+            ) -> Result<AddCommentResponse, symphony_core::tracker_trait::TrackerError>
+            {
+                unreachable!()
+            }
+
+            async fn add_blocker(
+                &self,
+                _request: AddBlockerRequest,
+            ) -> Result<AddBlockerResponse, symphony_core::tracker_trait::TrackerError>
+            {
+                unreachable!()
+            }
+
+            async fn link_parent_child(
+                &self,
+                _request: LinkParentChildRequest,
+            ) -> Result<LinkParentChildResponse, symphony_core::tracker_trait::TrackerError>
+            {
+                unreachable!()
+            }
+
+            async fn attach_artifact(
+                &self,
+                _request: AttachArtifactRequest,
+            ) -> Result<AttachArtifactResponse, symphony_core::tracker_trait::TrackerError>
+            {
+                unreachable!()
+            }
+        }
+
+        let mut db = symphony_state::StateDb::open_in_memory().unwrap();
+        db.migrate(migrations()).unwrap();
+        let source = db
+            .create_work_item(NewWorkItem {
+                tracker_id: "github",
+                identifier: "OWNER/REPO#1",
+                parent_id: None,
+                title: "source",
+                status_class: "running",
+                tracker_status: "open",
+                assigned_role: None,
+                assigned_agent: None,
+                priority: None,
+                workspace_policy: None,
+                branch_policy: None,
+                now: "2026-05-10T00:00:00Z",
+            })
+            .unwrap()
+            .id;
+        let run = db
+            .create_run(NewRun {
+                work_item_id: source,
+                role: "backend",
+                agent: "codex",
+                status: "running",
+                workspace_claim_id: None,
+                now: "2026-05-10T00:00:00Z",
+            })
+            .unwrap()
+            .id;
+        let row = db
+            .create_followup(NewFollowup {
+                source_work_item_id: source,
+                title: "Add retry coverage",
+                reason: "need a regression test",
+                scope: "tests only",
+                acceptance_criteria: "[\"retry path covered\"]",
+                blocking: true,
+                policy: "create_directly",
+                origin_kind: "run",
+                origin_run_id: Some(run),
+                origin_role: Some("backend"),
+                origin_agent_profile: None,
+                origin_human_actor: None,
+                status: "approved",
+                created_issue_id: None,
+                approval_role: None,
+                approval_note: None,
+                now: "2026-05-10T00:00:00Z",
+            })
+            .unwrap();
+
+        let shared = Arc::new(StdMutex::new(db));
+        let cfg = WorkflowConfig {
+            tracker: TrackerConfig {
+                kind: TrackerKind::Github,
+                ..TrackerConfig::default()
+            },
+            followups: symphony_config::FollowupConfig {
+                enabled: true,
+                initial_tracker_state: Some("Backlog".into()),
+                ..symphony_config::FollowupConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let filer = ApprovedFollowupFiler::new(&cfg, shared.clone(), Arc::new(RecordingTracker));
+
+        let filed = filer.run_once().await.unwrap();
+        assert_eq!(filed, 1);
+
+        let db = shared.lock().unwrap();
+        let stored = db.get_followup(row.id).unwrap().unwrap();
+        assert_eq!(stored.status, "created");
+        assert!(stored.created_issue_id.is_some());
     }
 
     #[tokio::test]
