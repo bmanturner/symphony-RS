@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use symphony_core::tracker::IssueId;
+use symphony_core::tracker::{IssueId, IssueState};
 use symphony_core::tracker_trait::{
     AddBlockerRequest, AddBlockerResponse, TrackerError, TrackerMutations, TrackerRead,
+    UpdateIssueRequest,
 };
 use symphony_core::{
     AcceptanceCriterionTrace, BlockerId, HandoffBlockerRequest, QaEvidence, QaVerdict, RoleKind,
@@ -73,6 +74,8 @@ pub struct StateQaVerdictSink {
     work_item_id: WorkItemId,
     role: RoleName,
     tracker: Arc<dyn QaVerdictTracker>,
+    tracker_active_states: Vec<IssueState>,
+    tracker_terminal_states: Vec<IssueState>,
     now: String,
 }
 
@@ -88,6 +91,8 @@ impl StateQaVerdictSink {
         work_item_id: WorkItemId,
         role: RoleName,
         tracker: Arc<dyn QaVerdictTracker>,
+        tracker_active_states: Vec<IssueState>,
+        tracker_terminal_states: Vec<IssueState>,
         now: impl Into<String>,
     ) -> Self {
         Self {
@@ -96,6 +101,8 @@ impl StateQaVerdictSink {
             work_item_id,
             role,
             tracker,
+            tracker_active_states,
+            tracker_terminal_states,
             now: now.into(),
         }
     }
@@ -117,6 +124,7 @@ impl QaVerdictSink for StateQaVerdictSink {
         let evidence = encode_json(&payload.evidence, "evidence")?;
         let acceptance_trace = encode_json_array(&payload.acceptance_trace, "acceptance_trace")?;
         let status_class = status_for_verdict(payload.verdict);
+        let tracker_status_update = self.resolve_tracker_status_update(status_class).await?;
         let tracker_blockers = self.resolve_tracker_blockers(&payload).await?;
 
         let mut db = self.db.lock().expect("qa verdict sink lock");
@@ -158,7 +166,7 @@ impl QaVerdictSink for StateQaVerdictSink {
                 tx.update_work_item_status(
                     self.work_item_id,
                     status_class.as_str(),
-                    status_class.as_str(),
+                    tracker_status_update.target_state.as_str(),
                     &self.now,
                 )?;
                 tx.append_event(NewEvent {
@@ -193,7 +201,47 @@ struct TrackerSyncedQaBlocker {
     tracker_edge_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TrackerStatusUpdate {
+    target_state: IssueState,
+}
+
 impl StateQaVerdictSink {
+    async fn resolve_tracker_status_update(
+        &self,
+        status_class: WorkItemStatusClass,
+    ) -> Result<TrackerStatusUpdate, ToolError> {
+        let (identifier, current_tracker_status) = {
+            let db = self.db.lock().expect("qa verdict sink lock");
+            let work_item = db
+                .get_work_item(self.work_item_id)
+                .map_err(|err| ToolError::Internal(err.to_string()))?
+                .ok_or_else(|| ToolError::Internal("qa work item not found".into()))?;
+            (work_item.identifier, work_item.tracker_status)
+        };
+        let issue = self
+            .tracker
+            .get_issue(&identifier)
+            .await
+            .map_err(map_tracker_error)?;
+        let target_state =
+            self.map_status_class_to_tracker_state(status_class, &current_tracker_status)?;
+        self.tracker
+            .update_issue(UpdateIssueRequest {
+                id: issue.id,
+                state: Some(target_state.clone()),
+                title: None,
+                body: None,
+                add_labels: Vec::new(),
+                remove_labels: Vec::new(),
+                add_assignees: Vec::new(),
+                remove_assignees: Vec::new(),
+            })
+            .await
+            .map_err(map_tracker_error)?;
+        Ok(TrackerStatusUpdate { target_state })
+    }
+
     async fn resolve_tracker_blockers(
         &self,
         payload: &RecordQaVerdictPayload,
@@ -252,6 +300,38 @@ impl StateQaVerdictSink {
             });
         }
         Ok(synced)
+    }
+
+    fn map_status_class_to_tracker_state(
+        &self,
+        status_class: WorkItemStatusClass,
+        current_tracker_status: &str,
+    ) -> Result<IssueState, ToolError> {
+        match status_class {
+            WorkItemStatusClass::Done => self
+                .tracker_terminal_states
+                .first()
+                .cloned()
+                .ok_or_else(|| ToolError::Internal("tracker.terminal_states is empty".into())),
+            WorkItemStatusClass::Rework => self
+                .tracker_active_states
+                .first()
+                .cloned()
+                .ok_or_else(|| ToolError::Internal("tracker.active_states is empty".into())),
+            WorkItemStatusClass::Qa => {
+                let raw = current_tracker_status.trim();
+                if raw.is_empty() {
+                    return Err(ToolError::Internal(
+                        "qa tracker status mapping requires a current tracker_status".into(),
+                    ));
+                }
+                Ok(IssueState::new(raw))
+            }
+            other => Err(ToolError::Internal(format!(
+                "qa verdict status reflection does not support status class {}",
+                other.as_str()
+            ))),
+        }
     }
 }
 
@@ -451,14 +531,28 @@ mod tests {
         reason: Option<String>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedUpdateIssueCall {
+        id: String,
+        state: Option<String>,
+    }
+
     #[derive(Default)]
     struct RecordingTracker {
         blocker_calls: StdMutex<Vec<RecordedBlockerCall>>,
+        update_issue_calls: StdMutex<Vec<RecordedUpdateIssueCall>>,
     }
 
     impl RecordingTracker {
         fn blocker_calls(&self) -> Vec<RecordedBlockerCall> {
             self.blocker_calls.lock().expect("tracker calls").clone()
+        }
+
+        fn update_issue_calls(&self) -> Vec<RecordedUpdateIssueCall> {
+            self.update_issue_calls
+                .lock()
+                .expect("tracker calls")
+                .clone()
         }
     }
 
@@ -518,9 +612,19 @@ mod tests {
 
         async fn update_issue(
             &self,
-            _request: UpdateIssueRequest,
+            request: UpdateIssueRequest,
         ) -> Result<UpdateIssueResponse, TrackerError> {
-            unreachable!("qa verdict sink does not update issues in this phase slice")
+            self.update_issue_calls
+                .lock()
+                .expect("tracker calls")
+                .push(RecordedUpdateIssueCall {
+                    id: request.id.to_string(),
+                    state: request.state.as_ref().map(ToString::to_string),
+                });
+            Ok(UpdateIssueResponse {
+                id: request.id,
+                state: request.state,
+            })
         }
 
         async fn add_comment(
@@ -625,6 +729,8 @@ mod tests {
             work_item_id,
             RoleName::new("qa"),
             tracker.clone(),
+            vec![IssueState::new("Todo"), IssueState::new("In Progress")],
+            vec![IssueState::new("Done"), IssueState::new("Cancelled")],
             NOW,
         ));
         (
@@ -651,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_qa_verdict_persists_pass() {
-        let (handler, sink, _tracker, work_item_id, _blocker_id) = handler();
+        let (handler, sink, tracker, work_item_id, _blocker_id) = handler();
         let result = handler
             .call(json!({
                 "verdict": "passed",
@@ -663,6 +769,14 @@ mod tests {
 
         assert_eq!(result.content["verdict"], "passed");
         assert_eq!(result.content["status_class"], "done");
+        assert!(tracker.blocker_calls().is_empty());
+        assert_eq!(
+            tracker.update_issue_calls(),
+            vec![RecordedUpdateIssueCall {
+                id: "OWNER/REPO#1".into(),
+                state: Some("Done".into()),
+            }]
+        );
         sink.with_db(|db| {
             let rows = db.list_qa_verdicts_for_work_item(work_item_id).unwrap();
             assert_eq!(rows.len(), 1);
@@ -708,6 +822,13 @@ mod tests {
                 reason: Some("regression".into()),
             }]
         );
+        assert_eq!(
+            tracker.update_issue_calls(),
+            vec![RecordedUpdateIssueCall {
+                id: "OWNER/REPO#1".into(),
+                state: Some("Todo".into()),
+            }]
+        );
         sink.with_db(|db| {
             let rows = db.list_qa_verdicts_for_work_item(work_item_id).unwrap();
             assert_eq!(rows[0].verdict, "failed_with_blockers");
@@ -732,7 +853,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_qa_verdict_keeps_inconclusive_in_qa() {
-        let (handler, _sink, _tracker, _work_item_id, _blocker_id) = handler();
+        let (handler, _sink, tracker, _work_item_id, _blocker_id) = handler();
         let result = handler
             .call(json!({
                 "verdict": "inconclusive",
@@ -742,11 +863,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.content["status_class"], "qa");
+        assert_eq!(
+            tracker.update_issue_calls(),
+            vec![RecordedUpdateIssueCall {
+                id: "OWNER/REPO#1".into(),
+                state: Some("qa".into()),
+            }]
+        );
     }
 
     #[tokio::test]
     async fn record_qa_verdict_accepts_configured_waiver_role() {
-        let (handler, _sink, _tracker, _work_item_id, _blocker_id) = handler();
+        let (handler, _sink, tracker, _work_item_id, _blocker_id) = handler();
         let result = handler
             .call(json!({
                 "verdict": "waived",
@@ -757,6 +885,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.content["status_class"], "done");
+        assert_eq!(
+            tracker.update_issue_calls(),
+            vec![RecordedUpdateIssueCall {
+                id: "OWNER/REPO#1".into(),
+                state: Some("Done".into()),
+            }]
+        );
     }
 
     #[tokio::test]

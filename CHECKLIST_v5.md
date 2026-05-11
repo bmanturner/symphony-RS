@@ -126,13 +126,13 @@ operator's tracker board therefore diverge whenever QA fails or marks a
 verdict inconclusive.
 
 - [x] Reflect QA-filed blockers to the tracker via `TrackerMutations::add_blocker` inside the `StateQaVerdictSink::submit` transaction envelope. The internal edge id and the tracker-side blocker edge id MUST be persisted together so retries are idempotent.
-- [ ] Reflect the work-item status transition (`update_work_item_status` → corresponding tracker state) via `TrackerMutations::update_issue`, mapping the kernel status class to the workflow's configured tracker state name (already plumbed through `tracker.active_states` / `tracker.terminal_states` config).
+- [x] Reflect the work-item status transition (`update_work_item_status` → corresponding tracker state) via `TrackerMutations::update_issue`, mapping the kernel status class to the workflow's configured tracker state name (already plumbed through `tracker.active_states` / `tracker.terminal_states` config).
 - [ ] Capability-gate both writes against `TrackerCapabilities::add_blocker` and the adapter's update support. When the adapter advertises `add_blocker: false` (label-only proxy), fall back to whatever proxy the adapter exposes per SPEC and surface the degradation in the event payload — do **not** silently drop the reflection.
 - [ ] Defer the tracker write through the operation queue once that infrastructure lands (the queue referenced by Phase 8 does not yet exist in production code) so a transient tracker outage during QA verdict submission does **not** roll back the internal verdict + blocker rows. Until the queue exists, document the synchronous behavior and the failure mode explicitly in the handler doc comment.
 - [ ] Extend `events.rs` `qa.verdict_recorded` payload to include the tracker-side blocker edge ids alongside the internal `BlockerId` list, so `symphony status` and downstream observers can render both.
-- [ ] Add a test proving QA `fail` with one blocker produces both a `work_item_edges` row **and** a tracker `add_blocker` call (assert against a recording tracker mock).
-- [ ] Add a test proving QA `inconclusive` follows the same reflection path.
-- [ ] Add a test proving QA `pass` does **not** call `add_blocker` or `update_issue` with a blocker payload.
+- [x] Add a test proving QA `fail` with one blocker produces both a `work_item_edges` row **and** a tracker `add_blocker` call (assert against a recording tracker mock).
+- [x] Add a test proving QA `inconclusive` follows the same reflection path.
+- [x] Add a test proving QA `pass` does **not** call `add_blocker` or `update_issue` with a blocker payload.
 - [ ] Add a test proving capability-degraded adapters (`add_blocker: false`) record the degradation in the event payload rather than failing the verdict submission.
 - [ ] Add a test proving a tracker outage during reflection does not corrupt the internal verdict state (verdict + blocker rows remain consistent; outage surfaces via the queue once Phase 7.7 lands, or via a clear error pre-queue).
 - [ ] Update `docs/` (the QA verdict surface page) to describe which side-effects land internally vs on the tracker and the operator-visible reflection contract.
