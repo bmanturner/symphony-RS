@@ -105,7 +105,7 @@ not auto-promote them — a human moves them to `Todo` to start agent work.
 - [x] Ensure the `FileFollowupHandler` direct-creation path (workflow with `CreateDirectly` policy) routes through the same applier rather than skipping it — single seam for tracker writes.
 - [x] Add a regression test proving a newly-filed follow-up's tracker state is outside `tracker.active_states` and that the next intake tick does **not** ingest it. Then mutate the issue state to an active state and assert the following intake tick picks it up.
 - [x] Add a test proving config load fails when `followups.initial_tracker_state` overlaps `tracker.active_states`.
-- [ ] Add a test proving a tracker outage during follow-up filing defers via the operation queue rather than corrupting the durable lifecycle (Approved row stays Approved until the write succeeds; no premature `mark_created`).
+- [x] Add a test proving a tracker outage during follow-up filing defers via the operation queue rather than corrupting the durable lifecycle (Approved row stays Approved until the write succeeds; no premature `mark_created`).
 - [ ] Update `docs/` (the same page that covers `followups.*` and `tracker.active_states`) to describe the dormant-on-create contract and the human-promotion handoff.
 
 ## Phase 7.6 — QA Verdict Blocker Tracker Reflection

@@ -38,6 +38,9 @@ use crate::handoffs::{HandoffRecord, NewHandoff, create_handoff_in};
 use crate::integration_records::{
     IntegrationRecordRow, NewIntegrationRecord, create_integration_record_in,
 };
+use crate::pending_tracker_syncs::{
+    NewPendingTrackerSync, PendingTrackerSyncRecord, enqueue_pending_tracker_sync_in,
+};
 use crate::qa_verdicts::{NewQaVerdict, QaVerdictRecord, create_qa_verdict_in};
 use crate::repository::{
     LeaseAcquisition, NewRun, NewWorkItem, RunId, RunRecord, WorkItemId, WorkItemRecord,
@@ -232,6 +235,14 @@ impl<'conn> StateTransaction<'conn> {
         now: &str,
     ) -> StateResult<bool> {
         mark_followup_created_in(&self.tx, id, created_issue_id, now)
+    }
+
+    /// Enqueue a durable tracker-sync retry in `pending` status.
+    pub fn enqueue_pending_tracker_sync(
+        &mut self,
+        new: NewPendingTrackerSync<'_>,
+    ) -> StateResult<PendingTrackerSyncRecord> {
+        enqueue_pending_tracker_sync_in(&self.tx, new)
     }
 
     /// Persist a structured agent handoff envelope inside this
