@@ -335,6 +335,27 @@ app-server` still loads for compatibility.
 
 `followups.initial_tracker_state`, when set, controls the tracker state used for newly created follow-up issues. It must stay outside `tracker.active_states` so freshly filed follow-ups remain dormant by default; a human promotes them into an active state like `Todo` when the team is ready to start work.
 
+That dormant-on-create contract is load-bearing:
+
+- `file_followup` with `default_policy: create_directly` writes the tracker issue immediately, but in the configured dormant state rather than an intake-active state.
+- Approval-routed follow-ups become tracker issues after approval, and they use the same configured dormant state when filed.
+- Symphony intake only sees issues returned by `tracker.fetch_active`, so a follow-up parked in `Backlog`, `Icebox`, or another non-active state does not auto-dispatch on the next tick.
+- The human handoff is explicit: once the team wants the follow-up to become normal work, an operator or teammate moves that tracker issue into an active state such as `Todo`. The next intake pass then treats it like any other active issue.
+
+Recommended pattern:
+
+```yaml
+tracker:
+  active_states: [Todo, In Progress]
+
+followups:
+  enabled: true
+  default_policy: create_directly
+  initial_tracker_state: Backlog
+```
+
+With that shape, follow-up creation is fast and durable, but the tracker board still shows a clear human-controlled promotion step between "captured as future work" and "eligible for agent dispatch."
+
 The platform-lead assignment catalog is generated from `WORKFLOW.md`
 roles, agents, global `routing.rules`, and role-local assignment
 metadata. Do not create parallel per-role `ASSIGNMENT.md` files for
@@ -425,7 +446,7 @@ surface for tooling that wants the platform-lead assignment catalog.
 
 `qa` is the gate. When `required: true`, `owner_role` must be a `qa_gate`. QA blockers should normally use `blocker_policy: blocks_parent`; waivers require a configured waiver role and a reason on the verdict.
 
-`followups` lets agents surface adjacent work without hiding it in prose. `create_directly` writes through tracker mutations; `propose_for_approval` queues the request for the configured approval role.
+`followups` lets agents surface adjacent work without hiding it in prose. `create_directly` writes through tracker mutations; `propose_for_approval` queues the request for the configured approval role. In both cases, if `initial_tracker_state` is set, the created tracker issue lands dormant first and requires a human promotion into `tracker.active_states` before intake will dispatch it.
 
 `observability` controls logs, durable event broadcasting, SSE, TUI, and dashboard surfaces.
 
