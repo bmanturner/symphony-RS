@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use symphony_core::{
     FollowupPolicy, FollowupRequestInput, FollowupRouteDecision, HandoffFollowupRequest,
-    RoleAuthority, RoleName, RunRef, WorkItemId as CoreWorkItemId, derive_followups, route_followups,
+    RoleAuthority, RoleName, RunRef, TrackerCapabilities, WorkItemId as CoreWorkItemId,
+    derive_followups, route_followups,
 };
 use symphony_state::StateDb;
 use symphony_state::events::NewEvent;
+use symphony_state::followup_apply::persist_applied_followup;
 use symphony_state::followups::NewFollowup;
 use symphony_state::repository::{RunId, WorkItemId};
 
@@ -37,6 +39,8 @@ pub struct SubmittedFollowup {
     pub route: FollowupRouteDecision,
     /// Durable follow-up row id.
     pub followup_id: i64,
+    /// Local work-item id when tracker filing completed immediately.
+    pub work_item_id: Option<i64>,
 }
 
 /// Persistence boundary for `file_followup`.
@@ -56,6 +60,10 @@ pub struct StateFollowupSink {
     source_work_item: WorkItemId,
     run_id: RunId,
     role: String,
+    tracker: Arc<dyn symphony_core::tracker_trait::TrackerMutations>,
+    tracker_capabilities: TrackerCapabilities,
+    tracker_kind: String,
+    initial_tracker_state: Option<symphony_core::tracker::IssueState>,
     now: String,
 }
 
@@ -66,6 +74,10 @@ impl StateFollowupSink {
         source_work_item: WorkItemId,
         run_id: RunId,
         role: impl Into<String>,
+        tracker: Arc<dyn symphony_core::tracker_trait::TrackerMutations>,
+        tracker_capabilities: TrackerCapabilities,
+        tracker_kind: impl Into<String>,
+        initial_tracker_state: Option<symphony_core::tracker::IssueState>,
         now: impl Into<String>,
     ) -> Self {
         Self {
@@ -73,6 +85,10 @@ impl StateFollowupSink {
             source_work_item,
             run_id,
             role: role.into(),
+            tracker,
+            tracker_capabilities,
+            tracker_kind: tracker_kind.into(),
+            initial_tracker_state,
             now: now.into(),
         }
     }
@@ -91,11 +107,11 @@ impl FollowupSink for StateFollowupSink {
         input: FollowupRequestInput,
         route: FollowupRouteDecision,
     ) -> Result<SubmittedFollowup, ToolError> {
-        let mut db = self.db.lock().expect("followup sink lock");
         let acceptance_criteria = serde_json::to_string(&input.acceptance_criteria)
             .map_err(|err| ToolError::Internal(err.to_string()))?;
-        let result = db
-            .transaction(|tx| match &route {
+        let (followup_id, persisted_followup) = {
+            let mut db = self.db.lock().expect("followup sink lock");
+            db.transaction(|tx| match &route {
                 FollowupRouteDecision::CreateDirectly => {
                     let followup = tx.create_followup(NewFollowup {
                         source_work_item_id: self.source_work_item,
@@ -128,7 +144,7 @@ impl FollowupSink for StateFollowupSink {
                         .to_string(),
                         now: &self.now,
                     })?;
-                    Ok(followup.id.get())
+                    Ok((followup.id.get(), Some(followup)))
                 }
                 FollowupRouteDecision::RouteToApprovalQueue { approval_role } => {
                     let followup = tx.create_followup(NewFollowup {
@@ -164,13 +180,47 @@ impl FollowupSink for StateFollowupSink {
                         .to_string(),
                         now: &self.now,
                     })?;
-                    Ok(followup.id.get())
+                    Ok((followup.id.get(), None))
                 }
             })
+            .map_err(|err| ToolError::Internal(err.to_string()))?
+        };
+        let work_item_id = if let Some(followup) = persisted_followup {
+            let followup = followup
+                .to_domain()
+                .map_err(|err| ToolError::Internal(err.to_string()))?;
+            let applied = symphony_core::followup_applier::apply_followup(
+                &followup,
+                self.tracker.as_ref(),
+                self.tracker_capabilities,
+                self.initial_tracker_state.clone(),
+                Vec::new(),
+            )
+            .await
             .map_err(|err| ToolError::Internal(err.to_string()))?;
+            let tracker_status = self
+                .initial_tracker_state
+                .as_ref()
+                .map(|state| state.as_str())
+                .unwrap_or("open");
+            let mut db = self.db.lock().expect("followup sink lock");
+            let persisted = persist_applied_followup(
+                &mut db,
+                &followup,
+                &applied,
+                &self.tracker_kind,
+                tracker_status,
+                &self.now,
+            )
+            .map_err(|err| ToolError::Internal(err.to_string()))?;
+            Some(persisted.work_item.id.0)
+        } else {
+            None
+        };
         Ok(SubmittedFollowup {
             route,
-            followup_id: result,
+            followup_id,
+            work_item_id,
         })
     }
 }
@@ -250,7 +300,7 @@ impl ToolHandler for FileFollowupHandler {
             "route": submitted.route.kind(),
             "requires_approval": submitted.route.requires_approval(),
             "followup_id": submitted.followup_id,
-            "work_item_id": Value::Null,
+            "work_item_id": submitted.work_item_id,
         })))
     }
 }
@@ -282,6 +332,13 @@ fn map_followup_error(err: symphony_core::FollowupRequestError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use symphony_core::tracker::IssueId;
+    use symphony_core::tracker_trait::{
+        AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse,
+        AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+        LinkParentChildRequest, LinkParentChildResponse, TrackerMutations, UpdateIssueRequest,
+        UpdateIssueResponse,
+    };
     use symphony_core::{RoleAuthority, RoleKind};
     use symphony_state::events::EventRepository;
     use symphony_state::followups::FollowupRepository;
@@ -291,6 +348,57 @@ mod tests {
     use super::*;
 
     const NOW: &str = "2026-05-10T02:00:00Z";
+
+    struct RecordingTracker;
+
+    #[async_trait::async_trait]
+    impl TrackerMutations for RecordingTracker {
+        async fn create_issue(
+            &self,
+            _request: CreateIssueRequest,
+        ) -> Result<CreateIssueResponse, symphony_core::tracker_trait::TrackerError> {
+            Ok(CreateIssueResponse {
+                id: IssueId::new("ENG-123"),
+                identifier: "ENG-123".into(),
+                url: Some("https://example.test/ENG-123".into()),
+            })
+        }
+
+        async fn update_issue(
+            &self,
+            _request: UpdateIssueRequest,
+        ) -> Result<UpdateIssueResponse, symphony_core::tracker_trait::TrackerError> {
+            unreachable!()
+        }
+
+        async fn add_comment(
+            &self,
+            _request: AddCommentRequest,
+        ) -> Result<AddCommentResponse, symphony_core::tracker_trait::TrackerError> {
+            unreachable!()
+        }
+
+        async fn add_blocker(
+            &self,
+            _request: AddBlockerRequest,
+        ) -> Result<AddBlockerResponse, symphony_core::tracker_trait::TrackerError> {
+            unreachable!()
+        }
+
+        async fn link_parent_child(
+            &self,
+            _request: LinkParentChildRequest,
+        ) -> Result<LinkParentChildResponse, symphony_core::tracker_trait::TrackerError> {
+            unreachable!()
+        }
+
+        async fn attach_artifact(
+            &self,
+            _request: AttachArtifactRequest,
+        ) -> Result<AttachArtifactResponse, symphony_core::tracker_trait::TrackerError> {
+            unreachable!()
+        }
+    }
 
     fn open() -> (StateDb, WorkItemId, RunId) {
         let mut db = StateDb::open_in_memory().unwrap();
@@ -329,7 +437,17 @@ mod tests {
         approval_role: Option<RoleName>,
     ) -> (FileFollowupHandler, Arc<StateFollowupSink>, WorkItemId) {
         let (db, source, run) = open();
-        let sink = Arc::new(StateFollowupSink::new(db, source, run, "backend", NOW));
+        let sink = Arc::new(StateFollowupSink::new(
+            db,
+            source,
+            run,
+            "backend",
+            Arc::new(RecordingTracker),
+            TrackerCapabilities::FULL,
+            "github",
+            Some(symphony_core::tracker::IssueState::new("Backlog")),
+            NOW,
+        ));
         (
             FileFollowupHandler::new(FileFollowupContext {
                 sink: sink.clone(),
@@ -364,7 +482,7 @@ mod tests {
 
         assert_eq!(result.content["route"], "create_directly");
         assert!(result.content["followup_id"].as_i64().is_some());
-        assert!(result.content["work_item_id"].is_null());
+        assert!(result.content["work_item_id"].as_i64().is_some());
         sink.with_db(|db| {
             let events = db.list_events_for_work_item(source).unwrap();
             assert_eq!(events[0].event_type, "followup.approved");
@@ -374,7 +492,11 @@ mod tests {
                 ))
                 .unwrap()
                 .unwrap();
-            assert_eq!(created.status, "approved");
+            assert_eq!(created.status, "created");
+            assert_eq!(
+                created.created_issue_id.map(|id| id.0),
+                result.content["work_item_id"].as_i64()
+            );
             assert_eq!(created.title, "Add retry coverage");
         });
     }
