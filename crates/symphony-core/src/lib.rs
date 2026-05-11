@@ -30,6 +30,7 @@ pub mod dispatcher_cooperation;
 pub mod event_bus;
 pub mod events;
 pub mod followup;
+pub mod followup_applier;
 pub mod followup_approval_runner;
 pub mod followup_approval_tick;
 pub mod followup_policy;
@@ -128,6 +129,9 @@ pub use event_bus::{DEFAULT_REPLAY_BUFFER, EventBus};
 pub use events::OrchestratorEvent;
 pub use followup::{
     FollowupError, FollowupId, FollowupIssueRequest, FollowupLink, FollowupPolicy, FollowupStatus,
+};
+pub use followup_applier::{
+    AppliedFollowup, ApplyFollowupError, DefaultFollowupApplier, FollowupApplier, apply_followup,
 };
 pub use followup_approval_runner::{
     FollowupApprovalDispatchOutcome, FollowupApprovalDispatchReason, FollowupApprovalDispatcher,

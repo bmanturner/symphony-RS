@@ -17,6 +17,8 @@ pub mod decomposition_apply;
 pub mod dependency_reconciliation;
 pub mod edges;
 pub mod events;
+pub mod followups;
+pub mod followup_apply;
 pub mod handoffs;
 pub mod integration_queue;
 pub mod integration_records;

@@ -7,13 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use symphony_core::{
     FollowupPolicy, FollowupRequestInput, FollowupRouteDecision, HandoffFollowupRequest,
-    RoleAuthority, RoleName, RunRef, WorkItemId as CoreWorkItemId, derive_followups,
-    route_followups,
+    RoleAuthority, RoleName, RunRef, WorkItemId as CoreWorkItemId, derive_followups, route_followups,
 };
 use symphony_state::StateDb;
-use symphony_state::edges::{EdgeSource, EdgeType, NewWorkItemEdge};
 use symphony_state::events::NewEvent;
-use symphony_state::repository::{NewWorkItem, RunId, WorkItemId};
+use symphony_state::followups::NewFollowup;
+use symphony_state::repository::{RunId, WorkItemId};
 
 use crate::handler::{ToolError, ToolHandler, ToolResult};
 
@@ -36,8 +35,8 @@ pub struct FileFollowupPayload {
 pub struct SubmittedFollowup {
     /// Resolved policy route.
     pub route: FollowupRouteDecision,
-    /// Local work item id when the request was created directly.
-    pub work_item_id: Option<i64>,
+    /// Durable follow-up row id.
+    pub followup_id: i64,
 }
 
 /// Persistence boundary for `file_followup`.
@@ -56,6 +55,7 @@ pub struct StateFollowupSink {
     db: Mutex<StateDb>,
     source_work_item: WorkItemId,
     run_id: RunId,
+    role: String,
     now: String,
 }
 
@@ -65,12 +65,14 @@ impl StateFollowupSink {
         db: StateDb,
         source_work_item: WorkItemId,
         run_id: RunId,
+        role: impl Into<String>,
         now: impl Into<String>,
     ) -> Self {
         Self {
             db: Mutex::new(db),
             source_work_item,
             run_id,
+            role: role.into(),
             now: now.into(),
         }
     }
@@ -90,56 +92,71 @@ impl FollowupSink for StateFollowupSink {
         route: FollowupRouteDecision,
     ) -> Result<SubmittedFollowup, ToolError> {
         let mut db = self.db.lock().expect("followup sink lock");
+        let acceptance_criteria = serde_json::to_string(&input.acceptance_criteria)
+            .map_err(|err| ToolError::Internal(err.to_string()))?;
         let result = db
             .transaction(|tx| match &route {
                 FollowupRouteDecision::CreateDirectly => {
-                    let issue = tx.create_work_item(NewWorkItem {
-                        tracker_id: "symphony",
-                        identifier: &format!(
-                            "followup-{}-{}",
-                            self.source_work_item.0, self.run_id.0
-                        ),
-                        parent_id: None,
+                    let followup = tx.create_followup(NewFollowup {
+                        source_work_item_id: self.source_work_item,
                         title: &input.title,
-                        status_class: "ready",
-                        tracker_status: "open",
-                        assigned_role: None,
-                        assigned_agent: None,
-                        priority: None,
-                        workspace_policy: None,
-                        branch_policy: None,
-                        now: &self.now,
-                    })?;
-                    tx.create_edge(NewWorkItemEdge {
-                        parent_id: self.source_work_item,
-                        child_id: issue.id,
-                        edge_type: EdgeType::FollowupOf,
-                        reason: Some(&input.reason),
-                        status: if input.blocking { "open" } else { "linked" },
-                        source: EdgeSource::Followup,
+                        reason: &input.reason,
+                        scope: &input.scope,
+                        acceptance_criteria: &acceptance_criteria,
+                        blocking: input.blocking,
+                        policy: FollowupPolicy::CreateDirectly.as_str(),
+                        origin_kind: "run",
+                        origin_run_id: Some(self.run_id),
+                        origin_role: Some(self.role.as_str()),
+                        origin_agent_profile: None,
+                        origin_human_actor: None,
+                        status: "approved",
+                        created_issue_id: None,
+                        approval_role: None,
+                        approval_note: None,
                         now: &self.now,
                     })?;
                     tx.append_event(NewEvent {
-                        event_type: "followup.created",
+                        event_type: "followup.approved",
                         work_item_id: Some(self.source_work_item),
                         run_id: Some(self.run_id),
                         payload: &json!({
                             "title": input.title,
-                            "followup_work_item_id": issue.id.0,
+                            "followup_id": followup.id.get(),
                             "route": route.kind(),
                         })
                         .to_string(),
                         now: &self.now,
                     })?;
-                    Ok(Some(issue.id.0))
+                    Ok(followup.id.get())
                 }
                 FollowupRouteDecision::RouteToApprovalQueue { approval_role } => {
+                    let followup = tx.create_followup(NewFollowup {
+                        source_work_item_id: self.source_work_item,
+                        title: &input.title,
+                        reason: &input.reason,
+                        scope: &input.scope,
+                        acceptance_criteria: &acceptance_criteria,
+                        blocking: input.blocking,
+                        policy: FollowupPolicy::ProposeForApproval.as_str(),
+                        origin_kind: "run",
+                        origin_run_id: Some(self.run_id),
+                        origin_role: Some(self.role.as_str()),
+                        origin_agent_profile: None,
+                        origin_human_actor: None,
+                        status: "proposed",
+                        created_issue_id: None,
+                        approval_role: None,
+                        approval_note: None,
+                        now: &self.now,
+                    })?;
                     tx.append_event(NewEvent {
                         event_type: "followup.proposed",
                         work_item_id: Some(self.source_work_item),
                         run_id: Some(self.run_id),
                         payload: &json!({
                             "title": input.title,
+                            "followup_id": followup.id.get(),
                             "scope": input.scope,
                             "approval_role": approval_role.as_str(),
                             "route": route.kind(),
@@ -147,13 +164,13 @@ impl FollowupSink for StateFollowupSink {
                         .to_string(),
                         now: &self.now,
                     })?;
-                    Ok(None)
+                    Ok(followup.id.get())
                 }
             })
             .map_err(|err| ToolError::Internal(err.to_string()))?;
         Ok(SubmittedFollowup {
             route,
-            work_item_id: result,
+            followup_id: result,
         })
     }
 }
@@ -232,7 +249,8 @@ impl ToolHandler for FileFollowupHandler {
         Ok(ToolResult::json(json!({
             "route": submitted.route.kind(),
             "requires_approval": submitted.route.requires_approval(),
-            "work_item_id": submitted.work_item_id,
+            "followup_id": submitted.followup_id,
+            "work_item_id": Value::Null,
         })))
     }
 }
@@ -266,6 +284,7 @@ mod tests {
     use serde_json::json;
     use symphony_core::{RoleAuthority, RoleKind};
     use symphony_state::events::EventRepository;
+    use symphony_state::followups::FollowupRepository;
     use symphony_state::migrations::migrations;
     use symphony_state::repository::{NewRun, NewWorkItem, RunRepository, WorkItemRepository};
 
@@ -310,7 +329,7 @@ mod tests {
         approval_role: Option<RoleName>,
     ) -> (FileFollowupHandler, Arc<StateFollowupSink>, WorkItemId) {
         let (db, source, run) = open();
-        let sink = Arc::new(StateFollowupSink::new(db, source, run, NOW));
+        let sink = Arc::new(StateFollowupSink::new(db, source, run, "backend", NOW));
         (
             FileFollowupHandler::new(FileFollowupContext {
                 sink: sink.clone(),
@@ -339,19 +358,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_followup_creates_direct_issue_when_policy_allows() {
+    async fn file_followup_persists_approved_followup_when_policy_allows() {
         let (handler, sink, source) = handler(FollowupPolicy::CreateDirectly, None);
         let result = handler.call(payload(false)).await.unwrap();
 
         assert_eq!(result.content["route"], "create_directly");
-        assert!(result.content["work_item_id"].as_i64().is_some());
+        assert!(result.content["followup_id"].as_i64().is_some());
+        assert!(result.content["work_item_id"].is_null());
         sink.with_db(|db| {
             let events = db.list_events_for_work_item(source).unwrap();
-            assert_eq!(events[0].event_type, "followup.created");
+            assert_eq!(events[0].event_type, "followup.approved");
             let created = db
-                .get_work_item(WorkItemId(result.content["work_item_id"].as_i64().unwrap()))
+                .get_followup(symphony_core::FollowupId::new(
+                    result.content["followup_id"].as_i64().unwrap(),
+                ))
                 .unwrap()
                 .unwrap();
+            assert_eq!(created.status, "approved");
             assert_eq!(created.title, "Add retry coverage");
         });
     }
@@ -367,9 +390,17 @@ mod tests {
         assert_eq!(result.content["route"], "route_to_approval_queue");
         assert_eq!(result.content["requires_approval"], true);
         assert!(result.content["work_item_id"].is_null());
+        assert!(result.content["followup_id"].as_i64().is_some());
         sink.with_db(|db| {
             let events = db.list_events_for_work_item(source).unwrap();
             assert_eq!(events[0].event_type, "followup.proposed");
+            let created = db
+                .get_followup(symphony_core::FollowupId::new(
+                    result.content["followup_id"].as_i64().unwrap(),
+                ))
+                .unwrap()
+                .unwrap();
+            assert_eq!(created.status, "proposed");
         });
     }
 }

@@ -9,6 +9,7 @@ description = "Durable orchestrator state for Symphony-RS v2 (SQLite via rusqlit
 [dependencies]
 async-trait.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 symphony-core = { path = "../symphony-core" }
 thiserror.workspace = true
 tokio = { workspace = true }

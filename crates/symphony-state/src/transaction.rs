@@ -33,6 +33,7 @@ use crate::edges::{
     list_incoming_open_blockers_in, list_open_blockers_for_subtree_in, update_edge_status_in,
 };
 use crate::events::{EventRecord, NewEvent};
+use crate::followups::{FollowupRecord, NewFollowup, create_followup_in, mark_followup_created_in};
 use crate::handoffs::{HandoffRecord, NewHandoff, create_handoff_in};
 use crate::integration_records::{
     IntegrationRecordRow, NewIntegrationRecord, create_integration_record_in,
@@ -215,6 +216,22 @@ impl<'conn> StateTransaction<'conn> {
     /// sequence numbers; nothing is broadcast or visible until commit.
     pub fn append_event(&mut self, new: NewEvent<'_>) -> StateResult<EventRecord> {
         crate::events::append_event_in(&self.tx, new)
+    }
+
+    /// Persist a durable follow-up request inside this transaction.
+    pub fn create_followup(&mut self, new: NewFollowup<'_>) -> StateResult<FollowupRecord> {
+        create_followup_in(&self.tx, new)
+    }
+
+    /// Advance a durable follow-up row to `Created` and record the local
+    /// work-item id it materialized into.
+    pub fn mark_followup_created(
+        &mut self,
+        id: symphony_core::FollowupId,
+        created_issue_id: WorkItemId,
+        now: &str,
+    ) -> StateResult<bool> {
+        mark_followup_created_in(&self.tx, id, created_issue_id, now)
     }
 
     /// Persist a structured agent handoff envelope inside this

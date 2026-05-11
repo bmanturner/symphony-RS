@@ -3872,6 +3872,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "rusqlite",
+ "serde_json",
  "symphony-core",
  "tempfile",
  "thiserror 2.0.18",

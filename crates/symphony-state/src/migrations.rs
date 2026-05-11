@@ -234,6 +234,51 @@ const V2_INITIAL_SCHEMA: Migration = Migration {
     "#,
 };
 
+/// Durable follow-up request rows.
+///
+/// CHECKLIST v5 Phase 7.5 needs a persistence seam for
+/// `FollowupIssueRequest` so direct-create can durably park approved
+/// follow-ups before a later filing pass pushes them to the tracker.
+const V2_FOLLOWUPS_SCHEMA: Migration = Migration {
+    version: 2_026_051_003,
+    name: "v2_followups_schema",
+    sql: r#"
+        CREATE TABLE followups (
+            id                    INTEGER PRIMARY KEY,
+            source_work_item_id   INTEGER NOT NULL
+                REFERENCES work_items(id) ON DELETE CASCADE,
+            title                 TEXT    NOT NULL,
+            reason                TEXT    NOT NULL,
+            scope                 TEXT    NOT NULL,
+            acceptance_criteria   TEXT    NOT NULL,
+            blocking              INTEGER NOT NULL
+                CHECK (blocking IN (0, 1)),
+            policy                TEXT    NOT NULL
+                CHECK (policy IN ('create_directly', 'propose_for_approval')),
+            origin_kind           TEXT    NOT NULL
+                CHECK (origin_kind IN ('run', 'agent', 'human')),
+            origin_run_id         INTEGER
+                REFERENCES runs(id) ON DELETE SET NULL,
+            origin_role           TEXT,
+            origin_agent_profile  TEXT,
+            origin_human_actor    TEXT,
+            status                TEXT    NOT NULL
+                CHECK (status IN ('proposed', 'approved', 'created', 'rejected', 'cancelled')),
+            created_issue_id      INTEGER
+                REFERENCES work_items(id) ON DELETE SET NULL,
+            approval_role         TEXT,
+            approval_note         TEXT,
+            created_at            TEXT    NOT NULL,
+            updated_at            TEXT    NOT NULL
+        );
+
+        CREATE INDEX idx_followups_source_work_item
+            ON followups(source_work_item_id);
+        CREATE INDEX idx_followups_status
+            ON followups(status);
+    "#,
+};
+
 /// Returns the full ordered list of v2 schema migrations.
 ///
 /// Callers should pass the slice straight to [`crate::StateDb::migrate`].
@@ -571,7 +616,7 @@ const V3_EDGE_TRACKER_SYNC_METADATA: Migration = Migration {
     "#,
 };
 
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     V2_INITIAL_SCHEMA,
     V2_INTEGRATION_RECORDS,
     V2_PULL_REQUEST_RECORDS,
@@ -580,6 +625,7 @@ const MIGRATIONS: [Migration; 8] = [
     V2_CANCEL_REQUESTS,
     V3_EDGE_PROVENANCE,
     V3_EDGE_TRACKER_SYNC_METADATA,
+    V2_FOLLOWUPS_SCHEMA,
 ];
 
 #[cfg(test)]
