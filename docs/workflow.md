@@ -242,6 +242,7 @@ followups:
   enabled: true
   default_policy: propose_for_approval
   approval_role: platform_lead
+  initial_tracker_state: Backlog
   non_blocking_label: follow-up
   blocking_label: blocker
   require_reason: true
@@ -331,6 +332,8 @@ role needs additional Claude CLI flags. Legacy `command: codex
 app-server` still loads for compatibility.
 
 `routing` maps normalized work items to roles. `first_match` uses file order. `priority` chooses the matching rule with the highest `priority`.
+
+`followups.initial_tracker_state`, when set, controls the tracker state used for newly created follow-up issues. It must stay outside `tracker.active_states` so freshly filed follow-ups remain dormant by default; a human promotes them into an active state like `Todo` when the team is ready to start work.
 
 The platform-lead assignment catalog is generated from `WORKFLOW.md`
 roles, agents, global `routing.rules`, and role-local assignment

@@ -2646,6 +2646,16 @@ pub struct FollowupConfig {
     #[serde(default)]
     pub approval_role: Option<String>,
 
+    /// Optional tracker state to assign newly created follow-up issues.
+    /// When set, the value MUST NOT overlap `tracker.active_states`
+    /// (case-insensitive): the contract is that freshly filed
+    /// follow-ups start dormant so intake does not immediately pull them
+    /// back into the active queue. Human operators promote them into an
+    /// active state (for example `Todo`) when the team is ready to work
+    /// them.
+    #[serde(default)]
+    pub initial_tracker_state: Option<String>,
+
     /// Tracker label applied to non-blocking follow-ups. Defaults to
     /// `"follow-up"` per SPEC v2 §5.13. Empty string means "do not
     /// label", which is preserved as operator intent.
@@ -2679,6 +2689,7 @@ impl Default for FollowupConfig {
             enabled: false,
             default_policy: ChildIssuePolicy::default(),
             approval_role: None,
+            initial_tracker_state: None,
             non_blocking_label: default_followup_non_blocking_label(),
             blocking_label: default_followup_blocking_label(),
             require_reason: true,
@@ -2925,6 +2936,16 @@ pub enum ConfigValidationError {
         state: String,
     },
 
+    /// `followups.initial_tracker_state`, when set, must keep newly
+    /// created follow-up issues outside the active intake set.
+    #[error(
+        "followups.initial_tracker_state `{state}` must not appear in tracker.active_states"
+    )]
+    FollowupInitialTrackerStateIsActive {
+        /// The configured follow-up initial tracker state.
+        state: String,
+    },
+
     /// `decomposition.max_depth` must be > 0 once decomposition is
     /// enabled — a zero depth would forbid the integration owner from
     /// decomposing anything, which contradicts `enabled: true`.
@@ -3106,6 +3127,7 @@ impl WorkflowConfig {
             }
         }
         self.validate_tracker_states()?;
+        self.validate_followup_initial_tracker_state()?;
         self.validate_branching_templates()?;
         self.validate_decomposition_depth()?;
         self.validate_dependency_policy_tracker_capabilities()?;
@@ -3261,6 +3283,25 @@ impl WorkflowConfig {
                     state: terminal.clone(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// `followups.initial_tracker_state`, when configured, must point at
+    /// a dormant state rather than one of `tracker.active_states`.
+    fn validate_followup_initial_tracker_state(&self) -> Result<(), ConfigValidationError> {
+        let Some(initial_state) = self.followups.initial_tracker_state.as_deref() else {
+            return Ok(());
+        };
+        if self
+            .tracker
+            .active_states
+            .iter()
+            .any(|state| state.eq_ignore_ascii_case(initial_state))
+        {
+            return Err(ConfigValidationError::FollowupInitialTrackerStateIsActive {
+                state: initial_state.to_string(),
+            });
         }
         Ok(())
     }
@@ -6178,6 +6219,7 @@ qa:
         assert!(!f.enabled);
         assert_eq!(f.default_policy, ChildIssuePolicy::ProposeForApproval);
         assert!(f.approval_role.is_none());
+        assert!(f.initial_tracker_state.is_none());
         assert_eq!(f.non_blocking_label, "follow-up");
         assert_eq!(f.blocking_label, "blocker");
         assert!(f.require_reason);
@@ -6200,6 +6242,7 @@ followups:
         let f = &parsed.followups;
         assert!(f.enabled);
         assert_eq!(f.approval_role.as_deref(), Some("platform_lead"));
+        assert!(f.initial_tracker_state.is_none());
         assert_eq!(f.default_policy, ChildIssuePolicy::ProposeForApproval);
         assert_eq!(f.non_blocking_label, "follow-up");
         assert_eq!(f.blocking_label, "blocker");
@@ -6217,6 +6260,7 @@ followups:
   enabled: true
   default_policy: create_directly
   approval_role: platform_lead
+  initial_tracker_state: Backlog
   non_blocking_label: follow-up
   blocking_label: blocker
   require_reason: true
@@ -6227,6 +6271,7 @@ followups:
         assert!(f.enabled);
         assert_eq!(f.default_policy, ChildIssuePolicy::CreateDirectly);
         assert_eq!(f.approval_role.as_deref(), Some("platform_lead"));
+        assert_eq!(f.initial_tracker_state.as_deref(), Some("Backlog"));
         assert_eq!(f.non_blocking_label, "follow-up");
         assert_eq!(f.blocking_label, "blocker");
         assert!(f.require_reason);
@@ -6302,6 +6347,7 @@ followups:
   enabled: true
   default_policy: create_directly
   approval_role: release_captain
+  initial_tracker_state: Icebox
   non_blocking_label: chore
   blocking_label: hotfix
   require_reason: false
@@ -6315,10 +6361,26 @@ followups:
         assert!(f.enabled);
         assert_eq!(f.default_policy, ChildIssuePolicy::CreateDirectly);
         assert_eq!(f.approval_role.as_deref(), Some("release_captain"));
+        assert_eq!(f.initial_tracker_state.as_deref(), Some("Icebox"));
         assert_eq!(f.non_blocking_label, "chore");
         assert_eq!(f.blocking_label, "hotfix");
         assert!(!f.require_reason);
         assert!(!f.require_acceptance_criteria);
+    }
+
+    #[test]
+    fn validate_rejects_followup_initial_tracker_state_that_is_active() {
+        let mut cfg = WorkflowConfig::default();
+        cfg.tracker.project_slug = Some("ENG".into());
+        cfg.tracker.active_states = vec!["Todo".into(), "In Progress".into()];
+        cfg.followups.initial_tracker_state = Some("todo".into());
+
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigValidationError::FollowupInitialTrackerStateIsActive {
+                state: "todo".into(),
+            })
+        );
     }
 
     /// SPEC v2 §5.17: each hook phase is a list of shell snippets, the

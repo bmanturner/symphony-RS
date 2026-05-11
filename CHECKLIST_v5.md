@@ -87,6 +87,95 @@ mock agent.
 - [x] Honor the workflow's follow-up policy (`SPEC_v2.md` §6).
 - [x] Add tests covering: direct creation when policy allows, proposal-for-approval when policy requires.
 
+## Phase 7.5 — Follow-up Tracker Filing (Approved → Created)
+
+Gap discovered after Phase 7: `file_followup` and the approval runner drive
+the durable lifecycle to `FollowupStatus::Approved` but nothing in
+production code calls `TrackerMutations::create_issue` for follow-ups, so
+no tracker issue is ever filed and `FollowupIssueRequest::mark_created`
+is invoked only from tests. Decomposition has the symmetric applier
+(`decomposition_applier.rs:227`); follow-ups do not. Additionally, the
+operator requirement is that created follow-up issues MUST land in a
+tracker state that is **not** in `tracker.active_states`, so intake does
+not auto-promote them — a human moves them to `Todo` to start agent work.
+
+- [x] Add `followups.initial_tracker_state: Option<String>` to the workflow config (`crates/symphony-config/src/config.rs`). Validate at load time that the value is **not** present in `tracker.active_states` (else it defeats the dormant-by-default guarantee). Document the knob alongside the existing `followups.*` fields.
+- [ ] Add `crates/symphony-core/src/followup_applier.rs` mirroring `decomposition_applier.rs`: pick up `FollowupStatus::Approved` rows, call `TrackerMutations::create_issue` with `initial_state: Some(<configured state>)`, then call `FollowupIssueRequest::mark_created` with the returned `WorkItemId` inside a `transaction.rs` envelope so the tracker id and the `Created` transition land atomically.
+- [ ] Wire the applier into the runner schedule so an Approved follow-up advances to `Created` on the next tick (parity with how `decomposition_applier` is driven).
+- [ ] Ensure the `FileFollowupHandler` direct-creation path (workflow with `CreateDirectly` policy) routes through the same applier rather than skipping it — single seam for tracker writes.
+- [ ] Add a regression test proving a newly-filed follow-up's tracker state is outside `tracker.active_states` and that the next intake tick does **not** ingest it. Then mutate the issue state to an active state and assert the following intake tick picks it up.
+- [ ] Add a test proving config load fails when `followups.initial_tracker_state` overlaps `tracker.active_states`.
+- [ ] Add a test proving a tracker outage during follow-up filing defers via the operation queue rather than corrupting the durable lifecycle (Approved row stays Approved until the write succeeds; no premature `mark_created`).
+- [ ] Update `docs/` (the same page that covers `followups.*` and `tracker.active_states`) to describe the dormant-on-create contract and the human-promotion handoff.
+
+## Phase 7.6 — QA Verdict Blocker Tracker Reflection
+
+Gap discovered after Phase 6: `RecordQaVerdictHandler` /
+`StateQaVerdictSink` (`crates/symphony-mcp/src/qa_verdict_tools.rs:119`)
+creates the blocker edge in the local state DB via `tx.create_edge(NewWorkItemEdge { edge_type: EdgeType::Blocks, source: EdgeSource::Qa, … })`,
+but **never calls `TrackerMutations::add_blocker`** — so the tracker
+(Linear/GitHub) does not learn about the QA-filed blocker. The only
+production consumer of `TrackerMutations::add_blocker` today is
+`decomposition_applier.rs:326` (decomposition dependency edges).
+Additionally, the same handler advances work-item status via
+`tx.update_work_item_status` (`qa_verdict_tools.rs:145`) without a
+matching `TrackerMutations::update_issue` — the only `update_issue`
+callsite in the tree is the `unreachable!()` test stub at
+`decomposition_applier.rs:553`. Symphony's internal model and the
+operator's tracker board therefore diverge whenever QA fails or marks a
+verdict inconclusive.
+
+- [ ] Reflect QA-filed blockers to the tracker via `TrackerMutations::add_blocker` inside the `StateQaVerdictSink::submit` transaction envelope. The internal edge id and the tracker-side blocker edge id MUST be persisted together so retries are idempotent.
+- [ ] Reflect the work-item status transition (`update_work_item_status` → corresponding tracker state) via `TrackerMutations::update_issue`, mapping the kernel status class to the workflow's configured tracker state name (already plumbed through `tracker.active_states` / `tracker.terminal_states` config).
+- [ ] Capability-gate both writes against `TrackerCapabilities::add_blocker` and the adapter's update support. When the adapter advertises `add_blocker: false` (label-only proxy), fall back to whatever proxy the adapter exposes per SPEC and surface the degradation in the event payload — do **not** silently drop the reflection.
+- [ ] Defer the tracker write through the operation queue once that infrastructure lands (the queue referenced by Phase 8 does not yet exist in production code) so a transient tracker outage during QA verdict submission does **not** roll back the internal verdict + blocker rows. Until the queue exists, document the synchronous behavior and the failure mode explicitly in the handler doc comment.
+- [ ] Extend `events.rs` `qa.verdict_recorded` payload to include the tracker-side blocker edge ids alongside the internal `BlockerId` list, so `symphony status` and downstream observers can render both.
+- [ ] Add a test proving QA `fail` with one blocker produces both a `work_item_edges` row **and** a tracker `add_blocker` call (assert against a recording tracker mock).
+- [ ] Add a test proving QA `inconclusive` follows the same reflection path.
+- [ ] Add a test proving QA `pass` does **not** call `add_blocker` or `update_issue` with a blocker payload.
+- [ ] Add a test proving capability-degraded adapters (`add_blocker: false`) record the degradation in the event payload rather than failing the verdict submission.
+- [ ] Add a test proving a tracker outage during reflection does not corrupt the internal verdict state (verdict + blocker rows remain consistent; outage surfaces via the queue once Phase 7.7 lands, or via a clear error pre-queue).
+- [ ] Update `docs/` (the QA verdict surface page) to describe which side-effects land internally vs on the tracker and the operator-visible reflection contract.
+
+## Phase 7.7 — Cross-Run Conversation Resume (Honor `memory: persistent`)
+
+Gap discovered alongside Phases 7.5/7.6: the
+`AgentBackendProfile.memory: Option<String>` config field
+(`crates/symphony-config/src/config.rs:1703`, doc'd as
+`"Memory policy hint (none, session, persistent, etc.)"`) is parsed but
+**never consumed by any production code** — `grep -rn "\.memory\b\|profile\.memory" crates/symphony-agent crates/symphony-core`
+returns zero hits. Within-run multi-turn continuation works for both
+backends (Claude via `--resume <uuid>` at `claude/runner.rs:174,190`;
+Codex via persistent JSON-RPC + `sendUserTurn` against the open
+conversation at `codex/runner.rs:385,406`), but **across-run resume is
+not wired for either backend**: every `spawn_session` allocates a fresh
+Claude session UUID (`claude/runner.rs:245`) or issues a fresh Codex
+`newConversation` RPC (`codex/runner.rs:385`). Codex's app-server
+protocol DOES support resuming an existing conversation by its
+`conversation_id`, but Symphony does not invoke that path. As a result,
+a specialist on rework or re-dispatch starts cold, with the kernel's
+prompt-assembly output as its only context.
+
+This phase wires the field through end-to-end so `memory: persistent`
+becomes a load-bearing knob rather than a misleading no-op. If the
+project decides cross-run resume is **not** wanted, the alternative is
+to delete the field and document the design choice — but a parsed-but-
+unread config knob is a footgun either way.
+
+- [ ] Decide and document the cross-run-memory contract in `ARCHITECTURE_v5.md` (or an addendum): does Symphony promise conversation continuity across re-dispatches, or does it deliberately treat agents as stateless and rely on prompt assembly? Make `memory: persistent` mean exactly what the answer is.
+- [ ] Replace `AgentBackendProfile.memory: Option<String>` with a typed enum (`MemoryPolicy::{None, Session, Persistent}`) so unknown values fail at config load instead of silently no-oping. Default preserves current behavior (`Session`).
+- [ ] Persist the per-role conversation handle (`ThreadId` for Claude; Codex `conversation_id`) in `symphony-state` keyed by `(work_item_id, role)` so subsequent runs for the same logical pairing can resume. Schema lives next to `handoffs` / `qa_verdicts`. Include a TTL or "ended_at" column so completed/terminal conversations can be pruned.
+- [ ] On `spawn_session`, when `memory: persistent` is configured AND a prior handle exists for `(work_item_id, role)`, resume rather than open a fresh conversation:
+  - [ ] Claude: pass the stored UUID as `--resume <uuid>` on the **first** turn (currently `--session-id` is only used on the very first turn of a brand-new session at `claude/runner.rs:174`).
+  - [ ] Codex: extend `CodexConfig` with `method_resume_conversation: String` (defaulting to upstream Codex's resume method name) and call it with the stored `conversation_id` instead of `newConversation`. Capture the resumed session in the same `SessionConfigured` flow at `codex/runner.rs:564`.
+- [ ] Capability detection: if the backend cannot resume (older Codex build that doesn't expose the resume RPC; Claude session UUID rejected as stale/expired), fall back to a fresh conversation, log the degradation as an `agent.resume_failed` event, and continue — do **not** fail the run.
+- [ ] Per-run override: allow the orchestrator to force `memory: none` for a single dispatch (e.g. when prompt assembly already includes the full prior context, or when the operator wants a clean retry). Surface this via the dispatcher API, not just config.
+- [ ] Add a test proving Claude `memory: persistent` resumes the same UUID across two `spawn_session` calls for the same `(work_item_id, role)` pair, and that `memory: session` (default) allocates fresh.
+- [ ] Add the symmetric test for Codex: persistent reuses `conversation_id` via the resume RPC; session-level allocates fresh via `newConversation`.
+- [ ] Add a test proving resume failure falls back to fresh + emits `agent.resume_failed`.
+- [ ] Add a test proving `memory: <unknown-string>` is rejected at config load (consequence of the typed enum).
+- [ ] Update `docs/roles.md` (already on the Phase 15 update list) to document the contract: which `memory` values exist, what they promise, when each is appropriate. Cross-link from the agent profile config docs.
+
 ## Phase 8 — `add_issue_comment` Write Tool and `agent_comments` Table
 
 - [ ] Add the `agent_comments` table migration per ARCHITECTURE v5 §4.3.1, including the unique partial index on `(run_id, idempotency_key)`.
