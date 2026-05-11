@@ -1836,6 +1836,245 @@ agents:
     }
 
     #[tokio::test]
+    async fn approved_followup_stays_dormant_until_tracker_state_enters_active_set() {
+        use std::sync::Mutex;
+        use symphony_core::intake_tick::{ActiveSetStore, IntakeQueueTick};
+        use symphony_core::queue_tick::{QueueTick, QueueTickCadence};
+        use symphony_core::tracker::{Issue, IssueId, IssueState};
+        use symphony_core::tracker_trait::{
+            AddBlockerRequest, AddBlockerResponse, AddCommentRequest, AddCommentResponse,
+            AttachArtifactRequest, AttachArtifactResponse, CreateIssueRequest, CreateIssueResponse,
+            LinkParentChildRequest, LinkParentChildResponse, TrackerError, TrackerResult,
+            UpdateIssueRequest, UpdateIssueResponse,
+        };
+
+        #[derive(Default)]
+        struct TrackerState {
+            next_id: usize,
+            issues: Vec<Issue>,
+        }
+
+        struct StatefulTracker {
+            active_states: Vec<IssueState>,
+            state: Mutex<TrackerState>,
+        }
+
+        impl StatefulTracker {
+            fn new(active_states: Vec<IssueState>) -> Self {
+                Self {
+                    active_states,
+                    state: Mutex::new(TrackerState::default()),
+                }
+            }
+
+            fn promote(&self, identifier: &str, state: IssueState) {
+                let mut guard = self.state.lock().unwrap();
+                let issue = guard
+                    .issues
+                    .iter_mut()
+                    .find(|issue| issue.identifier == identifier)
+                    .expect("issue exists");
+                issue.state = state;
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl TrackerRead for StatefulTracker {
+            async fn fetch_active(&self) -> TrackerResult<Vec<Issue>> {
+                let guard = self.state.lock().unwrap();
+                Ok(guard
+                    .issues
+                    .iter()
+                    .filter(|issue| self.active_states.iter().any(|state| state == &issue.state))
+                    .cloned()
+                    .collect())
+            }
+
+            async fn fetch_state(&self, ids: &[IssueId]) -> TrackerResult<Vec<Issue>> {
+                let guard = self.state.lock().unwrap();
+                Ok(ids
+                    .iter()
+                    .filter_map(|id| guard.issues.iter().find(|issue| &issue.id == id).cloned())
+                    .collect())
+            }
+
+            async fn fetch_terminal_recent(
+                &self,
+                _terminal_states: &[IssueState],
+            ) -> TrackerResult<Vec<Issue>> {
+                Ok(Vec::new())
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl TrackerMutations for StatefulTracker {
+            async fn create_issue(
+                &self,
+                request: CreateIssueRequest,
+            ) -> TrackerResult<CreateIssueResponse> {
+                let mut guard = self.state.lock().unwrap();
+                let n = guard.next_id;
+                guard.next_id += 1;
+                let identifier = format!("ENG-{}", 123 + n);
+                let issue = Issue::minimal(
+                    format!("tracker-{n}"),
+                    identifier.clone(),
+                    request.title,
+                    request
+                        .initial_state
+                        .unwrap_or_else(|| IssueState::new("Todo"))
+                        .as_str(),
+                );
+                guard.issues.push(issue.clone());
+                Ok(CreateIssueResponse {
+                    id: issue.id,
+                    identifier,
+                    url: Some(format!("https://example.test/{n}")),
+                })
+            }
+
+            async fn update_issue(
+                &self,
+                _request: UpdateIssueRequest,
+            ) -> TrackerResult<UpdateIssueResponse> {
+                Err(TrackerError::Unsupported("unused".into()))
+            }
+
+            async fn add_comment(
+                &self,
+                _request: AddCommentRequest,
+            ) -> TrackerResult<AddCommentResponse> {
+                Err(TrackerError::Unsupported("unused".into()))
+            }
+
+            async fn add_blocker(
+                &self,
+                _request: AddBlockerRequest,
+            ) -> TrackerResult<AddBlockerResponse> {
+                Err(TrackerError::Unsupported("unused".into()))
+            }
+
+            async fn link_parent_child(
+                &self,
+                _request: LinkParentChildRequest,
+            ) -> TrackerResult<LinkParentChildResponse> {
+                Err(TrackerError::Unsupported("unused".into()))
+            }
+
+            async fn attach_artifact(
+                &self,
+                _request: AttachArtifactRequest,
+            ) -> TrackerResult<AttachArtifactResponse> {
+                Err(TrackerError::Unsupported("unused".into()))
+            }
+        }
+
+        let mut db = symphony_state::StateDb::open_in_memory().unwrap();
+        db.migrate(migrations()).unwrap();
+        let source = db
+            .create_work_item(NewWorkItem {
+                tracker_id: "github",
+                identifier: "OWNER/REPO#1",
+                parent_id: None,
+                title: "source",
+                status_class: "running",
+                tracker_status: "open",
+                assigned_role: None,
+                assigned_agent: None,
+                priority: None,
+                workspace_policy: None,
+                branch_policy: None,
+                now: "2026-05-10T00:00:00Z",
+            })
+            .unwrap()
+            .id;
+        let run = db
+            .create_run(NewRun {
+                work_item_id: source,
+                role: "backend",
+                agent: "codex",
+                status: "running",
+                workspace_claim_id: None,
+                now: "2026-05-10T00:00:00Z",
+            })
+            .unwrap()
+            .id;
+        let row = db
+            .create_followup(NewFollowup {
+                source_work_item_id: source,
+                title: "Add retry coverage",
+                reason: "need a regression test",
+                scope: "tests only",
+                acceptance_criteria: "[\"retry path covered\"]",
+                blocking: true,
+                policy: "create_directly",
+                origin_kind: "run",
+                origin_run_id: Some(run),
+                origin_role: Some("backend"),
+                origin_agent_profile: None,
+                origin_human_actor: None,
+                status: "approved",
+                created_issue_id: None,
+                approval_role: None,
+                approval_note: None,
+                now: "2026-05-10T00:00:00Z",
+            })
+            .unwrap();
+
+        let tracker = Arc::new(StatefulTracker::new(vec![IssueState::new("Todo")]));
+        let shared = Arc::new(StdMutex::new(db));
+        let cfg = WorkflowConfig {
+            tracker: TrackerConfig {
+                kind: TrackerKind::Github,
+                active_states: vec!["Todo".into()],
+                ..TrackerConfig::default()
+            },
+            followups: symphony_config::FollowupConfig {
+                enabled: true,
+                initial_tracker_state: Some("Backlog".into()),
+                ..symphony_config::FollowupConfig::default()
+            },
+            ..WorkflowConfig::default()
+        };
+        let filer = ApprovedFollowupFiler::new(&cfg, shared.clone(), tracker.clone());
+
+        let filed = filer.run_once().await.unwrap();
+        assert_eq!(filed, 1);
+
+        let db = shared.lock().unwrap();
+        let stored = db.get_followup(row.id).unwrap().unwrap();
+        assert_eq!(stored.status, "created");
+        let created_issue_id = stored.created_issue_id.unwrap();
+        let persisted_item = db.get_work_item(created_issue_id).unwrap().unwrap();
+        assert_eq!(persisted_item.tracker_status, "Backlog");
+        drop(db);
+
+        let store = Arc::new(ActiveSetStore::new());
+        let mut intake = IntakeQueueTick::new(
+            tracker.clone() as Arc<dyn TrackerRead>,
+            store.clone(),
+            QueueTickCadence::fixed(Duration::from_millis(1)),
+        );
+
+        let first = intake.tick().await;
+        assert_eq!(first.errors, 0);
+        assert_eq!(
+            store.snapshot().len(),
+            0,
+            "Backlog follow-up must stay dormant"
+        );
+
+        tracker.promote("ENG-123", IssueState::new("Todo"));
+
+        let second = intake.tick().await;
+        assert_eq!(second.errors, 0);
+        let active = store.snapshot();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].identifier, "ENG-123");
+        assert_eq!(active[0].state, IssueState::new("Todo"));
+    }
+
+    #[tokio::test]
     async fn release_for_maps_completion_reasons_correctly() {
         assert_eq!(
             release_for(CompletionReason::Success),
